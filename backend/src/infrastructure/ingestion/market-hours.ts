@@ -22,7 +22,9 @@ export const YAHOO_MARKET: Record<YahooSymbolKey, MarketId> = {
   US13W: 'us_equity',
   US5Y: 'us_equity',
   US30Y: 'us_equity',
-  VIX: 'us_equity',
+  // VIX는 미국 주식 장 밖(CBOE 연장 거래 시간으로 보임)에도 갱신된다(B-46 ① 재측정 1: 장 밖 10분에 40회).
+  // 열린 시장 지표만 요청할 때(T-131) 빠지지 않도록 거의 24시간 시장으로 둔다.
+  VIX: 'global_24h',
   DOW: 'us_equity',
   RUSSELL: 'us_equity',
   NIKKEI: 'tokyo',
