@@ -293,6 +293,24 @@ const MIGRATIONS: Migration[] = [
       `SELECT add_retention_policy('stock_rankings', drop_after => INTERVAL '1 year', if_not_exists => true)`,
     ],
   },
+  {
+    version: 9,
+    name: '11단계 B′ T-97 market_flows (KOFIA daily market fund statistics, one row per metric per day)',
+    statements: [
+      // 증시 자금 흐름 일별 통계 (docs/Task_ORDER.md 11단계 B′ T-95 ~ T-97, D-44, D-65). 기존 테이블은 건드리지 않는다.
+      // 지표·날짜·값의 긴 형식: 응답 필드가 바뀌거나 늘어도 스키마를 바꾸지 않는다. metric은 '<데이터셋>.<응답 필드 이름>'.
+      // 기준 시각은 KRX 일별 값과 같은 15:30 KST. 하루 수십 행이라 청크 365일.
+      `CREATE TABLE IF NOT EXISTS market_flows (
+        time TIMESTAMPTZ NOT NULL,
+        metric TEXT NOT NULL,
+        value DOUBLE PRECISION NOT NULL,
+        source TEXT NOT NULL
+      )`,
+      `SELECT create_hypertable('market_flows', 'time', chunk_time_interval => INTERVAL '365 days', if_not_exists => TRUE)`,
+      `CREATE UNIQUE INDEX IF NOT EXISTS market_flows_metric_time_key ON market_flows (metric, time)`,
+      `SELECT add_retention_policy('market_flows', drop_after => INTERVAL '1 year', if_not_exists => true)`,
+    ],
+  },
 ];
 
 // 집계의 실제 저장 테이블(materialization hypertable)을 찾아 청크 간격을 바꾼다 (T-31).

@@ -8,11 +8,13 @@ import { KrxApiError, KrxClient, readKrxConfig } from './krx-client.js';
 import { combineCoverage, ENDPOINT_PATHS, FIELDS, mapIndexRows, missingDates, pastSeoulWeekdays, rowsOf, seoulWeekdays } from './krx-index-daily.js';
 import { BREADTH_ENDPOINTS, rankStocks, summarizeBreadth, type BreadthEndpoint } from './krx-breadth.js';
 import { safeLogList } from '../http-json.js';
+import { datesToCheck, recordCheck, type DateCheckState } from './krx-schedule.js';
 
 // KRX 일별 지수 수집기 (docs/Task_ORDER.md T-67, D-60)
 // VKOSPI와 KRX 섹터 5종의 일별 종가를 KRX Open API에서 받아 Kafka `index-daily`로 보낸다.
 // - KRX 키를 가진 컨테이너는 이 수집기 하나뿐이다. 키가 없으면 접속하지 않고 대기한다.
-// - 시작할 때 최근 KRX_BACKFILL_DAYS일(기본 370일)을 한 번 채우고, 이후에는 KRX_POLLING_INTERVAL_MS마다 최근 7일만 다시 확인한다.
+// - 시작할 때 최근 KRX_BACKFILL_DAYS일(기본 370일)을 한 번 채우고, 이후에는 KRX_POLLING_INTERVAL_MS마다 최근 7일 중
+//   아직 받지 않은(또는 정정 확인할) 날짜만 받는다 (krx-schedule.ts, T-132).
 //   DB는 (symbol, time) 기준으로 덮어쓰므로 다시 보내도 중복이 생기지 않는다.
 // - 값이 바뀐(또는 새로 생긴) 날짜만 보낸다.
 
@@ -63,6 +65,25 @@ const isEnabled = (endpoint: string) => (disabledUntil.get(endpoint) ?? 0) <= Da
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+// 최근 날짜 확인 일정 (T-132): 엔드포인트·날짜마다 받은 결과를 기억해서 필요한 날짜만 다시 받는다
+const checkStates = new Map<string, Map<string, DateCheckState>>();
+const statesFor = (endpoint: string) => {
+  let states = checkStates.get(endpoint);
+  if (!states) checkStates.set(endpoint, (states = new Map()));
+  return states;
+};
+function noteCheck(endpoint: string, basDd: string, result: 'rows' | 'empty') {
+  const states = statesFor(endpoint);
+  states.set(basDd, recordCheck(states.get(basDd), result, Date.now()));
+}
+// 확인 범위(window, 오래된 날부터) 중 이번 주기에 받을 날짜. 범위를 벗어난 날짜의 상태는 지운다
+function plannedDates(endpoint: string, window: string[]) {
+  const states = statesFor(endpoint);
+  const first = window[0];
+  for (const date of states.keys()) if (first === undefined || date < first) states.delete(date);
+  return datesToCheck(window, states, Date.now());
+}
+
 function describeError(error: unknown) {
   if (error instanceof KrxApiError) return `${error.message}${error.status ? ` status=${error.status}` : ''}${error.code ? ` code=${error.code}` : ''}`;
   return 'unexpected_error';
@@ -83,9 +104,11 @@ async function collectDay(client: KrxClient, endpoint: KrxEndpoint, basDd: strin
     }
     if (rows.length === 0) {
       fetchTotal.inc({ endpoint, result: 'empty' });
+      noteCheck(endpoint, basDd, 'empty');
       return true;
     }
     fetchTotal.inc({ endpoint, result: 'ok' });
+    noteCheck(endpoint, basDd, 'rows');
     lastSuccessAt.set({ endpoint }, Math.floor(Date.now() / 1000));
 
     const { ticks, invalid } = mapIndexRows(endpoint, basDd, rows);
@@ -155,9 +178,11 @@ async function collectBreadthDay(client: KrxClient, endpoint: BreadthEndpoint, b
     }
     if (rows.length === 0) {
       fetchTotal.inc({ endpoint, result: 'empty' });
+      noteCheck(endpoint, basDd, 'empty');
       return true;
     }
     fetchTotal.inc({ endpoint, result: 'ok' });
+    noteCheck(endpoint, basDd, 'rows');
     lastSuccessAt.set({ endpoint }, Math.floor(Date.now() / 1000));
 
     const { breadth, invalid } = summarizeBreadth(market, basDd, rows);
@@ -374,8 +399,16 @@ async function loop(client: KrxClient) {
   await backfillBreadth(client);
   await backfillRankings(client);
   // 시장 폭은 자체 정지(거부·제한)로 보호하므로, 결과를 지수 수집의 재시도 간격(백오프)에 섞지 않는다
-  await collectBreadthDays(client, seoulWeekdays(Date.now(), BREADTH_RECENT_DAYS), BREADTH_ENDPOINT_LIST);
-  const ok = await collectDays(client, seoulWeekdays(Date.now(), RECENT_DAYS), ENDPOINTS);
+  // 최근 날짜는 확인 일정(T-132)에 따라 필요한 날짜만 받는다. 받을 날짜가 없으면 이번 주기는 호출하지 않는다
+  const breadthWindow = seoulWeekdays(Date.now(), BREADTH_RECENT_DAYS);
+  for (const endpoint of BREADTH_ENDPOINT_LIST) {
+    await collectBreadthDays(client, plannedDates(endpoint, breadthWindow), [endpoint]);
+  }
+  const indexWindow = seoulWeekdays(Date.now(), RECENT_DAYS);
+  let ok = true;
+  for (const endpoint of ENDPOINTS) {
+    ok = (await collectDays(client, plannedDates(endpoint, indexWindow), [endpoint])) && ok;
+  }
   consecutiveFailures = ok ? 0 : consecutiveFailures + 1;
   const delay = consecutiveFailures === 0 ? POLLING_INTERVAL_MS : Math.min(POLLING_INTERVAL_MS * 2 ** consecutiveFailures, MAX_BACKOFF_MS);
   if (!stopping) timer = setTimeout(() => void loop(client), delay);

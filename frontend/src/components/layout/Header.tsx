@@ -18,7 +18,7 @@ const CATEGORIES = [
   { id: 'category2', name: '매크로 및 환율', icon: Globe },
   { id: 'category3', name: '글로벌 연동', icon: TrendingUp },
   { id: 'category4', name: '국내 섹터 모멘텀', icon: Activity },
-  { id: 'category5', name: '증시 자금 흐름', icon: ArrowLeftRight }, // 11단계 (준비 중, D-55)
+  { id: 'category5', name: '증시 자금 흐름', icon: ArrowLeftRight }, // 11단계 B′ (금융투자협회 일별 통계 1개월, D-77)
   { id: 'category6', name: '공시·자본 이벤트', icon: FileText }, // 12단계 (DART)
   { id: 'category8', name: '실적·배당 캘린더', icon: CalendarDays }, // 15단계 T-111 (공시 탭 바로 아래)
   { id: 'category9', name: '종목 순위', icon: ListOrdered }, // 15단계 T-113

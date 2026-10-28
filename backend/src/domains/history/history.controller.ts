@@ -2,7 +2,8 @@ import type { FastifyInstance } from 'fastify';
 import { redis } from '../../infrastructure/redis.js';
 import { dbPool } from '../../infrastructure/db.js';
 import { Latency } from '../../infrastructure/metrics.js';
-import { DERIVED_SPREADS, isDerivedSymbol, isSubscribableSymbol, isYahooSymbolKey } from '../../shared/symbols.js';
+import { DERIVED_SPREADS, isDerivedSymbol, isSubscribableSymbol, isYahooSymbolKey, YAHOO_KEYS } from '../../shared/symbols.js';
+import { isMarketState } from '../../shared/market-state.js';
 import { BREADTH_MARKETS, type BreadthMarket } from '../../shared/breadth.js';
 import type { DerivedSymbol, YahooSymbolKey } from '../../shared/symbols.js';
 import { isKrxDailySymbol, KRX_SECTOR_KEYS, type KrxDailySymbol } from '../../shared/krx-indices.js';
@@ -227,6 +228,30 @@ async function getRecentTicks(ticker: YahooSymbolKey): Promise<HistoryPoint[]> {
 }
 
 export const historyController = async (fastify: FastifyInstance) => {
+  // worker 재시작 중복 방지 (T-133): Yahoo 지표별 마지막 전송 tick(Gateway가 둔 Redis 최신값)의 소스 시각·장 상태만 돌려준다.
+  // 입력이 없고 고정 목록(27종)만 읽는다. 가격 등 다른 값은 내보내지 않는다(공개 시세의 시각 정보).
+  fastify.get('/api/v1/market/latest-times', async (_request, reply) => {
+    if (redis.status !== 'ready') return reply.code(503).send({ error: 'cache unavailable' });
+    try {
+      const values = await redis.mget(YAHOO_KEYS.map(key => `latest_tick:${key}`));
+      const data = YAHOO_KEYS.flatMap((symbol, index) => {
+        const raw = values[index];
+        if (!raw) return [];
+        try {
+          const tick = JSON.parse(raw) as { timestamp?: unknown; marketState?: unknown };
+          if (typeof tick.timestamp !== 'number' || !Number.isFinite(tick.timestamp)) return [];
+          return [isMarketState(tick.marketState) ? { symbol, timestamp: tick.timestamp, marketState: tick.marketState } : { symbol, timestamp: tick.timestamp }];
+        } catch {
+          return [];
+        }
+      });
+      return { data };
+    } catch (err) {
+      console.error('Error reading latest tick times:', err instanceof Error ? err.message : String(err));
+      return reply.code(500).send({ error: 'Failed to read latest tick times' });
+    }
+  });
+
   fastify.get('/api/v1/market/recent', async (request, reply) => {
     const startedAt = Date.now();
     const { ticker } = request.query as { ticker?: string };
@@ -524,6 +549,18 @@ export function startHistorySelfCheck() {
       }
     } catch (error) {
       console.error(`[rankings-check] failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    // 증시 자금 흐름 일별 통계 (11단계 B′): 가장 최근 기준일의 지표별 값. 공식 명세에 단위가 없어
+    // 원본 통계 사이트(금융투자협회 종합통계)의 같은 날 숫자와 비교해 단위·이름을 확정하는 데 쓴다(공개 통계 값)
+    try {
+      const { rows } = await dbPool.query<{ day: string; metric: string; value: number }>(
+        `SELECT to_char(time AT TIME ZONE 'Asia/Seoul', 'YYYY-MM-DD') AS day, metric, value::float8 AS value
+         FROM market_flows WHERE time = (SELECT max(time) FROM market_flows) ORDER BY metric`
+      );
+      console.log(`[flows-check] ${JSON.stringify({ day: rows[0]?.day ?? null, values: Object.fromEntries(rows.map(row => [row.metric, row.value])) })}`);
+    } catch (error) {
+      console.error(`[flows-check] failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }, 60000);
 }

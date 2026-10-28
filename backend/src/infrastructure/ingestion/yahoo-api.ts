@@ -45,8 +45,10 @@ function validateQuote(
 }
 
 // 요청 실패는 삼키지 않고 던진다. worker가 result="error"로 집계하고 백오프한다 (docs/Task_ORDER.md T-05).
-export async function fetchYahooData(): Promise<NormalizedMarketData[]> {
-  const symbols = Object.values(YAHOO_SYMBOLS);
+// keys: 이번에 요청할 지표(T-131, 열린 시장 지표만 요청할 때). 기본은 전체
+export async function fetchYahooData(keys: readonly YahooSymbolKey[] = YAHOO_KEYS): Promise<NormalizedMarketData[]> {
+  const symbols = keys.map(key => YAHOO_SYMBOLS[key]);
+  if (symbols.length === 0) return [];
 
   // yahoo-finance2 supports fetching multiple quotes at once
   const quotes = await yahooFinance.quote(symbols);

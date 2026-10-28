@@ -1,6 +1,8 @@
 import { fetchYahooData } from './yahoo-api.js';
 import type { NormalizedMarketData } from './normalizer.js';
-import { MARKETS, YAHOO_MARKET, decideMarketStatus } from './market-hours.js';
+import { MARKETS, YAHOO_MARKET, decideMarketStatus, type MarketId, type MarketStatus } from './market-hours.js';
+import { planYahooRequest } from './request-plan.js';
+import { fetchLatestTickTimes } from '../backend-coverage.js';
 import { YAHOO_KEYS, isYahooSymbolKey } from '../../shared/symbols.js';
 import type { YahooSymbolKey } from '../../shared/symbols.js';
 import type { MarketState } from '../../shared/market-state.js';
@@ -29,7 +31,6 @@ const KAFKA_TEST_INJECT_INVALID = process.env.KAFKA_TEST_INJECT_INVALID === 'tru
 // 장이 닫힌 시간(주말)에도 실시간 경로(Kafka → Gateway → WebSocket)의 지연을 측정하기 위함 (T-23, B-05).
 // 같은 (symbol, time)은 DB Sink의 유니크 제약(T-15)으로 건너뛰도록 되어 있다.
 const WORKER_TEST_SEND_UNCHANGED = process.env.WORKER_TEST_SEND_UNCHANGED === 'true';
-
 // 측정 지표 (docs/Task_ORDER.md T-01)
 const fetchDuration = new Latency('kospi_worker_fetch_duration_seconds', 'External API fetch duration by source');
 const fetchTotal = new Counter('kospi_worker_fetch_total', 'External API fetch attempts by source and result (success / empty / timeout / error)');
@@ -58,6 +59,13 @@ const lastSentMarketState = new Map<string, MarketState>();
 // 지표별로 가장 최근에 받은 소스 장 상태 (전송 여부와 상관없이). 수집 주기 판단에 쓴다 (T-56)
 const latestSourceState = new Map<YahooSymbolKey, MarketState>();
 let lastSourceStateSummary: string | undefined;
+
+// 요청 심볼 고르기 (T-131): 지난 주기 끝에 판단한 시장 상태, 시장이 닫힌 시각, 마지막 전체 요청 시각
+const symbolsRequested = new Counter('kospi_worker_yahoo_symbols_requested_total', 'Symbols requested from Yahoo, by scope (full = all symbols, open = open / holiday / just-closed markets only)');
+let marketStatuses: Partial<Record<MarketId, MarketStatus>> = {};
+const marketClosedAt = new Map<MarketId, number>();
+let lastFullRequestAt: number | undefined;
+let lastRequestSummary: string | undefined;
 
 type CollectedMarketData = NormalizedMarketData & { collectedAt: number };
 type FetchResult = 'success' | 'empty' | 'timeout' | 'error';
@@ -128,7 +136,17 @@ async function collect(
 async function runCycle(): Promise<FetchResult> {
   console.log(`\n[${new Date().toISOString()}] Fetching market data...`);
 
-  const yahoo = await collect('yahoo', fetchYahooData);
+  const plan = planYahooRequest(marketStatuses, marketClosedAt, lastFullRequestAt, Date.now());
+  if (plan.full) lastFullRequestAt = Date.now();
+  symbolsRequested.inc({ scope: plan.full ? 'full' : 'open' }, plan.keys.length);
+  if (!plan.full) {
+    const summary = plan.keys.join(',');
+    if (summary !== lastRequestSummary) {
+      console.log(`Requesting ${plan.keys.length} of ${YAHOO_KEYS.length} symbols (closed markets every 60s): ${summary}`);
+      lastRequestSummary = summary;
+    }
+  }
+  const yahoo = await collect('yahoo', () => fetchYahooData(plan.keys));
   const allData = yahoo.items;
 
   // 소스 장 상태 기록 (T-56)
@@ -219,7 +237,7 @@ let currentCycle: Promise<void> | undefined;
 
 // 시장 상태에 따라 기본 주기를 정한다 (T-07, D-16, T-56).
 // 하나라도 장중이면 활성 주기, 장중은 없고 휴장(시간표상 장 시간인데 소스가 닫힘)이 있으면 휴장 주기, 모두 닫혀 있으면 유휴 주기.
-// Yahoo는 요청 한 번에 모든 지표를 돌려주므로 지표별로 다른 주기를 줄 수 없다.
+// 요청 주기는 하나다. 대신 닫힌 시장의 지표는 다음 주기 요청에서 뺀다 (T-131, planYahooRequest).
 function baseInterval() {
   const now = new Date(Date.now() + MARKET_CLOCK_OFFSET_MS);
   const states = MARKETS.map(market => {
@@ -228,7 +246,10 @@ function baseInterval() {
   });
   for (const state of states) {
     marketOpen.set({ market: state.id }, state.status === 'open' ? 1 : 0);
+    const previous = marketStatuses[state.id];
+    if (previous !== undefined && previous !== 'closed' && state.status === 'closed') marketClosedAt.set(state.id, Date.now());
   }
+  marketStatuses = Object.fromEntries(states.map(state => [state.id, state.status])) as Partial<Record<MarketId, MarketStatus>>;
 
   const interval = states.some(state => state.status === 'open')
     ? POLLING_INTERVAL_MS
@@ -289,6 +310,33 @@ async function stopPolling() {
   await currentCycle;
 }
 
+// 재시작 중복 방지 (docs/Task_ORDER.md T-133, D-75)
+// 변경 감지 기준(마지막 전송 시각·장 상태)은 메모리에만 있어서, 다시 시작하면 첫 주기에 받은 tick을 전부 다시 보냈다
+// (장이 닫힌 시장의 몇 시간 전 tick까지 Kafka·Gateway·DB에 다시 들어감, B-22).
+// 시작할 때 backend에서 지표별 마지막 전송 tick(Gateway가 Redis에 둔 최신값)의 시각·장 상태를 받아 기준으로 쓴다.
+// backend에 닿지 못하면(전체 첫 기동 등) 예전처럼 첫 주기에 모두 보낸다. Redis가 비어 있을 때도 마찬가지(최신값을 다시 채움).
+const SEED_ATTEMPTS = 6;
+const SEED_RETRY_MS = 2500;
+
+async function seedLastSent() {
+  for (let attempt = 1; attempt <= SEED_ATTEMPTS && !stopping; attempt += 1) {
+    const latest = await fetchLatestTickTimes();
+    if (latest) {
+      let seeded = 0;
+      for (const item of latest) {
+        if (!isYahooSymbolKey(item.symbol)) continue;
+        lastSentTimestamp.set(item.symbol, item.timestamp);
+        if (item.marketState) lastSentMarketState.set(item.symbol, item.marketState);
+        seeded += 1;
+      }
+      console.log(`Change detection seeded from backend for ${seeded} of ${YAHOO_KEYS.length} symbols (unchanged ticks are not re-sent after a restart).`);
+      return;
+    }
+    if (attempt < SEED_ATTEMPTS) await new Promise(resolve => setTimeout(resolve, SEED_RETRY_MS));
+  }
+  console.warn('Latest sent ticks unavailable from backend; the first cycle sends every tick (as before).');
+}
+
 async function runIngestionWorker() {
   console.log('🚀 Data Ingestion Worker Started...');
   console.log(`Polling interval: ${POLLING_INTERVAL_MS}ms, fetch timeout: ${FETCH_TIMEOUT_MS}ms, max backoff: ${MAX_BACKOFF_MS}ms`);
@@ -329,6 +377,7 @@ async function runIngestionWorker() {
     { name: 'kafka producer', run: () => producer.disconnect() },
   ]);
 
+  if (!WORKER_TEST_SEND_UNCHANGED) await seedLastSent();
   pollLoop();
 }
 

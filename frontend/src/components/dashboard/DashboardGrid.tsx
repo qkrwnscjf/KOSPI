@@ -8,6 +8,7 @@ import { DisclosureDashboard } from '@/components/disclosures/DisclosureDashboar
 import { RiskDashboard } from '@/components/risk/RiskDashboard'
 import { EarningsCalendar } from '@/components/calendar/EarningsCalendar'
 import { RankingsDashboard } from '@/components/rankings/RankingsDashboard'
+import { MarketFlowsReport } from '@/components/flows/MarketFlowsReport'
 import { SectorNodes } from './SectorNodes'
 import { MarketBreadthPanel } from './MarketBreadth'
 
@@ -32,7 +33,7 @@ const categoryDescriptions: Record<string, string> = {
   category2: ' 원화 환율, 미국 국채 금리와 장단기 금리차, 변동성 지수를 보여 줍니다.',
   category3: ' 미국·아시아 주요 지수와 에너지·금속 원자재 선물을 보여 줍니다.',
   category4: ' KRX 섹터 지수 17종의 기간 수익률을 노드로 비교하고, 섹터별 추이를 확인합니다. 섹터 지수는 KRX 일별 시세입니다.',
-  category5: ' 외국인·기관·개인 중 누가 사고 누가 파는지, 돈의 흐름을 보여 줍니다.',
+  category5: ' 투자자예탁금·신용융자·미수금·반대매매 등 증시 주변 자금의 최근 1개월 일별 추이를 보여 줍니다(금융투자협회 종합통계).',
   category6: ' 새 공시와 증자·사채 발행(희석), 자사주 취득·소각(주주환원) 규모를 보여 줍니다.',
   category7: ' 코스피가 해외 지수·환율·변동성·금리와 얼마나 같이 움직였는지(상관계수·베타)와 지표별 변동성·최대 낙폭을 기간별로 보여 줍니다.',
   category8: ' 유가증권시장의 잠정실적·배당 결정·정기보고서 공시를 달력에서 날짜별로 보고, 날짜를 누르면 원문 링크를 확인합니다.',
@@ -84,26 +85,8 @@ function StatusFooter() {
         </div>
       </div>
 
-      <span className="text-[11px] text-fg-muted">시세 출처: Yahoo Finance(일부 10~15분 지연) · KRX Open API(일별) · 공시: 금융감독원 DART</span>
+      <span className="text-[11px] text-fg-muted">시세 출처: Yahoo Finance(일부 10~15분 지연) · KRX Open API(일별) · 공시: 금융감독원 DART · 증시 자금: 금융투자협회(공공데이터포털)</span>
     </footer>
-  )
-}
-
-// 증시 자금 흐름 탭은 수집 소스가 정해질 때까지 "데이터 준비 중"으로 둔다 (T-70, D-55).
-// 수집기·API·흐름 화면(components/flows/FlowDashboard.tsx) 코드는 그대로 두고, 이 탭에서만 보여 주지 않는다.
-function FlowsPending() {
-  return (
-    <motion.div
-      initial={{ opacity: 0, y: 12 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
-      className="card-neon flex h-[340px] w-full flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-line bg-surface px-6 text-center"
-    >
-      <span className="text-sm font-medium text-fg">데이터 준비 중</span>
-      <span className="max-w-md text-xs leading-relaxed text-fg-muted">
-        외국인·기관·개인의 순매수 데이터 수집을 준비하고 있습니다. 준비가 끝나면 이 탭에 수급 흐름도와 추이 그래프가 표시됩니다.
-      </span>
-    </motion.div>
   )
 }
 
@@ -147,9 +130,9 @@ export function DashboardGrid({ categoryId }: DashboardGridProps) {
         </div>
       )}
 
-      {/* 증시 자금 흐름 탭은 지표 카드 대신 준비 중 안내를 보여 준다 (T-70, D-55) */}
+      {/* 증시 자금 흐름 탭: 금융투자협회 일별 통계 1개월 (11단계 B′ T-98, D-77). 투자자별 순매수 화면(FlowDashboard)은 원천이 없어 쓰지 않는다 */}
       {categoryId === 'category5' ? (
-        <FlowsPending />
+        <MarketFlowsReport />
       ) : categoryId === 'category6' ? (
         <DisclosureDashboard />
       ) : categoryId === 'category7' ? (

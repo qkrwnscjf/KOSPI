@@ -5,6 +5,7 @@
 // - 실패하면 null을 돌려준다. 호출하는 쪽은 null이면 과거 채우기를 미루고 다음 주기에 다시 묻는다(재시작 반복 시 대량 호출 방지).
 
 import { fetchJson } from './http-json.js';
+import { isMarketState, type MarketState } from '../shared/market-state.js';
 
 const BACKEND_URL = (process.env.BACKEND_URL || 'http://localhost:3001').replace(/\/+$/, '');
 const REQUEST_TIMEOUT_MS = 5000;
@@ -74,6 +75,26 @@ export async function fetchRankingsCoverage(markets: readonly string[]): Promise
       : null);
   }
   return result;
+}
+
+// worker 재시작 중복 방지 (T-133): 지표별 마지막 전송 tick의 소스 시각·장 상태. 확인하지 못하면 null
+export interface LatestTickTime { symbol: string; timestamp: number; marketState?: MarketState }
+
+export function parseLatestTickTimes(body: Record<string, unknown>): LatestTickTime[] | null {
+  if (!Array.isArray(body.data)) return null;
+  const result: LatestTickTime[] = [];
+  for (const item of body.data.slice(0, 100)) {
+    if (!item || typeof item !== 'object') continue;
+    const { symbol, timestamp, marketState } = item as Record<string, unknown>;
+    if (typeof symbol !== 'string' || typeof timestamp !== 'number' || !Number.isFinite(timestamp)) continue;
+    result.push(isMarketState(marketState) ? { symbol, timestamp, marketState } : { symbol, timestamp });
+  }
+  return result;
+}
+
+export async function fetchLatestTickTimes(): Promise<LatestTickTime[] | null> {
+  const body = await getJson('/api/v1/market/latest-times');
+  return body ? parseLatestTickTimes(body) : null;
 }
 
 // DART 공시: 저장된 첫 접수일·마지막 접수일. 저장된 것이 없으면 earliest/latest가 null인 객체, 확인하지 못하면 null.

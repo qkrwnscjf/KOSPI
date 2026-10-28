@@ -116,6 +116,8 @@ services:
     environment:
       - KAFKA_BROKERS=kafka:29092
       - POLLING_INTERVAL_MS=5000
+      # 다시 시작할 때 마지막 전송 시각을 묻는 내부 주소 (T-133). Docker 내부 네트워크만 쓴다. 닿지 못하면 예전처럼 모두 보낸다
+      - BACKEND_URL=http://backend:3001
     depends_on:
       kafka:
         condition: service_healthy
@@ -185,6 +187,24 @@ services:
       kafka:
         condition: service_healthy
       backend:
+        condition: service_healthy
+
+  # 증시 자금 흐름 일별 통계 수집기 (docs/Task_ORDER.md 11단계 B′ T-95): 공공데이터포털 금융투자협회 종합통계 → Kafka market-flows
+  # 공공데이터포털 키를 가진 컨테이너는 이것 하나뿐이다. 공개 포트 없음. 접속 대상은 코드에 고정된 apis.data.go.kr 하나(D-45 승인).
+  # 6시간마다 오퍼레이션 2개를 1번씩(최근 35일) 호출하고 바뀐 날짜만 보낸다(D-77). 키·한도 오류면 24시간 멈춘다.
+  market-stats-collector:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: kospi-market-stats-collector
+    restart: on-failure
+    command: ["node", "dist/infrastructure/market-stats/market-stats-collector.js"]
+    environment:
+      - KAFKA_BROKERS=kafka:29092
+      # 키는 프로젝트 루트의 .env에서 변수 치환으로만 받는다 (D-51). 키가 요청 주소에 들어가므로 주소는 로그에 남기지 않는다.
+      - DATA_GO_KR_SERVICE_KEY=${DATA_GO_KR_SERVICE_KEY:-}
+    depends_on:
+      kafka:
         condition: service_healthy
 
   # Frontend UI (Nginx)
