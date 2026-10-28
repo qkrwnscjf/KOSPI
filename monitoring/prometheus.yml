@@ -28,3 +28,8 @@ scrape_configs:
   - job_name: 'disclosure-collector'
     static_configs:
       - targets: ['disclosure-collector:9464']
+
+  # 증시 자금 흐름 수집기 (11단계 B′ T-95). 내부 전용 포트.
+  - job_name: 'market-stats-collector'
+    static_configs:
+      - targets: ['market-stats-collector:9464']

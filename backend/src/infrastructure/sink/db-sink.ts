@@ -392,7 +392,7 @@ async function handleMarketFlowsBatch({ batch, resolveOffset, heartbeat }: EachB
 
 // 데이터 신선도 (15단계 T-112): 데이터셋마다 가장 최근 값이 얼마나 오래됐는지(초). 앱 설정 화면의 파이프라인 상태와 Grafana에 쓴다.
 // 테이블 이름은 고정 목록이다. 비어 있는 데이터셋은 기록하지 않는다(값이 생긴 뒤부터 나타남).
-const dataLatestAge = new Gauge('kospi_db_latest_data_age_seconds', 'Seconds since the newest row of each dataset (market_ticks, index_daily, market_breadth, disclosures, stock_rankings)');
+const dataLatestAge = new Gauge('kospi_db_latest_data_age_seconds', 'Seconds since the newest row of each dataset (market_ticks, index_daily, market_breadth, disclosures, stock_rankings, market_flows)');
 
 async function recordFreshness() {
   const { rows } = await dbPool.query<{ dataset: string; age_s: number | null }>(`
@@ -401,6 +401,7 @@ async function recordFreshness() {
     UNION ALL SELECT 'market_breadth', extract(epoch FROM now() - max(time))::float8 FROM market_breadth
     UNION ALL SELECT 'disclosures', extract(epoch FROM now() - max(first_seen_at))::float8 FROM disclosures
     UNION ALL SELECT 'stock_rankings', extract(epoch FROM now() - max(time))::float8 FROM stock_rankings
+    UNION ALL SELECT 'market_flows', extract(epoch FROM now() - max(time))::float8 FROM market_flows
   `);
   for (const row of rows) {
     if (row.age_s !== null) dataLatestAge.set({ dataset: row.dataset }, Math.max(0, Math.round(row.age_s)));

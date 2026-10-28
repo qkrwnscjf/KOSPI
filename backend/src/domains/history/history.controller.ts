@@ -551,6 +551,30 @@ export function startHistorySelfCheck() {
       console.error(`[rankings-check] failed: ${error instanceof Error ? error.message : String(error)}`);
     }
 
+    // 1일 봉 종가 점검 (D-80 진단): 국내 지표의 가장 최근 1일 봉 종가와 Redis 최신값(Gateway가 받은 마지막 tick)을 비교한다.
+    // 스택이 장의 일부 시간만 떠 있던 날은 1일 봉 종가가 실제 마지막 값과 다를 수 있다(공개 시세 값만 기록)
+    try {
+      const checks: Record<string, unknown>[] = [];
+      for (const ticker of ['KOSPI', 'KOSDAQ', 'SAMSUNG'] as YahooSymbolKey[]) {
+        const { rows } = await dbPool.query<{ day: string; close: number }>(
+          `SELECT to_char(bucket AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day, close::float8 AS close
+           FROM market_1d WHERE symbol = $1 ORDER BY bucket DESC LIMIT 1`,
+          [ticker]
+        );
+        const raw = redis.status === 'ready' ? await redis.get(`latest_tick:${ticker}`) : null;
+        const latest = raw ? (JSON.parse(raw) as { price?: number; timestamp?: number }) : null;
+        const latestDay = typeof latest?.timestamp === 'number' ? new Date(latest.timestamp).toISOString().slice(0, 10) : null;
+        checks.push({
+          ticker, barDay: rows[0]?.day ?? null, barClose: rows[0]?.close ?? null,
+          latestDay, latestPrice: latest?.price ?? null,
+          sameDay: rows[0]?.day === latestDay, matches: rows[0]?.day === latestDay && rows[0]?.close === latest?.price,
+        });
+      }
+      console.log(`[close-check] ${JSON.stringify(checks)}`);
+    } catch (error) {
+      console.error(`[close-check] failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
     // 증시 자금 흐름 일별 통계 (11단계 B′): 가장 최근 기준일의 지표별 값. 공식 명세에 단위가 없어
     // 원본 통계 사이트(금융투자협회 종합통계)의 같은 날 숫자와 비교해 단위·이름을 확정하는 데 쓴다(공개 통계 값)
     try {

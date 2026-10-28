@@ -1,6 +1,6 @@
 import { producer, TOPICS, ensureTopics } from '../kafka.js';
 import { fetchJson, HttpJsonError, safeLogList, safeLogText } from '../http-json.js';
-import { Counter, metricsConfig, startMetricsLog, startMetricsServer } from '../metrics.js';
+import { Counter, Gauge, metricsConfig, startMetricsLog, startMetricsServer } from '../metrics.js';
 import { registerShutdown } from '../shutdown.js';
 import { dailyCloseTime, dailyValues, readDataGoKrResponse, type MarketFlow, type MarketFlowDataset } from '../../shared/market-flows.js';
 
@@ -31,6 +31,8 @@ const PAUSE_CODES = new Set(['20', '22', '30', '31', '32']);
 
 const fetchTotal = new Counter('kospi_market_stats_fetch_total', 'KOFIA statistics fetches by operation and result (ok / error / result_code)');
 const sentTotal = new Counter('kospi_market_stats_days_sent_total', 'Dataset-days sent to Kafka by dataset');
+// 수집 중단 알림용 (KRX·DART 수집기와 같은 방식): 오퍼레이션별 마지막 성공 시각
+const lastSuccessAt = new Gauge('kospi_market_stats_last_success_timestamp_seconds', 'Unix time of the last successful KOFIA statistics fetch, by operation');
 
 const lastSent = new Map<string, string>();
 let stopping = false;
@@ -78,6 +80,7 @@ async function collect(dataset: MarketFlowDataset, operation: string, key: strin
     return resultCode !== null && PAUSE_CODES.has(resultCode) ? 'pause' : 'error';
   }
   fetchTotal.inc({ operation, result: 'ok' });
+  lastSuccessAt.set({ operation }, Math.floor(Date.now() / 1000));
   if (Number.isFinite(totalCount) && totalCount > rows.length) {
     console.warn(`[market-stats] ${operation}: received ${rows.length} of ${totalCount} rows (window larger than one page)`);
   }

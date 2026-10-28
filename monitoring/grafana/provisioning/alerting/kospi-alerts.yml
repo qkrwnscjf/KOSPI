@@ -286,6 +286,37 @@ groups:
         annotations:
           summary: "KRX Open API가 인증을 거부했습니다(401/403). 포털에서 서비스 이용 승인과 키 상태를 확인하세요. 해당 API는 6시간 멈춥니다."
 
+      # 증시 자금 흐름 수집이 멈춤 (11단계 B′ T-95: 6시간마다 확인, 실패하면 최대 24시간까지 늦춤)
+      # 정상이면 마지막 성공이 6시간 안쪽이므로 13시간(두 주기 + 여유)을 넘으면 알린다
+      - uid: kospi-market-stats-stale
+        title: 증시 자금 흐름 수집 중단
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: time() - min(kospi_market_stats_last_success_timestamp_seconds)
+              instant: true
+          - refId: B
+            datasourceUid: __expr__
+            model: { refId: B, type: reduce, expression: A, reducer: last }
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [46800] }
+        for: 15m
+        noDataState: OK
+        execErrState: Error
+        labels: { severity: warning }
+        annotations:
+          summary: "증시 자금 흐름(공공데이터포털) 조회가 13시간 넘게 성공하지 못했습니다. 키 오류·호출 한도·네트워크를 확인하세요."
+
       # DART 하루 호출 수가 한도(추정 2만 건)의 75%를 넘음
       - uid: kospi-dart-quota
         title: DART 호출 한도 근접
