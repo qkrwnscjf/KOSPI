@@ -12,6 +12,7 @@ import { parseMarketFlow, type MarketFlow } from '../../shared/market-flows.js';
 import { parseYahooDaily, type YahooDailyMessage } from '../../shared/yahoo-daily.js';
 import { YAHOO_DAILY_SOURCE } from '../../shared/symbols.js';
 import { setWallClockTimeout } from '../wall-clock-timer.js';
+import { safeLogText } from '../http-json.js';
 import type { EachBatchPayload } from 'kafkajs';
 import { runBackfillOnce, runDailyHistoryBackfill, runOfficialCloseRefresh } from './backfill.js';
 import { clampWindow, mergeWindows, planLateRefresh, POLICY_START_OFFSET_MS, SAFE_RAW_WINDOW_MS, type RefreshWindow } from './late-refresh.js';
@@ -46,6 +47,7 @@ const dbJobFailures = new Gauge('kospi_db_job_failures', 'Total failures of each
 const dbRawOldestAge = new Gauge('kospi_db_raw_oldest_age_seconds', 'Age of the oldest row in market_ticks (raw retention target: 3h, D-02)');
 const DB_SIZE_INTERVAL_MS = 5 * 60 * 1000;
 const DAILY_HISTORY_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const CLOSE_REFRESH_CHECK_MS = 30 * 60 * 1000;
 // 11단계·12단계·T-67에서 추가한 테이블 (용량·청크·행 수 기록). 이름은 고정 목록이고 매개변수로만 SQL에 넘긴다.
 const EXTRA_TABLES = ['investor_flows', 'index_daily', 'disclosures', 'market_breadth', 'stock_rankings', 'market_flows'];
 const dbRows = new Gauge('kospi_db_rows', 'Row count of the smaller hypertables added in stages 11-12 (investor_flows, index_daily, disclosures)');
@@ -539,6 +541,46 @@ async function recordDbSize() {
   } catch (error) {
     console.error(`DB size check failed: ${error instanceof Error ? error.message : String(error)}`);
   }
+  await logJobErrors();
+}
+
+// TimescaleDB 사용 통계 전송 설정 확인 (SEC-017): 꺼져 있지 않으면 경고한다. 설정 이름과 값만 남긴다
+async function logTelemetryLevel() {
+  try {
+    const { rows } = await dbPool.query<{ level: string }>(`SELECT current_setting('timescaledb.telemetry_level') AS level`);
+    const level = safeLogText(rows[0]?.level ?? 'unknown', 20);
+    if (level === 'off') console.log(`DB telemetry level: ${level}`);
+    else console.warn(`DB telemetry level: ${level} (expected off, SEC-017)`);
+  } catch (error) {
+    console.warn(`DB telemetry level check failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+// TimescaleDB 작업 오류 기록 (T-147): 누적 실패 수만으로는 원인을 알 수 없어(B-52) 처음 보는 오류를 로그로 남긴다.
+// 기동 때는 DB에 남아 있는 최근 오류(최대 5건)도 함께 남긴다. 이 조회가 실패해도 수집에는 영향이 없다.
+let lastJobErrorAt: Date | null = null;
+
+async function logJobErrors() {
+  try {
+    const { rows } = await dbPool.query<{ job_id: number; proc_name: string; hypertable_name: string | null; finish_time: Date; sqlerrcode: string | null; err_message: string | null }>(
+      `SELECT e.job_id, e.proc_name, j.hypertable_name, e.finish_time, e.sqlerrcode, e.err_message
+       FROM timescaledb_information.job_errors e
+       LEFT JOIN timescaledb_information.jobs j ON j.job_id = e.job_id
+       WHERE $1::timestamptz IS NULL OR e.finish_time > $1::timestamptz
+       ORDER BY e.finish_time DESC
+       LIMIT 5`,
+      [lastJobErrorAt]
+    );
+    for (const row of [...rows].reverse()) {
+      console.warn(`[db-job-error] ${JSON.stringify({
+        job: row.job_id, proc: safeLogText(row.proc_name, 60), table: safeLogText(row.hypertable_name ?? '', 60),
+        at: row.finish_time, code: safeLogText(row.sqlerrcode ?? '', 10), message: safeLogText(row.err_message ?? '', 200),
+      })}`);
+    }
+    lastJobErrorAt = rows[0]?.finish_time ?? lastJobErrorAt ?? new Date();
+  } catch (error) {
+    console.warn(`DB job error check failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 async function run() {
@@ -638,6 +680,7 @@ async function run() {
   });
 
   console.log('DB sink consumer started.');
+  void logTelemetryLevel();
 
   // 최초 1회 과거 데이터 채우기 (T-19). 실시간 적재와 동시에 진행하고, 실패해도 적재는 계속한다 (다음 기동에서 다시 시도).
   // 이어서 나중에 추가한 지표의 과거 일봉을 채운다 (T-104 ③). 집계를 다시 계산하지 않으므로 위 채우기의 결과와 무관하게 실행한다.
@@ -662,11 +705,16 @@ async function run() {
   const scheduleDailyHistory = () => setWallClockTimeout(() => {
     runDailyHistoryBackfill(dlqProducer)
       .catch(error => console.error(`Daily history backfill failed: ${error instanceof Error ? error.message : String(error)}`))
-      .then(() => runOfficialCloseRefresh(dlqProducer))
-      .catch(error => console.error(`Official close refresh failed: ${error instanceof Error ? error.message : String(error)}`))
       .finally(scheduleDailyHistory);
   }, DAILY_HISTORY_INTERVAL_MS);
   scheduleDailyHistory();
+  // 공식 종가는 장이 끝난 뒤 빨리 받도록 30분마다 확인한다 (T-145). 받을 지표가 없으면 외부 호출 없음
+  const scheduleCloseRefresh = () => setWallClockTimeout(() => {
+    runOfficialCloseRefresh(dlqProducer)
+      .catch(error => console.error(`Official close refresh failed: ${error instanceof Error ? error.message : String(error)}`))
+      .finally(scheduleCloseRefresh);
+  }, CLOSE_REFRESH_CHECK_MS);
+  scheduleCloseRefresh();
 
   // 종료 처리 (docs/Task_ORDER.md T-28): 컨슈머를 먼저 끊는다. kafkajs는 처리 중인 묶음이 끝날 때까지 기다린 뒤 그룹에서 나간다.
   // 커밋하지 못한 묶음은 다음 기동에서 다시 처리되고, 중복은 유니크 제약이 건너뛴다(at-least-once).

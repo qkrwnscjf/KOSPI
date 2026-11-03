@@ -10,8 +10,11 @@ import type { YahooSymbolKey } from '../../shared/symbols.js';
 // 장 시간이 정해진 시장의 지표는 장이 끝난 뒤 Yahoo 일봉(공식 종가)을 index_daily에 받아 두고, 그래프·리스크 계산은 그 값을 먼저 쓴다.
 // 24시간 시장(환율·원자재·VIX)은 하루 종가의 기준이 소스마다 달라 지금처럼 집계를 쓴다.
 export const CLOSE_FIX_DAYS = 10;
-export const CLOSE_FIX_REFETCH_MS = 20 * 3600_000; // 지표마다 하루 한 번
 export const usesOfficialDailyClose = (key: YahooSymbolKey) => YAHOO_MARKET[key] !== 'global_24h';
+// 당일 봉 확정 (T-145): 그 시장의 장이 끝나고 30분 뒤부터 받는다. 지표마다 장 하나에 한 번이고, 다음 장 뒤에 최근 10일을 다시 받아 정정도 반영한다
+export const CLOSE_FIX_MARGIN_MS = 30 * 60_000;
+export const shouldRefreshClose = (lastFetchedMs: number | undefined, sessionEndMs: number | null, marginMs = CLOSE_FIX_MARGIN_MS) =>
+  sessionEndMs !== null && (lastFetchedMs === undefined || lastFetchedMs < sessionEndMs + marginMs);
 
 export interface DailyBar {
   time: Date;
@@ -34,10 +37,12 @@ const seoulDay = (ms: number) => new Date(ms + 9 * 3600_000).toISOString().slice
 // - 시작한 지 24시간이 지나지 않은 봉은 아직 끝나지 않았을 수 있어(장중 값) 넣지 않는다. 시장마다 장 시간이 달라
 //   "서울 기준 오늘"로 거르면 미국 장의 진행 중인 봉이 들어간다. 빠진 날은 실시간 집계가 만들거나 이음매 확인 때 다시 받는다.
 // - 같은 날짜가 두 번 오면 마지막 값을 쓴다.
-export function toDailyRows(bars: DailyBar[], nowMs: number): DailyRow[] {
+// - finishedBeforeMs를 주면(T-145, 장 시간이 정해진 시장) 24시간 대신 이 시각보다 앞선 봉을 끝난 봉으로 본다.
+//   진행 중인 봉의 시각은 마지막 거래 시각이라, 지난 장의 마감 + 여유 시간보다 늦다.
+export function toDailyRows(bars: DailyBar[], nowMs: number, finishedBeforeMs?: number): DailyRow[] {
   const byDay = new Map<string, DailyRow>();
   for (const bar of bars) {
-    if (bar.time.getTime() > nowMs - 86_400_000) continue;
+    if (finishedBeforeMs !== undefined ? bar.time.getTime() >= finishedBeforeMs : bar.time.getTime() > nowMs - 86_400_000) continue;
     const day = seoulDay(bar.time.getTime());
     byDay.set(day, { time: closeTimestamp(day), close: bar.price, changeRate: bar.changeRate, changePrice: bar.changePrice });
   }

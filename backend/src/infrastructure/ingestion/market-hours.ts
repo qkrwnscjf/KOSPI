@@ -82,6 +82,29 @@ function zonedClock(date: Date, timeZone: string) {
 const isWeekday = (day: number) => day >= 1 && day <= 5;
 const hm = (hour: number, minute = 0) => hour * 60 + minute;
 
+// 정규 장 마감 시각 (T-145). 24시간 시장은 하루 종가의 기준이 없어 넣지 않는다
+const SESSION_CLOSE: Partial<Record<MarketId, { timeZone: string; close: number }>> = {
+  krx: { timeZone: 'Asia/Seoul', close: hm(15, 30) },
+  us_equity: { timeZone: 'America/New_York', close: hm(16) },
+  tokyo: { timeZone: 'Asia/Tokyo', close: hm(15, 30) },
+  taiwan: { timeZone: 'Asia/Taipei', close: hm(13, 30) },
+};
+
+// 마감 후 marginMs가 지난 가장 최근 평일 장의 마감 시각(ms). 공휴일은 시간표로 알 수 없어 평일로 친다(그날 봉이 없을 뿐이다).
+// 일수를 빼서 계산하므로 미국 서머타임이 바뀌는 주말을 건너뛸 때 1시간 어긋날 수 있다(받는 시점만 달라지고 값은 같다).
+export function latestSessionEnd(market: MarketId, nowMs: number, marginMs: number): number | null {
+  const session = SESSION_CLOSE[market];
+  if (!session) return null;
+  const at = nowMs - marginMs;
+  const { day, minutes } = zonedClock(new Date(at), session.timeZone);
+  const todayClose = at - (minutes - session.close) * 60_000;
+  for (let back = minutes >= session.close ? 0 : 1; back <= 7; back += 1) {
+    const candidate = todayClose - back * 86_400_000;
+    if (isWeekday((day - back + 7) % 7)) return candidate;
+  }
+  return null;
+}
+
 export const MARKETS: { id: MarketId; isOpen: (now: Date) => boolean }[] = [
   {
     // KOSPI, KOSDAQ: 월~금 09:00 ~ 15:30 (서울)

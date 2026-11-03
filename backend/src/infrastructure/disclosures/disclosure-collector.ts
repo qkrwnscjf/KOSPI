@@ -127,95 +127,9 @@ async function fetchListPage(client: DartClient, bgnDe: string, endDe: string, p
   return { items, rceptNos, totalPage, rawCount: list.length };
 }
 
-// ── 금액 누락 진단 (docs/Task_ORDER.md T-81, 검증용 스위치 DISCLOSURE_DIAGNOSE=true) ──
-// 금액을 못 찾은 자본 이벤트마다 원인 단서를 모으고, 과거 채우기가 끝나면 요약을 한 줄 로그로 남긴다.
-// 수집 결과(보내는 메시지·금액)는 바꾸지 않는다. 진단 모드에서만 조회 기간을 넓혀 한 번 더 찾는다(호출이 늘어남).
-// 로그에는 분류 이름·건수·공개된 접수번호(숫자) 일부만 남긴다.
-const DIAGNOSE = process.env.DISCLOSURE_DIAGNOSE === 'true';
-const DIAG_WIDER_DAYS_BEFORE = 7;
-interface AmountDiagnosis {
-  rceptNo: string;
-  kind: string;
-  reason: 'api_empty' | 'other_rcept' | 'empty_fields' | 'no_detail_api';
-  reportType: 'major_report' | 'other_title';  // 제목에 "주요사항보고서"가 있는지
-  isCorrection: boolean;
-  correctionExists: boolean;                   // 같은 회사·종류의 정정 공시가 이번 범위에 있는지
-  laterRows: number;                           // 금액 API가 돌려준 행 중 접수번호가 더 늦은 것
-  earlierRows: number;
-  foundWider: boolean | null;                  // 조회 기간을 넓혀 다시 찾았을 때 있는지 (진단 모드만)
-}
-const diagnoses: AmountDiagnosis[] = [];
-let diagFound = 0;
-
-const isMajorReport = (item: DisclosureBase) => item.reportName.replace(/\s+/g, '').includes('주요사항보고서');
-
-function diagnose(item: DisclosureBase, reason: AmountDiagnosis['reason'], rows: Record<string, unknown>[], all: DisclosureBase[]) {
-  diagnoses.push({
-    rceptNo: item.rceptNo,
-    kind: item.kind,
-    reason,
-    reportType: isMajorReport(item) ? 'major_report' : 'other_title',
-    isCorrection: item.isCorrection,
-    correctionExists: all.some(other => other.corpCode === item.corpCode && other.kind === item.kind && other.isCorrection && other.rceptNo !== item.rceptNo),
-    laterRows: rows.filter(row => typeof row.rcept_no === 'string' && row.rcept_no > item.rceptNo).length,
-    earlierRows: rows.filter(row => typeof row.rcept_no === 'string' && row.rcept_no < item.rceptNo).length,
-    foundWider: null,
-  });
-}
-
-// 진단 모드: 행을 못 찾은 건만 조회 기간을 넓혀(접수일 −7일 ~ 오늘) 다시 찾아본다
-async function diagnoseWider(client: DartClient) {
-  for (const entry of diagnoses) {
-    if (stopping || entry.foundWider !== null || (entry.reason !== 'api_empty' && entry.reason !== 'other_rcept')) continue;
-    const detail = DETAIL_ENDPOINTS[entry.kind as keyof typeof DETAIL_ENDPOINTS];
-    const corpCode = diagCorp.get(entry.rceptNo);
-    if (!detail || !corpCode) continue;
-    try {
-      const date = entry.rceptNo.slice(0, 8);
-      const bgn = new Date(Date.UTC(Number(date.slice(0, 4)), Number(date.slice(4, 6)) - 1, Number(date.slice(6, 8))) - DIAG_WIDER_DAYS_BEFORE * 86_400_000)
-        .toISOString().slice(0, 10).replace(/-/g, '');
-      const { body } = await request(client, 'detail', detail.endpoint, { corp_code: corpCode, bgn_de: bgn, end_de: toDartDate(seoulDate()) });
-      entry.foundWider = listOf(body).some(row => !!row && typeof row === 'object' && (row as Record<string, unknown>).rcept_no === entry.rceptNo);
-    } catch (error) {
-      if (error instanceof DartApiError && error.code && (DART_KEY_ERRORS.has(error.code) || error.code === DART_STATUS.rateLimited)) throw error;
-    }
-  }
-}
-const diagCorp = new Map<string, string>();
-
-// 요약: 원인 조합별 건수와 확인용 접수번호 예시(분류마다 최대 5개)
-function logDiagnosis() {
-  const groups = new Map<string, { count: number; samples: string[] }>();
-  for (const entry of diagnoses) {
-    const key = [entry.reason, entry.reportType, entry.isCorrection ? 'correction' : 'original',
-      entry.correctionExists ? 'has_correction' : 'no_correction', entry.laterRows > 0 ? 'later_rows' : 'no_later_rows',
-      entry.foundWider === null ? 'wider_na' : entry.foundWider ? 'found_wider' : 'not_found_wider'].join('|');
-    const group = groups.get(key) ?? { count: 0, samples: [] };
-    group.count += 1;
-    if (group.samples.length < 5) group.samples.push(entry.rceptNo);
-    groups.set(key, group);
-  }
-  const byKind: Record<string, Record<string, number>> = {};
-  for (const entry of diagnoses) {
-    byKind[entry.kind] ??= {};
-    const kindCounts = byKind[entry.kind]!;
-    kindCounts[entry.reason] = (kindCounts[entry.reason] ?? 0) + 1;
-  }
-  const combos = [...groups.entries()].sort((a, b) => b[1].count - a[1].count).map(([key, value]) => ({ key, ...value }));
-  console.log(`[dart-diag] ${JSON.stringify({ found: diagFound, missing: diagnoses.length, byKind, combos })}`);
-}
-
 // 희석·주주환원 공시의 금액. 같은 회사·같은 API는 한 번에 조회한다 (접수일 범위로 받아 접수번호로 짝지음).
 async function resolveAmounts(client: DartClient, items: DisclosureBase[]) {
   const amounts = new Map<string, number | null>();
-  if (DIAGNOSE) {
-    for (const item of items) {
-      if (item.group === 'dilution' || item.group === 'shareholder_return' || item.group === 'treasury_disposal') {
-        if (!DETAIL_ENDPOINTS[item.kind]) diagnose(item, 'no_detail_api', [], items);
-        else diagCorp.set(item.rceptNo, item.corpCode);
-      }
-    }
-  }
   const groups = new Map<string, { endpoint: string; fields: readonly string[]; corpCode: string; items: DisclosureBase[] }>();
   for (const item of items) {
     const detail = DETAIL_ENDPOINTS[item.kind];
@@ -246,10 +160,6 @@ async function resolveAmounts(client: DartClient, items: DisclosureBase[]) {
         amounts.set(item.rceptNo, amount);
         // 금액이 없는 이유를 나눠 센다: no_row = 주요사항보고서 API에 그 접수번호가 없음, empty_fields = 행은 있으나 금액 필드가 비어 있음
         amountTotal.inc({ result: amount !== null ? 'found' : row ? 'empty_fields' : 'no_row', kind: item.kind });
-        if (DIAGNOSE) {
-          if (amount !== null) diagFound += 1;
-          else diagnose(item, row ? 'empty_fields' : rows.length === 0 ? 'api_empty' : 'other_rcept', rows, items);
-        }
       }
     } catch (error) {
       // 금액을 못 받아도 공시 자체는 보낸다 (금액 없음). 키·한도 문제는 위로 올려 수집을 멈춘다
@@ -317,8 +227,7 @@ async function backfill(client: DartClient): Promise<boolean> {
   }
   const targetStart = toDartDate(daysAgo(BACKFILL_DAYS));
   const today = toDartDate(seoulDate());
-  // 진단 모드(T-81)는 이미 저장된 기간도 전부 다시 확인한다 (1회용 검증 스위치)
-  const ranges = DIAGNOSE ? [[targetStart, today] as [string, string]] : backfillRanges(targetStart, today, stored.coverage);
+  const ranges = backfillRanges(targetStart, today, stored.coverage);
   const startedAt = Date.now();
   let total = 0;
   // 3개월 창 목록 (회사 지정 없는 검색의 기간 제한)
@@ -347,10 +256,6 @@ async function backfill(client: DartClient): Promise<boolean> {
     await send(items, amounts, false, startedAt);
     for (const rceptNo of windowNos) seen.add(rceptNo);
     total += items.length;
-  }
-  if (DIAGNOSE && !stopping) {
-    await diagnoseWider(client);
-    logDiagnosis();
   }
   const storedText = stored.coverage ? `${stored.coverage.earliest}-${stored.coverage.latest}` : 'none';
   const rangeText = ranges.map(([from, to]) => `${from}-${to}`).join(',');

@@ -1,7 +1,8 @@
 // 나중에 추가한 Yahoo 지표의 과거 일봉 테스트 (docs/Task_ORDER.md T-104 ③, D-67)
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { GAP_FILL_DAYS, missingWeekdays, needsDailyHistory, toDailyRows, usesOfficialDailyClose } from '../src/infrastructure/sink/daily-history.js';
+import { GAP_FILL_DAYS, missingWeekdays, needsDailyHistory, shouldRefreshClose, toDailyRows, usesOfficialDailyClose } from '../src/infrastructure/sink/daily-history.js';
+import { latestSessionEnd } from '../src/infrastructure/ingestion/market-hours.js';
 import { nextCollectDelay, RETRY_AFTER_ERROR_MS } from '../src/infrastructure/market-stats/collect-schedule.js';
 import { YAHOO_KEYS } from '../src/shared/symbols.js';
 import { setWallClockTimeout } from '../src/infrastructure/wall-clock-timer.js';
@@ -51,6 +52,41 @@ test('datesToCheck: 확인한 적 없는 날짜는 뒤 날짜를 먼저 받았�
   assert.deepEqual(datesToCheck(dates, received, now), ['20261028', '20261029']);
   const emptyThenReceived = new Map([['20261029', { lastEmptyAt: now - 2 * 3600_000 }], ['20261102', { receivedAt: now - 1000 }]]);
   assert.deepEqual(datesToCheck(dates, emptyThenReceived, now), ['20261028']);
+});
+
+test('latestSessionEnd: 마감 30분 뒤부터 그날, 그 전이나 주말은 직전 평일 장 (T-145)', () => {
+  const margin = 30 * 60_000;
+  const iso = (value: number | null) => (value === null ? null : new Date(value).toISOString().slice(0, 16));
+  // 화요일 16:00 KST = 07:00 UTC: 오늘 15:30 마감
+  assert.equal(iso(latestSessionEnd('krx', Date.parse('2026-11-03T07:00:00Z'), margin)), '2026-11-03T06:30');
+  // 화요일 15:50 KST: 아직 30분이 안 지나 월요일 장
+  assert.equal(iso(latestSessionEnd('krx', Date.parse('2026-11-03T06:50:00Z'), margin)), '2026-11-02T06:30');
+  // 월요일 10:00 KST: 금요일 장, 토요일도 금요일 장
+  assert.equal(iso(latestSessionEnd('krx', Date.parse('2026-11-02T01:00:00Z'), margin)), '2026-10-30T06:30');
+  assert.equal(iso(latestSessionEnd('krx', Date.parse('2026-10-31T01:00:00Z'), margin)), '2026-10-30T06:30');
+  // 미국(11월은 UTC-5): 화요일 16:30 뉴욕 = 21:30 UTC
+  assert.equal(iso(latestSessionEnd('us_equity', Date.parse('2026-11-03T21:30:00Z'), margin)), '2026-11-03T21:00');
+  assert.equal(iso(latestSessionEnd('us_equity', Date.parse('2026-11-03T15:00:00Z'), margin)), '2026-11-02T21:00');
+  assert.equal(latestSessionEnd('global_24h', Date.parse('2026-11-03T07:00:00Z'), margin), null);
+});
+
+test('shouldRefreshClose: 처음이거나 지난 장 마감 뒤에 받은 적이 없을 때만 (T-145)', () => {
+  const end = Date.parse('2026-11-03T06:30:00Z');
+  assert.equal(shouldRefreshClose(undefined, end), true);
+  assert.equal(shouldRefreshClose(end - 3600_000, end), true);
+  assert.equal(shouldRefreshClose(end + 31 * 60_000, end), false);
+  assert.equal(shouldRefreshClose(undefined, null), false);
+});
+
+test('toDailyRows: 끝난 장의 봉은 받고 진행 중인 봉은 뺀다 (T-145)', () => {
+  const now = Date.parse('2026-11-03T07:00:00Z'); // 16:00 KST
+  const cutoff = Date.parse('2026-11-03T07:00:00Z'); // 마감 + 30분
+  // 오늘 봉의 시각이 마지막 거래 시각(15:30:xx)이어도 받는다. 24시간 규칙이면 빠졌을 봉이다
+  const rows = toDailyRows([bar('2026-11-02T00:00:00Z', 100), bar('2026-11-03T06:30:12Z', 101)], now, cutoff);
+  assert.deepEqual(rows.map(row => row.close), [100, 101]);
+  // 장중(11:00 KST): 지난 장 기준 시각이 월요일이라 오늘 봉은 뺀다
+  const live = toDailyRows([bar('2026-11-02T00:00:00Z', 100), bar('2026-11-03T02:00:00Z', 101)], Date.parse('2026-11-03T02:00:00Z'), Date.parse('2026-11-02T07:00:00Z'));
+  assert.deepEqual(live.map(row => row.close), [100]);
 });
 
 test('parseYahooDaily: 정상 메시지와 잘못된 값 (T-143)', () => {

@@ -5,7 +5,8 @@ import { TOPICS } from '../kafka.js';
 import { YAHOO_CATEGORY, YAHOO_DAILY_HISTORY_KEYS, YAHOO_KEYS, YAHOO_SYMBOLS } from '../../shared/symbols.js';
 import type { YahooSymbolKey } from '../../shared/symbols.js';
 import type { YahooDailyMessage } from '../../shared/yahoo-daily.js';
-import { CLOSE_FIX_DAYS, CLOSE_FIX_REFETCH_MS, GAP_LOOKBACK_DAYS, missingWeekdays, needsDailyHistory, toDailyRows, usesOfficialDailyClose, type DailyRow } from './daily-history.js';
+import { latestSessionEnd, YAHOO_MARKET } from '../ingestion/market-hours.js';
+import { CLOSE_FIX_DAYS, CLOSE_FIX_MARGIN_MS, GAP_LOOKBACK_DAYS, missingWeekdays, needsDailyHistory, shouldRefreshClose, toDailyRows, usesOfficialDailyClose, type DailyRow } from './daily-history.js';
 
 // 최초 1회 과거 데이터 채우기 (docs/Task_ORDER.md T-19, R-05, D-06)
 // 연속 집계에는 직접 넣을 수 없어서, 원본(market_ticks)에 종가를 넣고 → 집계를 전체 갱신하고 →
@@ -186,9 +187,10 @@ export async function runDailyHistoryBackfill(producer: Producer) {
 }
 
 // 공식 종가 보정 (docs/Task_ORDER.md T-136, D-81)
-// 장 시간이 정해진 시장의 지표(국내·미국·도쿄·대만)는 지표마다 하루 한 번, 최근 10일 Yahoo 일봉(공식 종가)을 index_daily에 넣는다.
+// 장 시간이 정해진 시장의 지표(국내·미국·도쿄·대만)는 그 시장의 장이 끝나고 30분 뒤(T-145) 한 번, 최근 10일 Yahoo 일봉(공식 종가)을 index_daily에 넣는다.
 // 이미 있는 Yahoo 일봉은 새 값으로 바꾼다(이전에 들어간 값이 확정 전이었을 수 있음). KRX 일봉(source 'krx', 코스피 200)은 건드리지 않는다.
-// 시작한 지 24시간이 안 된 봉은 넣지 않는다(toDailyRows). 집계(market_1d)는 다시 계산하지 않는다(저장 불변 조건).
+// 아직 끝나지 않은 장의 봉은 넣지 않는다(toDailyRows). 집계(market_1d)는 다시 계산하지 않는다(저장 불변 조건).
+// 받지 못한 지표는 다음 확인(30분 뒤) 때 다시 시도한다.
 const lastCloseFixAt = new Map<YahooSymbolKey, number>();
 
 export async function runOfficialCloseRefresh(producer: Producer) {
@@ -197,14 +199,15 @@ export async function runOfficialCloseRefresh(producer: Producer) {
   for (const symbol of YAHOO_KEYS) {
     if (!usesOfficialDailyClose(symbol)) continue;
     const now = Date.now();
-    if (now - (lastCloseFixAt.get(symbol) ?? 0) < CLOSE_FIX_REFETCH_MS) continue;
-    lastCloseFixAt.set(symbol, now);
+    const sessionEnd = latestSessionEnd(YAHOO_MARKET[symbol], now, CLOSE_FIX_MARGIN_MS);
+    if (sessionEnd === null || !shouldRefreshClose(lastCloseFixAt.get(symbol), sessionEnd)) continue;
     calls += 1;
     try {
       // 등락 계산에 직전 봉이 하나 더 필요해 하루 더 받는다
-      const rows = toDailyRows(await fetchBars(symbol, '1d', CLOSE_FIX_DAYS + 1), now);
+      const rows = toDailyRows(await fetchBars(symbol, '1d', CLOSE_FIX_DAYS + 1), now, sessionEnd + CLOSE_FIX_MARGIN_MS);
       await sendDailyRows(producer, symbol, rows, true);
       sent += rows.length;
+      lastCloseFixAt.set(symbol, now);
     } catch (error) {
       console.error(`Official close refresh ${symbol} failed: ${error instanceof Error ? error.message : String(error)}`);
     }

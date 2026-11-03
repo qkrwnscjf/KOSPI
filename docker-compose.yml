@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # Apache Kafka (Message Queue) — KRaft 모드: Zookeeper 없이 브로커가 컨트롤러 역할도 한다 (docs/Task_ORDER.md T-89)
   kafka:
@@ -57,6 +55,8 @@ services:
   timescaledb:
     image: timescale/timescaledb:latest-pg14
     container_name: kospi-timescaledb
+    # 사용 통계 전송을 끈다 (docs/security.md SEC-017). 기존 볼륨에도 적용되도록 실행 옵션으로 준다
+    command: ["postgres", "-c", "timescaledb.telemetry_level=off"]
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: password

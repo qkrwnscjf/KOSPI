@@ -42,6 +42,23 @@ const TICKS_RETENTION_MS = 24 * 60 * 60 * 1000; // 24시간: DB Sink가 하루 �
 const DLQ_RETENTION_MS = 7 * 24 * 60 * 60 * 1000; // 7일: 잘못된 메시지 원인 분석용
 const FLOWS_RETENTION_MS = 7 * 24 * 60 * 60 * 1000; // 7일: 하루 수천 건 이하라 길게 둬도 작음. DB Sink가 며칠 멈춰도 다시 채울 수 있음
 
+const topicDefinition = (topic: string, retentionMs: number, numPartitions = 1) => ({
+  topic,
+  numPartitions,
+  replicationFactor: 1,
+  configEntries: [{ name: 'retention.ms', value: String(retentionMs) }],
+});
+
+const TOPIC_DEFINITIONS = [
+  topicDefinition(TOPICS.ticks, TICKS_RETENTION_MS, TICKS_PARTITIONS),
+  topicDefinition(TOPICS.dlq, DLQ_RETENTION_MS),
+  topicDefinition(TOPICS.flows, FLOWS_RETENTION_MS),
+  topicDefinition(TOPICS.flowsDlq, DLQ_RETENTION_MS),
+  // KRX 일별 지수·DART 공시도 하루 수백 건 이하라 7일 보관 (DB Sink가 며칠 멈춰도 다시 채울 수 있음)
+  ...[TOPICS.indexDaily, TOPICS.disclosures, TOPICS.breadth, TOPICS.rankings, TOPICS.marketFlows, TOPICS.yahooDaily].map(topic => topicDefinition(topic, FLOWS_RETENTION_MS)),
+  ...[TOPICS.indexDailyDlq, TOPICS.disclosuresDlq, TOPICS.breadthDlq, TOPICS.rankingsDlq, TOPICS.marketFlowsDlq, TOPICS.yahooDailyDlq].map(topic => topicDefinition(topic, DLQ_RETENTION_MS)),
+];
+
 // 토픽이 없으면 만든다. worker, Gateway, DB Sink가 시작할 때 각자 호출하므로 어느 쪽이 먼저 떠도 같은 설정으로 만들어진다.
 // 이미 있으면 그대로 두고, 파티션 수가 설정과 다르면 경고만 남긴다 (파티션은 줄일 수 없어서 자동으로 바꾸지 않는다).
 export async function ensureTopics() {
@@ -49,48 +66,10 @@ export async function ensureTopics() {
   await admin.connect();
   try {
     try {
-      await admin.createTopics({
-        waitForLeaders: true,
-        topics: [
-          {
-            topic: TOPICS.ticks,
-            numPartitions: TICKS_PARTITIONS,
-            replicationFactor: 1,
-            configEntries: [{ name: 'retention.ms', value: String(TICKS_RETENTION_MS) }],
-          },
-          {
-            topic: TOPICS.dlq,
-            numPartitions: 1,
-            replicationFactor: 1,
-            configEntries: [{ name: 'retention.ms', value: String(DLQ_RETENTION_MS) }],
-          },
-          {
-            topic: TOPICS.flows,
-            numPartitions: 1,
-            replicationFactor: 1,
-            configEntries: [{ name: 'retention.ms', value: String(FLOWS_RETENTION_MS) }],
-          },
-          {
-            topic: TOPICS.flowsDlq,
-            numPartitions: 1,
-            replicationFactor: 1,
-            configEntries: [{ name: 'retention.ms', value: String(DLQ_RETENTION_MS) }],
-          },
-          // KRX 일별 지수·DART 공시도 하루 수백 건 이하라 7일 보관 (DB Sink가 며칠 멈춰도 다시 채울 수 있음)
-          ...[TOPICS.indexDaily, TOPICS.disclosures, TOPICS.breadth, TOPICS.rankings, TOPICS.marketFlows, TOPICS.yahooDaily].map(topic => ({
-            topic,
-            numPartitions: 1,
-            replicationFactor: 1,
-            configEntries: [{ name: 'retention.ms', value: String(FLOWS_RETENTION_MS) }],
-          })),
-          ...[TOPICS.indexDailyDlq, TOPICS.disclosuresDlq, TOPICS.breadthDlq, TOPICS.rankingsDlq, TOPICS.marketFlowsDlq, TOPICS.yahooDailyDlq].map(topic => ({
-            topic,
-            numPartitions: 1,
-            replicationFactor: 1,
-            configEntries: [{ name: 'retention.ms', value: String(DLQ_RETENTION_MS) }],
-          })),
-        ],
-      });
+      // 없는 토픽만 만든다 (T-146). 이미 있는 토픽까지 요청하면 브로커 오류 응답이 ERROR 로그로 남아 진짜 오류가 묻힌다
+      const existing = new Set(await admin.listTopics());
+      const topics = TOPIC_DEFINITIONS.filter(definition => !existing.has(definition.topic));
+      if (topics.length > 0) await admin.createTopics({ waitForLeaders: true, topics });
     } catch (error) {
       // 여러 서비스가 동시에 만들려고 하면 "이미 있음" 에러가 날 수 있다. 아래 메타데이터 확인으로 판단한다.
       console.warn(`createTopics: ${error instanceof Error ? error.message : String(error)}`);
