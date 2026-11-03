@@ -4,6 +4,7 @@ import { dbPool } from '../../infrastructure/db.js';
 import { Latency } from '../../infrastructure/metrics.js';
 import { DERIVED_SPREADS, isDerivedSymbol, isSubscribableSymbol, isYahooSymbolKey, YAHOO_KEYS } from '../../shared/symbols.js';
 import { isMarketState } from '../../shared/market-state.js';
+import { usesOfficialDailyClose } from '../../infrastructure/sink/daily-history.js';
 import { BREADTH_MARKETS, type BreadthMarket } from '../../shared/breadth.js';
 import type { DerivedSymbol, YahooSymbolKey } from '../../shared/symbols.js';
 import { isKrxDailySymbol, KRX_SECTOR_KEYS, type KrxDailySymbol } from '../../shared/krx-indices.js';
@@ -50,6 +51,27 @@ async function getHistory(ticker: YahooSymbolKey, timeframe: Timeframe): Promise
   // 일봉 출처는 Yahoo(source 'yahoo') 또는 Yahoo가 주지 않는 지표의 KRX(source 'krx', 코스피 200)다. (symbol, time)이 유일해서 날짜당 1행.
   // - 그 날짜에 집계 버킷이 있으면 집계가 우선이라 같은 날짜가 두 번 나오지 않는다.
   // - 일봉 시각은 집계 버킷과 같은 기준(UTC 자정)으로 맞춘다. 1일·1주(5분·1시간 봉)는 해상도가 달라 붙이지 않는다.
+  // 장 시간이 정해진 시장의 지표(T-136, D-81)는 반대로 일봉(공식 종가)을 먼저 쓰고, 일봉이 없는 날(오늘·아직 받지 않은 날)만 집계를 쓴다.
+  // 스택이 장의 일부만 떠 있던 날 집계 종가가 틀리는 문제(B-49) 때문. 집계 자체는 바꾸지 않는다.
+  if (view === 'market_1d' && usesOfficialDailyClose(ticker)) {
+    const { rows } = await dbPool.query<HistoryPoint>(
+      `WITH daily AS (
+         SELECT time_bucket(INTERVAL '1 day', d.time) AS t, d.close
+         FROM index_daily d WHERE d.symbol = $1 AND d.time >= now() - $2::interval
+       )
+       SELECT (extract(epoch FROM t) * 1000)::float8 AS time, close::float8 AS value
+       FROM (
+         SELECT t, close FROM daily
+         UNION ALL
+         SELECT a.bucket AS t, a.close FROM market_1d a
+         WHERE a.symbol = $1 AND a.bucket >= now() - $2::interval
+           AND NOT EXISTS (SELECT 1 FROM daily WHERE daily.t = a.bucket)
+       ) merged
+       ORDER BY t`,
+      [ticker, range]
+    );
+    return rows;
+  }
   if (view === 'market_1d') {
     const { rows } = await dbPool.query<HistoryPoint>(
       `WITH agg AS (
@@ -573,6 +595,57 @@ export function startHistorySelfCheck() {
       console.log(`[close-check] ${JSON.stringify(checks)}`);
     } catch (error) {
       console.error(`[close-check] failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    // 공식 종가 보정 점검 (T-136, B-51): 최근 14일, Yahoo 27종 전부(공개 시세 값만)
+    // - 장 시간이 정해진 시장 17종: 집계 종가가 공식 종가(Yahoo 일봉)와 다른 날(이전 규칙에서 그래프가 보여 주던 값), 지금 API 값이 공식 종가와 다른 날
+    // - 24시간 시장 10종: API 값이 집계와 다른 날(이전 규칙 그대로인지)
+    // - 모두: 집계나 일봉이 있는 날인데 API에 없는 날, 두 번 나오는 날
+    // KRX로 대조할 수 있는 5종은 날짜별 값을 따로 남긴다([official-close-values] ↔ krx-collector [krx-close-check])
+    try {
+      const official: Record<string, unknown>[] = [];
+      const aggFirst: Record<string, unknown>[] = [];
+      const values: Record<string, unknown> = {};
+      const differs = (a: number, b: number) => Math.abs(a - b) > 0.005;
+      for (const ticker of YAHOO_KEYS) {
+        const { rows } = await dbPool.query<{ day: string; agg: number | null; daily: number | null }>(
+          `SELECT day, max(agg) AS agg, max(daily) AS daily FROM (
+             SELECT to_char(bucket AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day, close::float8 AS agg, NULL::float8 AS daily
+             FROM market_1d WHERE symbol = $1 AND bucket >= now() - INTERVAL '14 days'
+             UNION ALL
+             SELECT to_char(time_bucket(INTERVAL '1 day', time) AT TIME ZONE 'UTC', 'YYYY-MM-DD'), NULL, close::float8
+             FROM index_daily WHERE symbol = $1 AND time >= now() - INTERVAL '14 days'
+           ) x GROUP BY day ORDER BY day`,
+          [ticker]
+        );
+        const apiPoints = (await getHistory(ticker, '1개월')).map(point => ({ day: new Date(point.time).toISOString().slice(0, 10), value: point.value }));
+        const api = new Map(apiPoints.map(point => [point.day, point.value]));
+        const missingDays = rows.filter(row => !api.has(row.day)).map(row => row.day);
+        const duplicateDays = [...new Set(apiPoints.filter((point, index) => apiPoints.findIndex(other => other.day === point.day) !== index).map(point => point.day))];
+        if (usesOfficialDailyClose(ticker)) {
+          official.push({
+            ticker, days: rows.length, officialDays: rows.filter(row => row.daily !== null).length,
+            aggOnlyDays: rows.filter(row => row.agg !== null && row.daily === null).map(row => row.day),
+            aggWrong: rows.filter(row => row.agg !== null && row.daily !== null && differs(row.agg, row.daily)).length,
+            apiWrongDays: rows.filter(row => row.daily !== null && api.has(row.day) && differs(api.get(row.day) ?? 0, row.daily)).map(row => row.day),
+            missingDays, duplicateDays,
+          });
+          if (['KOSPI', 'KOSPI200', 'SAMSUNG', 'SK_HYNIX', 'HYUNDAI'].includes(ticker)) {
+            values[ticker] = Object.fromEntries(rows.map(row => [row.day, { agg: row.agg, daily: row.daily, api: api.get(row.day) ?? null }]));
+          }
+        } else {
+          aggFirst.push({
+            ticker, days: rows.length,
+            apiNotAggDays: rows.filter(row => row.agg !== null && api.has(row.day) && differs(api.get(row.day) ?? 0, row.agg)).map(row => row.day),
+            missingDays, duplicateDays,
+          });
+        }
+      }
+      console.log(`[official-close-check] ${JSON.stringify(official)}`);
+      console.log(`[official-close-values] ${JSON.stringify(values)}`);
+      console.log(`[agg-first-check] ${JSON.stringify(aggFirst)}`);
+    } catch (error) {
+      console.error(`[official-close-check] failed: ${error instanceof Error ? error.message : String(error)}`);
     }
 
     // 증시 자금 흐름 일별 통계 (11단계 B′): 가장 최근 기준일의 지표별 값. 공식 명세에 단위가 없어

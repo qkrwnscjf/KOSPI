@@ -2,6 +2,16 @@
 // 순수 함수만 둔다(테스트 대상). 받아 오기·저장은 backfill.ts의 runDailyHistoryBackfill이 한다.
 
 import { closeTimestamp, shiftDate } from '../krx/krx-index-daily.js';
+import { YAHOO_MARKET } from '../ingestion/market-hours.js';
+import type { YahooSymbolKey } from '../../shared/symbols.js';
+
+// ── 공식 종가 보정 (docs/Task_ORDER.md T-136, D-81) ──
+// 1일 봉은 실시간 원본으로만 만들어진다. 스택이 장의 일부 시간만 떠 있던 날은 종가가 실제 종가와 다르다(B-49 진단).
+// 장 시간이 정해진 시장의 지표는 장이 끝난 뒤 Yahoo 일봉(공식 종가)을 index_daily에 받아 두고, 그래프·리스크 계산은 그 값을 먼저 쓴다.
+// 24시간 시장(환율·원자재·VIX)은 하루 종가의 기준이 소스마다 달라 지금처럼 집계를 쓴다.
+export const CLOSE_FIX_DAYS = 10;
+export const CLOSE_FIX_REFETCH_MS = 20 * 3600_000; // 지표마다 하루 한 번
+export const usesOfficialDailyClose = (key: YahooSymbolKey) => YAHOO_MARKET[key] !== 'global_24h';
 
 export interface DailyBar {
   time: Date;

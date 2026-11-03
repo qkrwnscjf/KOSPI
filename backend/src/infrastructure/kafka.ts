@@ -32,6 +32,9 @@ export const TOPICS = {
   // 증시 자금 흐름 일별 통계 (11단계 B′ T-97, D-44): 데이터셋·날짜마다 1건
   marketFlows: 'market-flows',
   marketFlowsDlq: 'market-flows.dlq',
+  // Yahoo 일봉 (T-143): db-sink가 받아 보내고 db-sink가 저장한다. Gateway는 읽지 않는다
+  yahooDaily: 'yahoo-daily',
+  yahooDailyDlq: 'yahoo-daily.dlq',
 } as const;
 
 const TICKS_PARTITIONS = Number.parseInt(process.env.KAFKA_TOPIC_PARTITIONS ?? '', 10) || 1;
@@ -74,13 +77,13 @@ export async function ensureTopics() {
             configEntries: [{ name: 'retention.ms', value: String(DLQ_RETENTION_MS) }],
           },
           // KRX 일별 지수·DART 공시도 하루 수백 건 이하라 7일 보관 (DB Sink가 며칠 멈춰도 다시 채울 수 있음)
-          ...[TOPICS.indexDaily, TOPICS.disclosures, TOPICS.breadth, TOPICS.rankings, TOPICS.marketFlows].map(topic => ({
+          ...[TOPICS.indexDaily, TOPICS.disclosures, TOPICS.breadth, TOPICS.rankings, TOPICS.marketFlows, TOPICS.yahooDaily].map(topic => ({
             topic,
             numPartitions: 1,
             replicationFactor: 1,
             configEntries: [{ name: 'retention.ms', value: String(FLOWS_RETENTION_MS) }],
           })),
-          ...[TOPICS.indexDailyDlq, TOPICS.disclosuresDlq, TOPICS.breadthDlq, TOPICS.rankingsDlq, TOPICS.marketFlowsDlq].map(topic => ({
+          ...[TOPICS.indexDailyDlq, TOPICS.disclosuresDlq, TOPICS.breadthDlq, TOPICS.rankingsDlq, TOPICS.marketFlowsDlq, TOPICS.yahooDailyDlq].map(topic => ({
             topic,
             numPartitions: 1,
             replicationFactor: 1,
@@ -118,6 +121,7 @@ const DLQ_FOR: Record<string, string> = {
   [TOPICS.breadth]: TOPICS.breadthDlq,
   [TOPICS.rankings]: TOPICS.rankingsDlq,
   [TOPICS.marketFlows]: TOPICS.marketFlowsDlq,
+  [TOPICS.yahooDaily]: TOPICS.yahooDailyDlq,
 };
 const dlqTopicFor = (topic: string) => DLQ_FOR[topic] ?? TOPICS.dlq;
 

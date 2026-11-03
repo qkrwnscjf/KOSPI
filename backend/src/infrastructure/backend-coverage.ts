@@ -31,16 +31,16 @@ async function getJson(path: string): Promise<Record<string, unknown> | null> {
 }
 
 // KRX 일별 지수: 심볼마다 저장된 첫 날짜·마지막 날짜. 심볼이 비어 있으면 그 심볼은 earliest/latest 없음(null).
-// 모든 심볼을 확인하지 못하면 null.
-export async function fetchDailyIndexCoverage(symbols: readonly string[]): Promise<Map<string, DateCoverage | null> | null> {
-  const result = new Map<string, DateCoverage | null>();
+// 모든 심볼을 확인하지 못하면 null. days: 저장된 날짜 전부(사이 빈 날 찾기용, T-141)
+export async function fetchDailyIndexCoverage(symbols: readonly string[]): Promise<Map<string, (DateCoverage & { days: ReadonlySet<string> }) | null> | null> {
+  const result = new Map<string, (DateCoverage & { days: ReadonlySet<string> }) | null>();
   for (const symbol of symbols) {
     const body = await getJson(`/api/v1/market/history?ticker=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent('1년')}`);
     if (!body || !Array.isArray(body.data)) return null;
     const times = body.data
       .map(point => (point && typeof point === 'object' ? (point as Record<string, unknown>).time : undefined))
       .filter((time): time is number => typeof time === 'number' && Number.isFinite(time));
-    result.set(symbol, times.length === 0 ? null : { earliest: seoulDay(Math.min(...times)), latest: seoulDay(Math.max(...times)) });
+    result.set(symbol, times.length === 0 ? null : { earliest: seoulDay(Math.min(...times)), latest: seoulDay(Math.max(...times)), days: new Set(times.map(seoulDay)) });
   }
   return result;
 }

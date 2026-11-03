@@ -44,6 +44,9 @@ services:
     container_name: kospi-redis
     ports:
       - "127.0.0.1:6379:6379"
+    # 최신값 캐시를 down → up 뒤에도 유지한다. worker가 재시작 때 이 값으로 변경 감지를 시작한다 (docs/Task_ORDER.md T-142, T-133). 공개 시세 캐시만 있다
+    volumes:
+      - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -268,6 +271,7 @@ services:
 
 volumes:
   timescaledb_data:
+  redis_data:
   prometheus_data:
   grafana_data:
   # KRaft 모드 Kafka 데이터 (T-89). 이전 Zookeeper 모드 볼륨(kafka_data, zookeeper_data, zookeeper_log)은 삭제하지 않고 남겨 둠

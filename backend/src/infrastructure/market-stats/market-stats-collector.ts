@@ -3,13 +3,15 @@ import { fetchJson, HttpJsonError, safeLogList, safeLogText } from '../http-json
 import { Counter, Gauge, metricsConfig, startMetricsLog, startMetricsServer } from '../metrics.js';
 import { registerShutdown } from '../shutdown.js';
 import { dailyCloseTime, dailyValues, readDataGoKrResponse, type MarketFlow, type MarketFlowDataset } from '../../shared/market-flows.js';
+import { nextCollectDelay } from './collect-schedule.js';
+import { setWallClockTimeout, type WallClockTimer } from '../wall-clock-timer.js';
 
 // 증시 자금 흐름 일별 통계 수집기 (docs/Task_ORDER.md 11단계 B′ T-95, D-45, D-65, D-76, D-77)
 // 공공데이터포털 "금융투자협회 종합통계"의 증시자금추이·신용공여잔고추이를 받아 Kafka `market-flows`로 보낸다.
 // - 화면은 최근 1개월만 보여 준다(D-77). 그래서 주기마다 오퍼레이션당 1번, 최근 35일을 한꺼번에 요청한다(약 25 영업일, 응답 수 KB).
 //   과거 채우기가 따로 없어서 다시 시작해도 대량 호출이 생기지 않는다(SEC-014와 같은 목적).
 // - 값은 영업일 기준 2 ~ 3일 늦게 공개된다(B-47 관찰). 그래서 6시간마다 확인하고, 값이 바뀐 날짜만 보낸다.
-// - 키 오류·호출 한도 같은 결과 코드면 24시간 멈추고, 그 밖의 실패는 다음 주기를 2배씩 늦춘다(최대 24시간).
+// - 키 오류·호출 한도 같은 결과 코드면 24시간 멈춘다. 그 밖의 실패는 첫 번째만 30분 뒤 다시 시도하고, 이어서 실패하면 2배씩 늦춘다(최대 24시간, T-137).
 // - 키를 가진 컨테이너는 이것 하나뿐이다. 접속 대상은 아래 고정 주소 하나(apis.data.go.kr, D-45 승인)이고 환경변수로 바꿀 수 없다.
 // - 키는 요청 주소(쿼리)에 들어가므로 주소·키·오류 원문을 로그에 남기지 않는다. 응답에서 온 문자열은 safeLogText로 정리해서 남긴다.
 
@@ -36,8 +38,10 @@ const lastSuccessAt = new Gauge('kospi_market_stats_last_success_timestamp_secon
 
 const lastSent = new Map<string, string>();
 let stopping = false;
-let timer: ReturnType<typeof setTimeout> | undefined;
+let timer: WallClockTimer | undefined;
 let consecutiveFailures = 0;
+// 검증용 (기본 끔, BENCHMARK B-51): 첫 주기를 요청 없이 일시 실패로 처리해서 재시도 일정(T-137)을 실제 실행으로 확인한다
+let failFirstCycle = process.env.MARKET_STATS_TEST_FAIL_FIRST === 'true';
 
 const seoulDay = (ms: number) => new Date(ms + 9 * 3600_000).toISOString().slice(0, 10).replace(/-/g, '');
 
@@ -110,21 +114,24 @@ async function collect(dataset: MarketFlowDataset, operation: string, key: strin
 async function loop(key: string) {
   if (stopping) return;
   const results: ('ok' | 'pause' | 'error')[] = [];
-  for (const { dataset, operation } of OPERATIONS) {
-    if (stopping) return;
-    results.push(await collect(dataset, operation, key));
-  }
-  let delay = POLLING_INTERVAL_MS;
-  if (results.includes('pause')) {
-    delay = MAX_DELAY_MS;
-    console.warn(`[market-stats] key, permission or quota problem: pausing for ${MAX_DELAY_MS / 3600_000}h`);
-  } else if (results.includes('error')) {
-    consecutiveFailures += 1;
-    delay = Math.min(POLLING_INTERVAL_MS * 2 ** consecutiveFailures, MAX_DELAY_MS);
+  if (failFirstCycle) {
+    failFirstCycle = false;
+    console.warn('MARKET_STATS_TEST_FAIL_FIRST=true: first cycle treated as a transient failure, no request sent (verification only).');
+    results.push(...OPERATIONS.map(() => 'error' as const));
   } else {
-    consecutiveFailures = 0;
+    for (const { dataset, operation } of OPERATIONS) {
+      if (stopping) return;
+      results.push(await collect(dataset, operation, key));
+    }
   }
-  if (!stopping) timer = setTimeout(() => void loop(key), delay);
+  // 다음 주기: 하루 멈춤 / 첫 일시 실패는 30분 뒤 다시 / 그 뒤는 2배씩 (T-137)
+  const previousFailures = consecutiveFailures;
+  const next = nextCollectDelay(results, consecutiveFailures, POLLING_INTERVAL_MS, MAX_DELAY_MS);
+  consecutiveFailures = next.failures;
+  if (results.includes('pause')) console.warn(`[market-stats] key, permission or quota problem: pausing for ${MAX_DELAY_MS / 3600_000}h`);
+  else if (results.includes('error')) console.warn(`[market-stats] retrying in ${Math.round(next.delayMs / 60_000)}m (consecutive failures: ${next.failures})`);
+  else if (previousFailures > 0) console.log(`[market-stats] recovered after ${previousFailures} failed cycle(s); next in ${Math.round(next.delayMs / 3600_000)}h`);
+  if (!stopping) timer = setWallClockTimeout(() => void loop(key), next.delayMs);
 }
 
 async function main() {
@@ -147,7 +154,7 @@ async function main() {
   await producer.connect();
   await ensureTopics();
   registerShutdown('market-stats-collector', [
-    { name: 'poll loop', run: () => { stopping = true; clearTimeout(timer); } },
+    { name: 'poll loop', run: () => { stopping = true; timer?.cancel(); } },
     { name: 'kafka producer', run: () => producer.disconnect() },
   ]);
   console.log(`[market-stats] last ${WINDOW_DAYS} days, ${OPERATIONS.length} requests every ${POLLING_INTERVAL_MS / 3600_000}h.`);

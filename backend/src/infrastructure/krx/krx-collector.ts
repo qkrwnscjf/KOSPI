@@ -1,13 +1,14 @@
 import { producer, TOPICS, ensureTopics } from '../kafka.js';
 import { Counter, Gauge, Latency, metricsConfig, startMetricsLog, startMetricsServer } from '../metrics.js';
 import { registerShutdown } from '../shutdown.js';
-import { KRX_DAILY_INDICES, KRX_DAILY_KEYS, KRX_HISTORY_KEYS, type KrxEndpoint } from '../../shared/krx-indices.js';
+import { KRX_DAILY_INDICES, KRX_DAILY_KEYS, KRX_HISTORY_KEYS, normalizeIndexName, type KrxEndpoint } from '../../shared/krx-indices.js';
 import { fetchBreadthCoverage, fetchDailyIndexCoverage, fetchRankingsCoverage } from '../backend-coverage.js';
 import type { TickData } from '../../shared/types.js';
 import { KrxApiError, KrxClient, readKrxConfig } from './krx-client.js';
-import { combineCoverage, ENDPOINT_PATHS, FIELDS, mapIndexRows, missingDates, pastSeoulWeekdays, rowsOf, seoulWeekdays } from './krx-index-daily.js';
-import { BREADTH_ENDPOINTS, rankStocks, summarizeBreadth, type BreadthEndpoint } from './krx-breadth.js';
+import { combineCoverage, ENDPOINT_PATHS, FIELDS, internalGaps, mapIndexRows, missingDates, parseKrxNumber, pastSeoulWeekdays, rowsOf, seoulWeekdays } from './krx-index-daily.js';
+import { BREADTH_ENDPOINTS, rankStocks, STOCK_FIELDS, summarizeBreadth, type BreadthEndpoint } from './krx-breadth.js';
 import { safeLogList } from '../http-json.js';
+import { setWallClockTimeout, type WallClockTimer } from '../wall-clock-timer.js';
 import { datesToCheck, recordCheck, type DateCheckState } from './krx-schedule.js';
 
 // KRX 일별 지수 수집기 (docs/Task_ORDER.md T-67, D-60)
@@ -50,7 +51,7 @@ const lastSent = new Map<string, string>();
 const loggedFields = new Set<string>();
 const loggedMissing = new Set<KrxEndpoint>();
 let stopping = false;
-let timer: ReturnType<typeof setTimeout> | undefined;
+let timer: WallClockTimer | undefined;
 let consecutiveFailures = 0;
 
 // 인증 거부(401/403)를 받은 엔드포인트는 한동안 호출하지 않는다 (키 미승인 상태에서 반복 호출 방지).
@@ -301,6 +302,10 @@ async function backfill(client: KrxClient) {
 // Yahoo 지표의 과거 일봉 (T-104 보완): KOSPI 시리즈 일별 시세에서 코스피 200 종가를 받는다(index_daily에만 저장, 화면 tick 아님).
 // 실시간 집계가 시작되기 전 기간만 필요하므로 저장된 첫 날짜보다 앞쪽(과 저장이 없으면 1년 전체)만 받는다. 오늘은 실시간 수집이 맡는다.
 // 프로세스당 한 번만 하고, 저장 범위를 확인하지 못하면 다음 주기로 미룬다 (SEC-014).
+// 저장된 범위 사이의 빈 날(스택이 꺼져 있던 날)은 최근 60일만 채운다(T-141). 오늘 집계가 먼저 생겨도 놓치지 않기 위함이다.
+// 평일 공휴일은 응답이 비어 넘어간다(시작할 때 몇 번 더 호출).
+const HISTORY_GAP_LOOKBACK_DAYS = 60;
+
 async function backfillHistory(client: KrxClient) {
   const endpoint: KrxEndpoint = 'kospi';
   if (BACKFILL_DAYS <= 0 || stopping || backfilled.has(endpoint) || !isEnabled(endpoint)) return;
@@ -308,7 +313,8 @@ async function backfillHistory(client: KrxClient) {
   if (!coverage) return;
   const target = pastSeoulWeekdays(Date.now(), BACKFILL_DAYS);
   const stored = combineCoverage(ENDPOINT_SYMBOLS.kospi.map(symbol => coverage.get(symbol)));
-  const dates = missingDates(target, stored);
+  const gaps = internalGaps(pastSeoulWeekdays(Date.now(), HISTORY_GAP_LOOKBACK_DAYS), ENDPOINT_SYMBOLS.kospi.map(symbol => coverage.get(symbol)?.days ?? new Set<string>()));
+  const dates = [...new Set([...missingDates(target, stored), ...gaps])].sort();
   if (dates.length === 0) {
     backfilled.add(endpoint);
     console.log(`[krx] ${endpoint} history backfill skipped: already stored ${stored?.earliest}-${stored?.latest}`);
@@ -392,6 +398,41 @@ async function backfillRankings(client: KrxClient) {
   }
 }
 
+// 검증용 공식 종가 대조 (기본 끔, BENCHMARK B-51): T-136이 화면에 쓰는 Yahoo 일봉이 거래소 공식 종가와 같은지 독립 기준으로 확인한다.
+// 최근 2주 평일마다 이미 승인된 두 엔드포인트를 1번씩 받아 대상 5종의 종가만 로그로 남긴다(공개 시세). Kafka로 보내지 않고 저장하지 않는다.
+const CLOSE_CHECK = process.env.KRX_CLOSE_CHECK === 'true';
+const CLOSE_CHECK_DAYS = 14;
+const CLOSE_CHECK_INDICES = new Map([['코스피', 'KOSPI'], ['코스피 200', 'KOSPI200']].map(([name, symbol]) => [normalizeIndexName(name!), symbol!]));
+const CLOSE_CHECK_STOCKS = new Map([['005930', 'SAMSUNG'], ['000660', 'SK_HYNIX'], ['005380', 'HYUNDAI']]);
+
+async function runCloseCheck(client: KrxClient) {
+  console.warn('KRX_CLOSE_CHECK=true: logging official closes of 5 symbols for the last 2 weeks (verification only).');
+  const closes: Record<string, Record<string, number | null>> = {};
+  let calls = 0;
+  for (const basDd of seoulWeekdays(Date.now(), CLOSE_CHECK_DAYS)) {
+    const day: Record<string, number | null> = {};
+    for (const [endpoint, path] of [['kospi', ENDPOINT_PATHS.kospi], ['stk', BREADTH_ENDPOINTS.stk.path]] as const) {
+      if (stopping || !isEnabled(endpoint)) continue;
+      calls += 1;
+      try {
+        for (const row of rowsOf(await client.get(path, basDd))) {
+          const name = row[FIELDS.name];
+          const code = row[STOCK_FIELDS.code];
+          const symbol = endpoint === 'kospi'
+            ? (typeof name === 'string' ? CLOSE_CHECK_INDICES.get(normalizeIndexName(name)) : undefined)
+            : (typeof code === 'string' ? CLOSE_CHECK_STOCKS.get(code.trim()) : undefined);
+          if (symbol) day[symbol] = parseKrxNumber(row[endpoint === 'kospi' ? FIELDS.close : STOCK_FIELDS.close]);
+        }
+      } catch (error) {
+        handleFetchError(endpoint, basDd, error);
+      }
+      await sleep(REQUEST_GAP_MS);
+    }
+    if (Object.keys(day).length > 0) closes[`${basDd.slice(0, 4)}-${basDd.slice(4, 6)}-${basDd.slice(6, 8)}`] = day;
+  }
+  console.log(`[krx-close-check] ${JSON.stringify({ calls, closes })}`);
+}
+
 async function loop(client: KrxClient) {
   if (stopping) return;
   await backfill(client);
@@ -409,9 +450,11 @@ async function loop(client: KrxClient) {
   for (const endpoint of ENDPOINTS) {
     ok = (await collectDays(client, plannedDates(endpoint, indexWindow), [endpoint])) && ok;
   }
+  // 코스피 200 일봉 (T-141): Yahoo가 일봉을 주지 않아 공식 종가를 여기서 받는다. 시장 폭처럼 결과를 지수 수집의 백오프에 섞지 않는다
+  await collectDays(client, plannedDates('kospi', indexWindow), ['kospi']);
   consecutiveFailures = ok ? 0 : consecutiveFailures + 1;
   const delay = consecutiveFailures === 0 ? POLLING_INTERVAL_MS : Math.min(POLLING_INTERVAL_MS * 2 ** consecutiveFailures, MAX_BACKOFF_MS);
-  if (!stopping) timer = setTimeout(() => void loop(client), delay);
+  if (!stopping) timer = setWallClockTimeout(() => void loop(client), delay);
 }
 
 async function main() {
@@ -432,11 +475,12 @@ async function main() {
   await ensureTopics();
   const client = new KrxClient(config);
   registerShutdown('krx-collector', [
-    { name: 'poll loop', run: () => { stopping = true; clearTimeout(timer); } },
+    { name: 'poll loop', run: () => { stopping = true; timer?.cancel(); } },
     { name: 'kafka producer', run: () => producer.disconnect() },
   ]);
 
   console.log(`[krx] configured for ${KRX_DAILY_KEYS.length} indices. Backfill ${BACKFILL_DAYS} days, then every ${POLLING_INTERVAL_MS}ms.`);
+  if (CLOSE_CHECK) await runCloseCheck(client);
   void loop(client);
 }
 

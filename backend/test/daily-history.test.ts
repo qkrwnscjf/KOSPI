@@ -1,7 +1,93 @@
 // 나중에 추가한 Yahoo 지표의 과거 일봉 테스트 (docs/Task_ORDER.md T-104 ③, D-67)
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { GAP_FILL_DAYS, missingWeekdays, needsDailyHistory, toDailyRows } from '../src/infrastructure/sink/daily-history.js';
+import { GAP_FILL_DAYS, missingWeekdays, needsDailyHistory, toDailyRows, usesOfficialDailyClose } from '../src/infrastructure/sink/daily-history.js';
+import { nextCollectDelay, RETRY_AFTER_ERROR_MS } from '../src/infrastructure/market-stats/collect-schedule.js';
+import { YAHOO_KEYS } from '../src/shared/symbols.js';
+import { setWallClockTimeout } from '../src/infrastructure/wall-clock-timer.js';
+import { internalGaps } from '../src/infrastructure/krx/krx-index-daily.js';
+import { datesToCheck } from '../src/infrastructure/krx/krx-schedule.js';
+import { parseYahooDaily } from '../src/shared/yahoo-daily.js';
+import { replayDecision } from '../src/infrastructure/sink/dlq-replay.js';
+import { TOPICS } from '../src/infrastructure/kafka.js';
+
+const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+test('setWallClockTimeout: 잠자기로 시계가 건너뛰면 다음 확인 때 바로 실행한다 (T-140)', async () => {
+  let clock = 1_000_000;
+  let fired = 0;
+  setWallClockTimeout(() => { fired += 1; }, 3600_000, () => clock, 2);
+  await wait(15);
+  assert.equal(fired, 0); // 아직 시각 전
+  clock += 3600_000; // 깨어나 보니 1시간이 지남
+  await wait(15);
+  assert.equal(fired, 1);
+  await wait(15);
+  assert.equal(fired, 1); // 한 번만
+});
+
+test('setWallClockTimeout: 취소하면 실행하지 않는다 (T-140)', async () => {
+  let clock = 1_000_000;
+  let fired = 0;
+  const timer = setWallClockTimeout(() => { fired += 1; }, 1000, () => clock, 2);
+  timer.cancel();
+  clock += 5000;
+  await wait(15);
+  assert.equal(fired, 0);
+});
+
+test('internalGaps: 저장된 첫날과 마지막 날 사이의 빈 날만 (T-141)', () => {
+  const target = ['20261026', '20261027', '20261028', '20261029', '20261030', '20261102', '20261103'];
+  // 오늘 집계(11/3)가 먼저 생겨도 10/29·10/30·11/2를 찾는다
+  assert.deepEqual(internalGaps(target, [new Set(['20261027', '20261028', '20261103'])]), ['20261029', '20261030', '20261102']);
+  assert.deepEqual(internalGaps(target, [new Set(target)]), []);
+  assert.deepEqual(internalGaps(target, [new Set()]), []); // 저장된 것이 없으면 missingDates가 맡음
+});
+
+test('datesToCheck: 확인한 적 없는 날짜는 뒤 날짜를 먼저 받았어도 받고, 비어 있던 날짜만 휴장으로 본다 (T-141)', () => {
+  const now = Date.parse('2026-11-03T10:00:00Z');
+  const dates = ['20261028', '20261029', '20261102'];
+  const received = new Map([['20261102', { receivedAt: now - 1000 }]]);
+  assert.deepEqual(datesToCheck(dates, received, now), ['20261028', '20261029']);
+  const emptyThenReceived = new Map([['20261029', { lastEmptyAt: now - 2 * 3600_000 }], ['20261102', { receivedAt: now - 1000 }]]);
+  assert.deepEqual(datesToCheck(dates, emptyThenReceived, now), ['20261028']);
+});
+
+test('parseYahooDaily: 정상 메시지와 잘못된 값 (T-143)', () => {
+  const good = { symbol: 'SP500', time: 1_793_000_000_000, close: 7000.5, changeRate: 0.1, changePrice: 7, overwrite: true, producedAt: 1_793_000_000_001 };
+  const parse = (value: unknown) => parseYahooDaily(Buffer.from(JSON.stringify(value)));
+  assert.deepEqual(parse(good), { ok: true, row: good });
+  assert.deepEqual(parse({ ...good, symbol: 'KRX_SEMI' }), { ok: false, reason: 'symbol' }); // Yahoo 심볼만
+  assert.deepEqual(parse({ ...good, close: 0 }), { ok: false, reason: 'close' });
+  assert.deepEqual(parse({ ...good, changeRate: null }), { ok: false, reason: 'change_rate' });
+  assert.deepEqual(parse({ ...good, overwrite: 'yes' }), { ok: false, reason: 'overwrite' });
+  assert.deepEqual(parseYahooDaily(Buffer.from('{')), { ok: false, reason: 'invalid_json' });
+  assert.deepEqual(parseYahooDaily(null), { ok: false, reason: 'empty' });
+});
+
+test('DLQ 다시 처리: yahoo-daily 메시지도 지금 검증으로 판단한다 (T-143)', () => {
+  const value = Buffer.from(JSON.stringify({ symbol: 'SP500', time: 1_793_000_000_000, close: 7000.5, changeRate: 0.1, changePrice: 7, overwrite: false }));
+  assert.deepEqual(replayDecision(TOPICS.yahooDaily, value), { replay: true });
+  assert.deepEqual(replayDecision(TOPICS.yahooDaily, Buffer.from('{}')), { replay: false, reason: 'symbol' });
+});
+
+test('usesOfficialDailyClose: 장 시간이 정해진 시장 17종만, 24시간 시장(환율·원자재·VIX)은 제외 (T-136)', () => {
+  const official = YAHOO_KEYS.filter(usesOfficialDailyClose);
+  assert.equal(official.length, 17);
+  assert.ok(official.includes('KOSPI') && official.includes('SP500') && official.includes('NIKKEI'));
+  assert.ok(!official.includes('USD/KRW') && !official.includes('VIX') && !official.includes('GOLD'));
+});
+
+test('nextCollectDelay: 첫 일시 실패는 30분 뒤, 이어지면 2배씩, 키·한도 문제는 하루 (T-137)', () => {
+  const six = 6 * 3600_000;
+  const day = 24 * 3600_000;
+  assert.deepEqual(nextCollectDelay(['ok', 'ok'], 0, six, day), { delayMs: six, failures: 0 });
+  assert.deepEqual(nextCollectDelay(['error', 'ok'], 0, six, day), { delayMs: RETRY_AFTER_ERROR_MS, failures: 1 });
+  assert.deepEqual(nextCollectDelay(['error', 'ok'], 1, six, day), { delayMs: 2 * six, failures: 2 });
+  assert.deepEqual(nextCollectDelay(['error', 'ok'], 2, six, day), { delayMs: day, failures: 3 });
+  assert.deepEqual(nextCollectDelay(['pause', 'ok'], 0, six, day), { delayMs: day, failures: 0 });
+  assert.deepEqual(nextCollectDelay(['ok', 'ok'], 3, six, day), { delayMs: six, failures: 0 });
+});
 import { closeTimestamp } from '../src/infrastructure/krx/krx-index-daily.js';
 
 const bar = (iso: string, price: number) => ({ time: new Date(iso), price, changeRate: 1, changePrice: 2 });

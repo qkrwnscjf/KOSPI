@@ -24,8 +24,10 @@ export function datesToCheck(dates: string[], states: ReadonlyMap<string, DateCh
     if (nowMs < checkFromMs(date)) return false;
     const state = states.get(date);
     if (state?.receivedAt !== undefined) return state.recheckedAt === undefined && nowMs - state.receivedAt >= RECHECK_AFTER_MS;
+    // 아직 확인한 적 없는 날짜는 뒤 날짜를 먼저 받았어도 받는다(T-141: 과거 채우기·인증 확인이 최근 날짜를 먼저 받는 경우, 실패했던 날짜)
+    if (state?.lastEmptyAt === undefined) return true;
     if (dates.slice(index + 1).some(later => states.get(later)?.receivedAt !== undefined)) return false;
-    return state?.lastEmptyAt === undefined || nowMs - state.lastEmptyAt >= EMPTY_RECHECK_MS;
+    return nowMs - state.lastEmptyAt >= EMPTY_RECHECK_MS;
   });
 }
 

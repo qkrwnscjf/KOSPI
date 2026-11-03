@@ -1,8 +1,11 @@
 import YahooFinance from 'yahoo-finance2';
+import type { Producer } from 'kafkajs';
 import { dbPool } from '../db.js';
-import { YAHOO_CATEGORY, YAHOO_DAILY_HISTORY_KEYS, YAHOO_DAILY_SOURCE, YAHOO_KEYS, YAHOO_SYMBOLS } from '../../shared/symbols.js';
+import { TOPICS } from '../kafka.js';
+import { YAHOO_CATEGORY, YAHOO_DAILY_HISTORY_KEYS, YAHOO_KEYS, YAHOO_SYMBOLS } from '../../shared/symbols.js';
 import type { YahooSymbolKey } from '../../shared/symbols.js';
-import { GAP_LOOKBACK_DAYS, missingWeekdays, needsDailyHistory, toDailyRows } from './daily-history.js';
+import type { YahooDailyMessage } from '../../shared/yahoo-daily.js';
+import { CLOSE_FIX_DAYS, CLOSE_FIX_REFETCH_MS, GAP_LOOKBACK_DAYS, missingWeekdays, needsDailyHistory, toDailyRows, usesOfficialDailyClose, type DailyRow } from './daily-history.js';
 
 // 최초 1회 과거 데이터 채우기 (docs/Task_ORDER.md T-19, R-05, D-06)
 // 연속 집계에는 직접 넣을 수 없어서, 원본(market_ticks)에 종가를 넣고 → 집계를 전체 갱신하고 →
@@ -135,7 +138,20 @@ const GAP_REFETCH_MS = 20 * 60 * 60 * 1000; // 공휴일처럼 채울 수 없는
 const lastGapFetchAt = new Map<YahooSymbolKey, number>();
 const historyKeys = new Set<YahooSymbolKey>(YAHOO_DAILY_HISTORY_KEYS);
 
-export async function runDailyHistoryBackfill() {
+// 일봉은 DB에 바로 쓰지 않고 Kafka로 보낸다(T-143). db-sink의 컨슈머가 검증 후 저장한다
+async function sendDailyRows(producer: Producer, symbol: YahooSymbolKey, rows: DailyRow[], overwrite: boolean) {
+  if (rows.length === 0) return;
+  const producedAt = Date.now();
+  await producer.send({
+    topic: TOPICS.yahooDaily,
+    messages: rows.map(row => {
+      const message: YahooDailyMessage = { symbol, time: row.time, close: row.close, changeRate: row.changeRate, changePrice: row.changePrice, overwrite, producedAt };
+      return { key: symbol, value: JSON.stringify(message) };
+    }),
+  });
+}
+
+export async function runDailyHistoryBackfill(producer: Producer) {
   for (const symbol of YAHOO_KEYS) {
     const { rows: [state] } = await dbPool.query<{ last_daily: number | null; first_agg: number | null; first_agg_day: string | null; agg_days: string[] | null; daily_days: string[] | null }>(
       // 마지막 일봉은 출처와 상관없이 본다 (Yahoo가 주지 않는 지표는 KRX 일봉이 있다, T-104 보완)
@@ -159,27 +175,39 @@ export async function runDailyHistoryBackfill() {
       // 이음매 채우기는 1년치 전부(이미 있는 날짜는 건너뜀), 빠진 날 메우기는 그 날짜만 넣는다(집계가 있는 날의 중복 행을 만들지 않음)
       const gapSet = new Set(gaps);
       const rows = seam ? allRows : allRows.filter(row => gapSet.has(new Date(row.time).toISOString().slice(0, 10)));
-      let inserted = 0;
-      if (rows.length > 0) {
-        const values: unknown[] = [];
-        const placeholders = rows.map((row, index) => {
-          const base = index * 6;
-          values.push(row.time, symbol, row.close, row.changeRate, row.changePrice, YAHOO_DAILY_SOURCE);
-          return `(to_timestamp($${base + 1} / 1000.0), $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6})`;
-        });
-        const result = await dbPool.query(
-          `INSERT INTO index_daily (time, symbol, close, change_rate, change_price, source)
-           VALUES ${placeholders.join(', ')}
-           ON CONFLICT (symbol, time) DO NOTHING`,
-          values
-        );
-        inserted = result.rowCount ?? 0;
-      }
+      await sendDailyRows(producer, symbol, rows, false);
       console.log(seam
-        ? `Daily history backfill ${symbol}: ${rows.length} days, ${inserted} inserted`
-        : `Daily gap fill ${symbol}: missing ${gaps.join(',')} → ${inserted} inserted (others not provided by the source, e.g. holidays)`);
+        ? `Daily history backfill ${symbol}: ${rows.length} days sent`
+        : `Daily gap fill ${symbol}: missing ${gaps.join(',')} → ${rows.length} sent (others not provided by the source, e.g. holidays)`);
     } catch (error) {
       console.error(`Daily history backfill ${symbol} failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
+}
+
+// 공식 종가 보정 (docs/Task_ORDER.md T-136, D-81)
+// 장 시간이 정해진 시장의 지표(국내·미국·도쿄·대만)는 지표마다 하루 한 번, 최근 10일 Yahoo 일봉(공식 종가)을 index_daily에 넣는다.
+// 이미 있는 Yahoo 일봉은 새 값으로 바꾼다(이전에 들어간 값이 확정 전이었을 수 있음). KRX 일봉(source 'krx', 코스피 200)은 건드리지 않는다.
+// 시작한 지 24시간이 안 된 봉은 넣지 않는다(toDailyRows). 집계(market_1d)는 다시 계산하지 않는다(저장 불변 조건).
+const lastCloseFixAt = new Map<YahooSymbolKey, number>();
+
+export async function runOfficialCloseRefresh(producer: Producer) {
+  let calls = 0;
+  let sent = 0;
+  for (const symbol of YAHOO_KEYS) {
+    if (!usesOfficialDailyClose(symbol)) continue;
+    const now = Date.now();
+    if (now - (lastCloseFixAt.get(symbol) ?? 0) < CLOSE_FIX_REFETCH_MS) continue;
+    lastCloseFixAt.set(symbol, now);
+    calls += 1;
+    try {
+      // 등락 계산에 직전 봉이 하나 더 필요해 하루 더 받는다
+      const rows = toDailyRows(await fetchBars(symbol, '1d', CLOSE_FIX_DAYS + 1), now);
+      await sendDailyRows(producer, symbol, rows, true);
+      sent += rows.length;
+    } catch (error) {
+      console.error(`Official close refresh ${symbol} failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  if (calls > 0) console.log(`Official close refresh: ${calls} symbols fetched, ${sent} daily rows sent (last ${CLOSE_FIX_DAYS} days)`);
 }

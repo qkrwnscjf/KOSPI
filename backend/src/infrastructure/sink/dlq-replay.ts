@@ -6,6 +6,7 @@ import { parseDisclosure } from '../../shared/disclosures.js';
 import { parseMarketBreadth } from '../../shared/breadth.js';
 import { parseStockRankings } from '../../shared/rankings.js';
 import { parseMarketFlow } from '../../shared/market-flows.js';
+import { parseYahooDaily } from '../../shared/yahoo-daily.js';
 import { isKrxDailySymbol, isKrxHistorySymbol } from '../../shared/krx-indices.js';
 
 // DLQ 다시 처리 (docs/Task_ORDER.md T-129, D-74) — 검증용 스위치 DLQ_REPLAY=true일 때 db-sink 시작 시 한 번만 실행(기본 끔)
@@ -41,6 +42,7 @@ export function replayDecision(sourceTopic: string, value: Buffer | null): Repla
     [TOPICS.breadth]: parseMarketBreadth,
     [TOPICS.rankings]: parseStockRankings,
     [TOPICS.marketFlows]: parseMarketFlow,
+    [TOPICS.yahooDaily]: parseYahooDaily,
   };
   const parse = parsers[sourceTopic];
   if (!parse) return fail('unknown_source_topic');

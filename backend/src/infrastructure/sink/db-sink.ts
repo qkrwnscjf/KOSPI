@@ -9,8 +9,11 @@ import { isKrxDailySymbol, isKrxHistorySymbol } from '../../shared/krx-indices.j
 import { parseMarketBreadth, type MarketBreadth } from '../../shared/breadth.js';
 import { parseStockRankings, type StockRankings } from '../../shared/rankings.js';
 import { parseMarketFlow, type MarketFlow } from '../../shared/market-flows.js';
+import { parseYahooDaily, type YahooDailyMessage } from '../../shared/yahoo-daily.js';
+import { YAHOO_DAILY_SOURCE } from '../../shared/symbols.js';
+import { setWallClockTimeout } from '../wall-clock-timer.js';
 import type { EachBatchPayload } from 'kafkajs';
-import { runBackfillOnce, runDailyHistoryBackfill } from './backfill.js';
+import { runBackfillOnce, runDailyHistoryBackfill, runOfficialCloseRefresh } from './backfill.js';
 import { clampWindow, mergeWindows, planLateRefresh, POLICY_START_OFFSET_MS, SAFE_RAW_WINDOW_MS, type RefreshWindow } from './late-refresh.js';
 import { runDlqReplay } from './dlq-replay.js';
 import { registerShutdown } from '../shutdown.js';
@@ -390,6 +393,57 @@ async function handleMarketFlowsBatch({ batch, resolveOffset, heartbeat }: EachB
   await heartbeat();
 }
 
+// Yahoo 일봉 저장 (T-143). 빈 날 채우기는 없는 날짜만 넣고, 공식 종가 보정은 Yahoo 행만 새 값으로 바꾼다(KRX 행은 그대로, T-136).
+const yahooDailyReceived = new Counter('kospi_sink_yahoo_daily_received_total', 'Valid Yahoo daily messages received from Kafka');
+const yahooDailyWritten = new Counter('kospi_sink_yahoo_daily_rows_written_total', 'Yahoo daily rows inserted or updated in index_daily');
+
+async function writeYahooDaily(rows: YahooDailyMessage[], overwrite: boolean) {
+  if (rows.length === 0) return 0;
+  const values: unknown[] = [];
+  const placeholders = rows.map((row, index) => {
+    const base = index * 6;
+    values.push(row.time, row.symbol, row.close, row.changeRate, row.changePrice, YAHOO_DAILY_SOURCE);
+    return `(to_timestamp($${base + 1} / 1000.0), $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6})`;
+  });
+  const conflict = overwrite
+    ? `DO UPDATE SET close = EXCLUDED.close, change_rate = EXCLUDED.change_rate, change_price = EXCLUDED.change_price
+       WHERE index_daily.source = EXCLUDED.source`
+    : 'DO NOTHING';
+  const result = await dbPool.query(
+    `INSERT INTO index_daily (time, symbol, close, change_rate, change_price, source) VALUES ${placeholders.join(', ')}
+     ON CONFLICT (symbol, time) ${conflict}`,
+    values
+  );
+  return result.rowCount ?? 0;
+}
+
+// 다른 토픽과 같은 규칙: 잘못된 메시지는 DLQ, 저장에 성공한 뒤에만 오프셋 확정.
+async function handleYahooDailyBatch({ batch, resolveOffset, heartbeat }: EachBatchPayload) {
+  const valid: YahooDailyMessage[] = [];
+  for (const message of batch.messages) {
+    const parsed = parseYahooDaily(message.value);
+    if (!parsed.ok) {
+      invalidTotal.inc({ reason: `yahoo_daily_${parsed.reason}` });
+      console.warn(`DB sink skipped invalid Yahoo daily message at ${batch.topic}[${batch.partition}]@${message.offset}: ${parsed.reason}`);
+      await sendToDlq(dlqProducer, { consumer: CONSUMER_NAME, topic: batch.topic, partition: batch.partition, message, reason: parsed.reason });
+      continue;
+    }
+    valid.push(parsed.row);
+  }
+  // 없는 날짜 넣기를 먼저, 바꾸기를 나중에 한다. 같은 묶음에 둘 다 있으면 공식 종가가 남는다. 예외는 그대로 던져서 오프셋을 확정하지 않는다
+  if (valid.length > 0) {
+    const keyOf = (row: YahooDailyMessage) => `${row.symbol}|${row.time}`;
+    const written = await writeYahooDaily(lastByKey(valid.filter(row => !row.overwrite), keyOf), false)
+      + await writeYahooDaily(lastByKey(valid.filter(row => row.overwrite), keyOf), true);
+    yahooDailyReceived.inc({}, valid.length);
+    yahooDailyWritten.inc({}, written);
+    console.log(`DB sink stored Yahoo daily rows: ${valid.length} received, ${written} written`);
+  }
+  const lastMessage = batch.messages[batch.messages.length - 1];
+  if (lastMessage) resolveOffset(lastMessage.offset);
+  await heartbeat();
+}
+
 // 데이터 신선도 (15단계 T-112): 데이터셋마다 가장 최근 값이 얼마나 오래됐는지(초). 앱 설정 화면의 파이프라인 상태와 Grafana에 쓴다.
 // 테이블 이름은 고정 목록이다. 비어 있는 데이터셋은 기록하지 않는다(값이 생긴 뒤부터 나타남).
 const dataLatestAge = new Gauge('kospi_db_latest_data_age_seconds', 'Seconds since the newest row of each dataset (market_ticks, index_daily, market_breadth, disclosures, stock_rankings, market_flows)');
@@ -493,7 +547,7 @@ async function run() {
   await ensureTopics();
   await consumer.connect();
   // 그룹이 처음 시작할 때만 토픽의 처음부터 읽는다. 이후에는 커밋된 오프셋부터 이어서 읽는다.
-  await consumer.subscribe({ topics: [TOPICS.ticks, TOPICS.flows, TOPICS.indexDaily, TOPICS.disclosures, TOPICS.breadth, TOPICS.rankings, TOPICS.marketFlows], fromBeginning: true });
+  await consumer.subscribe({ topics: [TOPICS.ticks, TOPICS.flows, TOPICS.indexDaily, TOPICS.disclosures, TOPICS.breadth, TOPICS.rankings, TOPICS.marketFlows, TOPICS.yahooDaily], fromBeginning: true });
 
   // kafkajs가 스스로 재시작하지 않는 중단이면 종료해서 docker-compose의 restart: on-failure가 다시 띄우게 한다.
   consumer.on(consumer.events.CRASH, event => {
@@ -526,6 +580,10 @@ async function run() {
       }
       if (payload.batch.topic === TOPICS.marketFlows) {
         await handleMarketFlowsBatch(payload);
+        return;
+      }
+      if (payload.batch.topic === TOPICS.yahooDaily) {
+        await handleYahooDailyBatch(payload);
         return;
       }
       const { batch, resolveOffset, heartbeat } = payload;
@@ -585,8 +643,11 @@ async function run() {
   // 이어서 나중에 추가한 지표의 과거 일봉을 채운다 (T-104 ③). 집계를 다시 계산하지 않으므로 위 채우기의 결과와 무관하게 실행한다.
   runBackfillOnce()
     .catch(error => console.error(`Backfill failed: ${error instanceof Error ? error.message : String(error)}`))
-    .then(() => runDailyHistoryBackfill())
+    .then(() => runDailyHistoryBackfill(dlqProducer))
     .catch(error => console.error(`Daily history backfill failed: ${error instanceof Error ? error.message : String(error)}`))
+    // 공식 종가 보정 (T-136): 장이 정해진 시장의 지표만 지표마다 하루 한 번
+    .then(() => runOfficialCloseRefresh(dlqProducer))
+    .catch(error => console.error(`Official close refresh failed: ${error instanceof Error ? error.message : String(error)}`))
     .finally(() => void recordDbSize());
 
   setInterval(() => void recordDbSize(), DB_SIZE_INTERVAL_MS);
@@ -597,9 +658,15 @@ async function run() {
     runDlqReplay(dlqProducer).catch(error => console.error(`[dlq-replay] failed: ${error instanceof Error ? error.message : String(error)}`));
   }
   // 과거 일봉과 실시간 집계 사이의 빈 날을 주기적으로 다시 확인한다 (T-104 ③). 비어 있지 않으면 외부 호출 없음
-  setInterval(() => {
-    runDailyHistoryBackfill().catch(error => console.error(`Daily history backfill failed: ${error instanceof Error ? error.message : String(error)}`));
+  // 잠자기 뒤에도 실제 시각에 맞춰 실행한다 (T-140)
+  const scheduleDailyHistory = () => setWallClockTimeout(() => {
+    runDailyHistoryBackfill(dlqProducer)
+      .catch(error => console.error(`Daily history backfill failed: ${error instanceof Error ? error.message : String(error)}`))
+      .then(() => runOfficialCloseRefresh(dlqProducer))
+      .catch(error => console.error(`Official close refresh failed: ${error instanceof Error ? error.message : String(error)}`))
+      .finally(scheduleDailyHistory);
   }, DAILY_HISTORY_INTERVAL_MS);
+  scheduleDailyHistory();
 
   // 종료 처리 (docs/Task_ORDER.md T-28): 컨슈머를 먼저 끊는다. kafkajs는 처리 중인 묶음이 끝날 때까지 기다린 뒤 그룹에서 나간다.
   // 커밋하지 못한 묶음은 다음 기동에서 다시 처리되고, 중복은 유니크 제약이 건너뛴다(at-least-once).

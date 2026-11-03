@@ -73,6 +73,20 @@ export function missingDates(targetDates: string[], coverage: { earliest: string
   return targetDates.filter(date => date > coverage.latest || (fillOlder && date < coverage.earliest));
 }
 
+// 저장된 범위 사이의 빈 날 (T-141): 심볼마다 저장된 날짜 집합을 보고, 그 심볼의 첫 저장일과 마지막 저장일 사이인데 없는 날짜를 돌려준다.
+// targetDates는 오래된 날부터. 저장된 것이 없는 심볼은 여기서 보지 않는다(missingDates가 전부 받음).
+export function internalGaps(targetDates: string[], storedDays: readonly ReadonlySet<string>[]): string[] {
+  const gaps = new Set<string>();
+  for (const days of storedDays) {
+    if (days.size === 0) continue;
+    const sorted = [...days].sort();
+    const first = sorted[0]!;
+    const last = sorted[sorted.length - 1]!;
+    for (const date of targetDates) if (date > first && date < last && !days.has(date)) gaps.add(date);
+  }
+  return targetDates.filter(date => gaps.has(date));
+}
+
 // YYYYMMDD에 일수를 더한다
 export function shiftDate(date: string, days: number) {
   const ms = Date.UTC(Number(date.slice(0, 4)), Number(date.slice(4, 6)) - 1, Number(date.slice(6, 8))) + days * 86_400_000;
