@@ -11,6 +11,7 @@ import { isKrxDailySymbol, KRX_SECTOR_KEYS, type KrxDailySymbol } from '../../sh
 import { computeMarketRisk, isRiskRange, RISK_BASE, RISK_RANGES, RISK_TARGETS, type RiskRange } from '../../shared/market-risk.js';
 import { isRankingMarket, isRankingType, RANKING_MARKETS, type RankingType } from '../../shared/rankings.js';
 import { isCalendarDate } from '../../shared/disclosure-calendar.js';
+import type { BarResolution } from '../../shared/yahoo-bars.js';
 
 // 측정 지표 (docs/Task_ORDER.md T-01, BENCHMARK M-11)
 const historyDuration = new Latency('kospi_history_request_duration_seconds', 'History API response time by result (cache_hit / cache_miss / not_ready / error)');
@@ -27,9 +28,9 @@ type Timeframe = '1일' | '1주' | '1개월' | '3개월' | '1년';
 type HistoryPoint = { time: number; value: number };
 
 // DB 집계 조회 (docs/Task_ORDER.md T-20). 집계 이름은 이 고정된 표에서만 고른다 (사용자 입력으로 SQL을 만들지 않음).
-const DB_TIMEFRAMES: Record<Timeframe, { view: string; range: string }> = {
-  '1일': { view: 'market_5m', range: '1 day' },    // T-21: 이전에는 2일치를 보여 줬다
-  '1주': { view: 'market_1h', range: '7 days' },
+const DB_TIMEFRAMES: Record<Timeframe, { view: string; range: string; fill?: BarResolution }> = {
+  '1일': { view: 'market_5m', range: '1 day', fill: '5m' },    // T-21: 이전에는 2일치를 보여 줬다
+  '1주': { view: 'market_1h', range: '7 days', fill: '1h' },
   '1개월': { view: 'market_1d', range: '30 days' },
   '3개월': { view: 'market_1d', range: '90 days' },
   '1년': { view: 'market_1d', range: '365 days' },
@@ -45,7 +46,7 @@ const HISTORY_CACHE_TTL_S = Number.parseInt(process.env.HISTORY_CACHE_TTL_S ?? '
 
 // DB 집계 조회 (T-20). B-06에서 Yahoo 직접 호출보다 약 6배 빠르고, "1일" 기간 오류와 0값이 없어서 채택했다.
 async function getHistory(ticker: YahooSymbolKey, timeframe: Timeframe): Promise<HistoryPoint[]> {
-  const { view, range } = DB_TIMEFRAMES[timeframe];
+  const { view, range, fill } = DB_TIMEFRAMES[timeframe];
   // 1개월 ~ 1년(1일 봉): 집계에 없는 날짜를 일봉(index_daily)으로 채운다.
   // - 나중에 추가한 지표는 집계가 시작되기 전 날짜(T-104 ③), 모든 지표는 스택이 꺼져 있던 날처럼 집계가 빠진 날(T-127).
   // 일봉 출처는 Yahoo(source 'yahoo') 또는 Yahoo가 주지 않는 지표의 KRX(source 'krx', 코스피 200)다. (symbol, time)이 유일해서 날짜당 1행.
@@ -91,12 +92,21 @@ async function getHistory(ticker: YahooSymbolKey, timeframe: Timeframe): Promise
     );
     return rows;
   }
+  // 1일·1주(5분·1시간 봉, T-151): 스택이 꺼져 있던 구간처럼 집계에 없는 시각만 Yahoo 봉(market_bars_fill)으로 채운다. 집계가 항상 우선이다.
   const { rows } = await dbPool.query<HistoryPoint>(
-    `SELECT (extract(epoch FROM bucket) * 1000)::float8 AS time, close::float8 AS value
-     FROM ${view}
-     WHERE symbol = $1 AND bucket >= now() - $2::interval
-     ORDER BY bucket`,
-    [ticker, range]
+    `WITH agg AS (
+       SELECT bucket, close FROM ${view} WHERE symbol = $1 AND bucket >= now() - $2::interval
+     )
+     SELECT (extract(epoch FROM t) * 1000)::float8 AS time, close::float8 AS value
+     FROM (
+       SELECT bucket AS t, close FROM agg
+       UNION ALL
+       SELECT f.time AS t, f.close FROM market_bars_fill f
+       WHERE f.symbol = $1 AND f.resolution = $3 AND f.time >= now() - $2::interval
+         AND NOT EXISTS (SELECT 1 FROM agg WHERE agg.bucket = f.time)
+     ) merged
+     ORDER BY t`,
+    [ticker, range, fill]
   );
   return rows;
 }
@@ -646,6 +656,43 @@ export function startHistorySelfCheck() {
       console.log(`[agg-first-check] ${JSON.stringify(aggFirst)}`);
     } catch (error) {
       console.error(`[official-close-check] failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    // 1일·1주 공백 채우기 (T-151, B-58): 같은 시점의 집계만 점 수와 합친 뒤 점 수, 집계 값 변화, 같은 시각 중복, 0 이하 값.
+    // overlap: 봉과 집계가 둘 다 있는 시각의 수와 차이(%). 봉 시각을 버킷에 맞춘 방식이 맞는지 보는 값이다(공개 시세에서 계산한 숫자)
+    try {
+      const results: Record<string, unknown>[] = [];
+      for (const ticker of YAHOO_KEYS) {
+        for (const timeframe of ['1일', '1주'] as const) {
+          const { view, range, fill } = DB_TIMEFRAMES[timeframe];
+          const agg = await dbPool.query<HistoryPoint>(
+            `SELECT (extract(epoch FROM bucket) * 1000)::float8 AS time, close::float8 AS value FROM ${view}
+             WHERE symbol = $1 AND bucket >= now() - $2::interval ORDER BY bucket`,
+            [ticker, range]
+          );
+          const merged = await getHistory(ticker, timeframe);
+          const mergedByTime = new Map(merged.map(point => [point.time, point.value]));
+          const overlap = await dbPool.query<{ n: number; median_pct: number | null; max_pct: number | null }>(
+            `SELECT count(*)::int AS n,
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY abs(f.close - a.close::float8) / a.close::float8 * 100) AS median_pct,
+                    max(abs(f.close - a.close::float8) / a.close::float8 * 100) AS max_pct
+             FROM market_bars_fill f JOIN ${view} a ON a.symbol = f.symbol AND a.bucket = f.time
+             WHERE f.symbol = $1 AND f.resolution = $2 AND f.time >= now() - $3::interval`,
+            [ticker, fill, range]
+          );
+          const round = (value: number | null | undefined) => (value === null || value === undefined ? null : Math.round(value * 10000) / 10000);
+          results.push({
+            ticker, timeframe, agg: agg.rows.length, merged: merged.length,
+            aggChanged: agg.rows.filter(point => mergedByTime.get(point.time) !== point.value).length,
+            duplicates: merged.length - mergedByTime.size,
+            nonPositive: merged.filter(point => point.value <= 0).length,
+            overlap: overlap.rows[0]?.n ?? 0, medianPct: round(overlap.rows[0]?.median_pct), maxPct: round(overlap.rows[0]?.max_pct),
+          });
+        }
+      }
+      console.log(`[bars-fill-check] ${JSON.stringify(results)}`);
+    } catch (error) {
+      console.error(`[bars-fill-check] failed: ${error instanceof Error ? error.message : String(error)}`);
     }
 
     // 증시 자금 흐름 일별 통계 (11단계 B′): 가장 최근 기준일의 지표별 값. 공식 명세에 단위가 없어

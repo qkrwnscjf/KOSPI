@@ -311,6 +311,38 @@ const MIGRATIONS: Migration[] = [
       `SELECT add_retention_policy('market_flows', drop_after => INTERVAL '1 year', if_not_exists => true)`,
     ],
   },
+  {
+    version: 10,
+    name: 'T-151 market_bars_fill (Yahoo 5m/1h closes for periods with no aggregate)',
+    statements: [
+      // 1일·1주 그래프 공백 채우기 (docs/Task_ORDER.md T-151). 기존 테이블·집계는 건드리지 않는다.
+      // 집계에 넣으면 원본이 지워진 구간을 다시 계산할 때 다른 지표의 집계가 지워지므로(저장 불변 조건) 따로 두고, History API가 집계에 없는 시각만 이어 붙인다.
+      // 시각은 집계 버킷과 같은 경계다. 가장 긴 1주 그래프에 맞춰 8일 보관한다. 지표당 하루 최대 300행 정도(추정)라 청크 1일.
+      `CREATE TABLE IF NOT EXISTS market_bars_fill (
+        time TIMESTAMPTZ NOT NULL,
+        symbol TEXT NOT NULL,
+        resolution TEXT NOT NULL,
+        close DOUBLE PRECISION NOT NULL,
+        source TEXT NOT NULL
+      )`,
+      `SELECT create_hypertable('market_bars_fill', 'time', chunk_time_interval => INTERVAL '1 day', if_not_exists => TRUE)`,
+      `CREATE UNIQUE INDEX IF NOT EXISTS market_bars_fill_key ON market_bars_fill (symbol, resolution, time)`,
+      `SELECT add_retention_policy('market_bars_fill', drop_after => INTERVAL '8 days', if_not_exists => true)`,
+    ],
+  },
+  {
+    version: 11,
+    name: 'T-151 market_bars_fill_runs (last Yahoo bar fetch per symbol and resolution)',
+    statements: [
+      // 지표·해상도마다 Yahoo 봉을 마지막으로 받은 시각. 그때 이미 끝난 빈 칸은 Yahoo에도 없는 칸이라 재시작해도 다시 받지 않는다(B-58). 최대 54행.
+      `CREATE TABLE IF NOT EXISTS market_bars_fill_runs (
+        symbol TEXT NOT NULL,
+        resolution TEXT NOT NULL,
+        fetched_at TIMESTAMPTZ NOT NULL,
+        PRIMARY KEY (symbol, resolution)
+      )`,
+    ],
+  },
 ];
 
 // 집계의 실제 저장 테이블(materialization hypertable)을 찾아 청크 간격을 바꾼다 (T-31).

@@ -7,8 +7,10 @@ import { TimeoutError, withAbortTimeout } from '../abort-timeout.js';
 import { YAHOO_CATEGORY, YAHOO_DAILY_HISTORY_KEYS, YAHOO_KEYS, YAHOO_SYMBOLS } from '../../shared/symbols.js';
 import type { YahooSymbolKey } from '../../shared/symbols.js';
 import type { YahooDailyMessage } from '../../shared/yahoo-daily.js';
+import { BAR_RESOLUTIONS, type YahooBarMessage } from '../../shared/yahoo-bars.js';
 import { latestSessionEnd, YAHOO_MARKET } from '../ingestion/market-hours.js';
 import { CLOSE_FIX_DAYS, CLOSE_FIX_MARGIN_MS, GAP_LOOKBACK_DAYS, missingWeekdays, needsDailyHistory, shouldRefreshClose, toDailyRows, usesOfficialDailyClose, type DailyRow } from './daily-history.js';
+import { FILL_PLANS, fillDue, findGap, needsFill, toFillRows } from './intraday-fill.js';
 
 // 최초 1회 과거 데이터 채우기 (docs/Task_ORDER.md T-19, R-05, D-06)
 // 연속 집계에는 직접 넣을 수 없어서, 원본(market_ticks)에 종가를 넣고 → 집계를 전체 갱신하고 →
@@ -246,4 +248,66 @@ export async function runOfficialCloseRefresh(producer: Producer) {
     }
   }
   if (calls > 0) console.log(`Official close refresh: ${calls} symbols fetched, ${sent} daily rows sent (last ${CLOSE_FIX_DAYS} days) in ${Date.now() - startedAt}ms`);
+}
+
+// 1일·1주 그래프 공백 채우기 (docs/Task_ORDER.md T-151, BENCHMARK B-58)
+// 스택이 꺼져 있던 구간은 집계에 값이 없다. 지표·해상도마다 공백이 있을 때만 Yahoo 봉을 받아 Kafka로 보내고, 컨슈머가 market_bars_fill에 저장한다.
+// 집계는 건드리지 않고, History API가 집계에 없는 시각만 이어 붙인다. 공백 판단에는 이미 채운 값도 포함한다.
+// 받지 못한 지표는 다음 확인 때 다시 시도한다. 채워지지 않는 공백(공휴일 등)은 FILL_REFETCH_MS마다 한 번만 받는다.
+const lastFillAt = new Map<string, number>();
+
+export async function runIntradayFill(producer: Producer) {
+  const startedAt = Date.now();
+  let calls = 0;
+  let failed = 0;
+  let sent = 0;
+  for (const symbol of YAHOO_KEYS) {
+    for (const resolution of BAR_RESOLUTIONS) {
+      const plan = FILL_PLANS[resolution];
+      // 집계 이름은 코드의 고정 표에서만 온다
+      const { rows } = await dbPool.query<{ ms: number }>(
+        `SELECT (extract(epoch FROM bucket) * 1000)::float8 AS ms FROM ${plan.view}
+         WHERE symbol = $1 AND bucket >= now() - make_interval(secs => $2)
+         UNION
+         SELECT (extract(epoch FROM time) * 1000)::float8 FROM market_bars_fill
+         WHERE symbol = $1 AND resolution = $3 AND time >= now() - make_interval(secs => $2)`,
+        [symbol, plan.windowMs / 1000, resolution]
+      );
+      const { rows: [lastRun] } = await dbPool.query<{ fetched: number }>(
+        `SELECT (extract(epoch FROM fetched_at) * 1000)::float8 AS fetched FROM market_bars_fill_runs WHERE symbol = $1 AND resolution = $2`,
+        [symbol, resolution]
+      );
+      const now = Date.now();
+      const key = `${symbol}|${resolution}`;
+      if (!needsFill(findGap(rows.map(row => row.ms), YAHOO_MARKET[symbol], resolution, now, lastRun?.fetched ?? null), resolution)) continue;
+      if (!fillDue(lastFillAt.get(key), now)) continue;
+      calls += 1;
+      try {
+        const result = await fetchChart(symbol, plan.yahooInterval, plan.fetchDays);
+        const bars = toFillRows(result.quotes, resolution, now);
+        if (bars.length > 0) {
+          await producer.send({
+            topic: TOPICS.yahooBars,
+            messages: bars.map(bar => {
+              const message: YahooBarMessage = { symbol, resolution, time: bar.time, close: bar.close, producedAt: now };
+              return { key: symbol, value: JSON.stringify(message) };
+            }),
+          });
+        }
+        sent += bars.length;
+        lastFillAt.set(key, now);
+        // 시세가 아니라 "언제까지 요청해 봤는지" 기록이라 Kafka를 거치지 않는다 (backfill_runs와 같은 방식)
+        await dbPool.query(
+          `INSERT INTO market_bars_fill_runs (symbol, resolution, fetched_at) VALUES ($1, $2, to_timestamp($3 / 1000.0))
+           ON CONFLICT (symbol, resolution) DO UPDATE SET fetched_at = EXCLUDED.fetched_at`,
+          [symbol, resolution, now]
+        );
+      } catch (error) {
+        failed += 1;
+        console.error(`Intraday fill ${symbol} ${resolution} failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  }
+  if (calls > 0) console.log(`Intraday fill: ${calls} charts fetched, ${failed} failed, ${sent} bars sent in ${Date.now() - startedAt}ms`);
+  else console.log(`Intraday fill: nothing to fetch (checked in ${Date.now() - startedAt}ms)`);
 }

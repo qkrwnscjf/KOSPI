@@ -35,6 +35,9 @@ export const TOPICS = {
   // Yahoo 일봉 (T-143): db-sink가 받아 보내고 db-sink가 저장한다. Gateway는 읽지 않는다
   yahooDaily: 'yahoo-daily',
   yahooDailyDlq: 'yahoo-daily.dlq',
+  // Yahoo 장중 봉 (T-151): 꺼져 있던 구간의 1일·1주 그래프용. db-sink가 받아 보내고 db-sink가 저장한다. Gateway는 읽지 않는다
+  yahooBars: 'yahoo-bars',
+  yahooBarsDlq: 'yahoo-bars.dlq',
 } as const;
 
 const TICKS_PARTITIONS = Number.parseInt(process.env.KAFKA_TOPIC_PARTITIONS ?? '', 10) || 1;
@@ -55,8 +58,8 @@ const TOPIC_DEFINITIONS = [
   topicDefinition(TOPICS.flows, FLOWS_RETENTION_MS),
   topicDefinition(TOPICS.flowsDlq, DLQ_RETENTION_MS),
   // KRX 일별 지수·DART 공시도 하루 수백 건 이하라 7일 보관 (DB Sink가 며칠 멈춰도 다시 채울 수 있음)
-  ...[TOPICS.indexDaily, TOPICS.disclosures, TOPICS.breadth, TOPICS.rankings, TOPICS.marketFlows, TOPICS.yahooDaily].map(topic => topicDefinition(topic, FLOWS_RETENTION_MS)),
-  ...[TOPICS.indexDailyDlq, TOPICS.disclosuresDlq, TOPICS.breadthDlq, TOPICS.rankingsDlq, TOPICS.marketFlowsDlq, TOPICS.yahooDailyDlq].map(topic => topicDefinition(topic, DLQ_RETENTION_MS)),
+  ...[TOPICS.indexDaily, TOPICS.disclosures, TOPICS.breadth, TOPICS.rankings, TOPICS.marketFlows, TOPICS.yahooDaily, TOPICS.yahooBars].map(topic => topicDefinition(topic, FLOWS_RETENTION_MS)),
+  ...[TOPICS.indexDailyDlq, TOPICS.disclosuresDlq, TOPICS.breadthDlq, TOPICS.rankingsDlq, TOPICS.marketFlowsDlq, TOPICS.yahooDailyDlq, TOPICS.yahooBarsDlq].map(topic => topicDefinition(topic, DLQ_RETENTION_MS)),
 ];
 
 // 토픽이 없으면 만든다. worker, Gateway, DB Sink가 시작할 때 각자 호출하므로 어느 쪽이 먼저 떠도 같은 설정으로 만들어진다.
@@ -101,6 +104,7 @@ const DLQ_FOR: Record<string, string> = {
   [TOPICS.rankings]: TOPICS.rankingsDlq,
   [TOPICS.marketFlows]: TOPICS.marketFlowsDlq,
   [TOPICS.yahooDaily]: TOPICS.yahooDailyDlq,
+  [TOPICS.yahooBars]: TOPICS.yahooBarsDlq,
 };
 const dlqTopicFor = (topic: string) => DLQ_FOR[topic] ?? TOPICS.dlq;
 

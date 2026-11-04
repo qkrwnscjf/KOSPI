@@ -10,11 +10,12 @@ import { parseMarketBreadth, type MarketBreadth } from '../../shared/breadth.js'
 import { parseStockRankings, type StockRankings } from '../../shared/rankings.js';
 import { parseMarketFlow, type MarketFlow } from '../../shared/market-flows.js';
 import { parseYahooDaily, type YahooDailyMessage } from '../../shared/yahoo-daily.js';
+import { parseYahooBar, type YahooBarMessage } from '../../shared/yahoo-bars.js';
 import { YAHOO_DAILY_SOURCE } from '../../shared/symbols.js';
 import { setWallClockTimeout } from '../wall-clock-timer.js';
 import { safeLogText } from '../http-json.js';
 import type { EachBatchPayload } from 'kafkajs';
-import { runBackfillOnce, runDailyHistoryBackfill, runOfficialCloseRefresh } from './backfill.js';
+import { runBackfillOnce, runDailyHistoryBackfill, runIntradayFill, runOfficialCloseRefresh } from './backfill.js';
 import { clampWindow, mergeWindows, planLateRefresh, POLICY_START_OFFSET_MS, SAFE_RAW_WINDOW_MS, type RefreshWindow } from './late-refresh.js';
 import { runDlqReplay } from './dlq-replay.js';
 import { registerShutdown } from '../shutdown.js';
@@ -49,7 +50,7 @@ const DB_SIZE_INTERVAL_MS = 5 * 60 * 1000;
 const DAILY_HISTORY_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const CLOSE_REFRESH_CHECK_MS = 30 * 60 * 1000;
 // 11단계·12단계·T-67에서 추가한 테이블 (용량·청크·행 수 기록). 이름은 고정 목록이고 매개변수로만 SQL에 넘긴다.
-const EXTRA_TABLES = ['investor_flows', 'index_daily', 'disclosures', 'market_breadth', 'stock_rankings', 'market_flows'];
+const EXTRA_TABLES = ['investor_flows', 'index_daily', 'disclosures', 'market_breadth', 'stock_rankings', 'market_flows', 'market_bars_fill'];
 const dbRows = new Gauge('kospi_db_rows', 'Row count of the smaller hypertables added in stages 11-12 (investor_flows, index_daily, disclosures)');
 
 // 여러 행을 INSERT 한 번으로 저장한다 (P-16). 단일 문장이라 전부 들어가거나 전부 실패한다.
@@ -446,6 +447,54 @@ async function handleYahooDailyBatch({ batch, resolveOffset, heartbeat }: EachBa
   await heartbeat();
 }
 
+// Yahoo 장중 봉 저장 (T-151). 집계가 없는 구간을 채우는 값이다. 이미 있는 시각은 건너뛴다(같은 봉을 다시 받아도 값이 바뀌지 않음).
+const yahooBarsReceived = new Counter('kospi_sink_yahoo_bars_received_total', 'Valid Yahoo intraday bar messages received from Kafka');
+const yahooBarsWritten = new Counter('kospi_sink_yahoo_bars_rows_written_total', 'Yahoo intraday bar rows inserted into market_bars_fill');
+
+async function writeYahooBars(rows: YahooBarMessage[]) {
+  const values: unknown[] = [];
+  const placeholders = rows.map((row, index) => {
+    const base = index * 5;
+    values.push(row.time, row.symbol, row.resolution, row.close, YAHOO_DAILY_SOURCE);
+    return `(to_timestamp($${base + 1} / 1000.0), $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5})`;
+  });
+  const result = await dbPool.query(
+    `INSERT INTO market_bars_fill (time, symbol, resolution, close, source) VALUES ${placeholders.join(', ')}
+     ON CONFLICT (symbol, resolution, time) DO NOTHING`,
+    values
+  );
+  return result.rowCount ?? 0;
+}
+
+// 다른 토픽과 같은 규칙: 잘못된 메시지는 DLQ, 저장에 성공한 뒤에만 오프셋 확정.
+async function handleYahooBarsBatch({ batch, resolveOffset, heartbeat }: EachBatchPayload) {
+  const valid: YahooBarMessage[] = [];
+  for (const message of batch.messages) {
+    const parsed = parseYahooBar(message.value);
+    if (!parsed.ok) {
+      invalidTotal.inc({ reason: `yahoo_bar_${parsed.reason}` });
+      console.warn(`DB sink skipped invalid Yahoo bar message at ${batch.topic}[${batch.partition}]@${message.offset}: ${parsed.reason}`);
+      await sendToDlq(dlqProducer, { consumer: CONSUMER_NAME, topic: batch.topic, partition: batch.partition, message, reason: parsed.reason });
+      continue;
+    }
+    valid.push(parsed.row);
+  }
+  // 예외는 그대로 던져서 오프셋을 확정하지 않는다
+  if (valid.length > 0) {
+    let written = 0;
+    for (let index = 0; index < valid.length; index += 500) {
+      written += await writeYahooBars(valid.slice(index, index + 500));
+      await heartbeat();
+    }
+    yahooBarsReceived.inc({}, valid.length);
+    yahooBarsWritten.inc({}, written);
+    console.log(`DB sink stored Yahoo intraday bars: ${valid.length} received, ${written} written`);
+  }
+  const lastMessage = batch.messages[batch.messages.length - 1];
+  if (lastMessage) resolveOffset(lastMessage.offset);
+  await heartbeat();
+}
+
 // 데이터 신선도 (15단계 T-112): 데이터셋마다 가장 최근 값이 얼마나 오래됐는지(초). 앱 설정 화면의 파이프라인 상태와 Grafana에 쓴다.
 // 테이블 이름은 고정 목록이다. 비어 있는 데이터셋은 기록하지 않는다(값이 생긴 뒤부터 나타남).
 const dataLatestAge = new Gauge('kospi_db_latest_data_age_seconds', 'Seconds since the newest row of each dataset (market_ticks, index_daily, market_breadth, disclosures, stock_rankings, market_flows)');
@@ -506,6 +555,7 @@ async function recordDbSize() {
       UNION ALL SELECT 'market_breadth', count(*)::text FROM market_breadth
       UNION ALL SELECT 'stock_rankings', count(*)::text FROM stock_rankings
       UNION ALL SELECT 'market_flows', count(*)::text FROM market_flows
+      UNION ALL SELECT 'market_bars_fill', count(*)::text FROM market_bars_fill
     `);
     for (const row of counts.rows) {
       dbRows.set({ relation: row.relation }, Number(row.rows));
@@ -589,7 +639,7 @@ async function run() {
   await ensureTopics();
   await consumer.connect();
   // 그룹이 처음 시작할 때만 토픽의 처음부터 읽는다. 이후에는 커밋된 오프셋부터 이어서 읽는다.
-  await consumer.subscribe({ topics: [TOPICS.ticks, TOPICS.flows, TOPICS.indexDaily, TOPICS.disclosures, TOPICS.breadth, TOPICS.rankings, TOPICS.marketFlows, TOPICS.yahooDaily], fromBeginning: true });
+  await consumer.subscribe({ topics: [TOPICS.ticks, TOPICS.flows, TOPICS.indexDaily, TOPICS.disclosures, TOPICS.breadth, TOPICS.rankings, TOPICS.marketFlows, TOPICS.yahooDaily, TOPICS.yahooBars], fromBeginning: true });
 
   // kafkajs가 스스로 재시작하지 않는 중단이면 종료해서 docker-compose의 restart: on-failure가 다시 띄우게 한다.
   consumer.on(consumer.events.CRASH, event => {
@@ -626,6 +676,10 @@ async function run() {
       }
       if (payload.batch.topic === TOPICS.yahooDaily) {
         await handleYahooDailyBatch(payload);
+        return;
+      }
+      if (payload.batch.topic === TOPICS.yahooBars) {
+        await handleYahooBarsBatch(payload);
         return;
       }
       const { batch, resolveOffset, heartbeat } = payload;
@@ -691,6 +745,9 @@ async function run() {
     // 공식 종가 보정 (T-136): 장이 정해진 시장의 지표만 지표마다 하루 한 번
     .then(() => runOfficialCloseRefresh(dlqProducer))
     .catch(error => console.error(`Official close refresh failed: ${error instanceof Error ? error.message : String(error)}`))
+    // 1일·1주 그래프 공백 채우기 (T-151): 공백이 있는 지표만 받는다
+    .then(() => runIntradayFill(dlqProducer))
+    .catch(error => console.error(`Intraday fill failed: ${error instanceof Error ? error.message : String(error)}`))
     .finally(() => void recordDbSize());
 
   setInterval(() => void recordDbSize(), DB_SIZE_INTERVAL_MS);
@@ -705,6 +762,8 @@ async function run() {
   const scheduleDailyHistory = () => setWallClockTimeout(() => {
     runDailyHistoryBackfill(dlqProducer)
       .catch(error => console.error(`Daily history backfill failed: ${error instanceof Error ? error.message : String(error)}`))
+      .then(() => runIntradayFill(dlqProducer))
+      .catch(error => console.error(`Intraday fill failed: ${error instanceof Error ? error.message : String(error)}`))
       .finally(scheduleDailyHistory);
   }, DAILY_HISTORY_INTERVAL_MS);
   scheduleDailyHistory();
