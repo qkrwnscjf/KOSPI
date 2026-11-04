@@ -1,9 +1,9 @@
 import { Server, Socket } from 'socket.io';
-import type { Consumer, EachMessagePayload, KafkaMessage } from 'kafkajs';
+import type { Consumer, EachMessagePayload } from 'kafkajs';
 import { flowRoom, isFlowMarket, parseInvestorFlow } from '../../shared/flows.js';
 import { DISCLOSURE_ROOM, isTargetStock, parseDisclosure } from '../../shared/disclosures.js';
 import { isKrxDailySymbol, isKrxHistorySymbol } from '../../shared/krx-indices.js';
-import { kafka, TOPICS, ensureTopics, sendToDlq } from '../../infrastructure/kafka.js';
+import { kafka, TOPICS, ensureTopics } from '../../infrastructure/kafka.js';
 import { Counter, Gauge, Latency } from '../../infrastructure/metrics.js';
 import { marketService } from './market.service.js';
 import { parseTick } from '../../shared/tick-validation.js';
@@ -25,7 +25,8 @@ const kafkaConnectAttempts = new Counter('kospi_gateway_kafka_connect_attempts_t
 kafkaConnected.set({}, 0);
 
 // 잘못된 메시지 방어 (docs/Task_ORDER.md T-13, SEC-002)
-const invalidTotal = new Counter('kospi_gateway_invalid_messages_total', 'Messages sent to the DLQ by the gateway, by reason');
+// Gateway는 세고 건너뛰기만 한다. Gateway가 읽는 토픽은 db-sink도 같은 검증으로 읽고, DLQ에는 db-sink가 넣는다(T-153, B-59: 같은 메시지가 두 번 들어가던 문제)
+const invalidTotal = new Counter('kospi_gateway_invalid_messages_total', 'Invalid messages skipped by the gateway, by reason (db-sink sends them to the DLQ)');
 const redisErrorsTotal = new Counter('kospi_gateway_redis_errors_total', 'Redis errors while caching the latest tick');
 
 // emit 순서 (docs/Task_ORDER.md T-23, BENCHMARK B-05)
@@ -48,11 +49,8 @@ const replayedSkippedTotal = new Counter('kospi_gateway_replayed_skipped_total',
 
 const RECONNECT_INITIAL_DELAY_MS = 1000;
 const RECONNECT_MAX_DELAY_MS = 30000;
-const CONSUMER_NAME = 'gateway';
 
 const errorMessage = (error: unknown) => (error instanceof Error ? error.message : String(error));
-
-const dlqProducer = kafka.producer();
 
 // 이 핸들러는 예외를 던지지 않는다. 던지면 kafkajs가 같은 메시지를 계속 다시 시도해서 실시간 경로 전체가 멈춘다 (SEC-002).
 const handleMessage = (io: Server) => async ({ topic, partition, message }: EachMessagePayload) => {
@@ -63,22 +61,21 @@ const handleMessage = (io: Server) => async ({ topic, partition, message }: Each
     return;
   }
   if (topic === TOPICS.flows) {
-    await handleFlowMessage(io, topic, partition, message, consumedAt);
+    handleFlowMessage(io, topic, partition, message.value, message.offset, consumedAt);
     return;
   }
   if (topic === TOPICS.indexDaily) {
-    await handleIndexDailyMessage(io, topic, partition, message);
+    handleIndexDailyMessage(io, topic, partition, message.value, message.offset);
     return;
   }
   if (topic === TOPICS.disclosures) {
-    await handleDisclosureMessage(io, topic, partition, message);
+    handleDisclosureMessage(io, topic, partition, message.value, message.offset);
     return;
   }
   const parsed = parseTick(message.value);
   if (!parsed.ok) {
     invalidTotal.inc({ reason: parsed.reason });
     console.warn(`Gateway skipped invalid message at ${topic}[${partition}]@${message.offset}: ${parsed.reason}`);
-    await sendToDlq(dlqProducer, { consumer: CONSUMER_NAME, topic, partition, message, reason: parsed.reason });
     return;
   }
 
@@ -103,12 +100,11 @@ const handleMessage = (io: Server) => async ({ topic, partition, message }: Each
 };
 
 // 증시 자금 흐름 (docs/Task_ORDER.md 11단계 A). 시세와 같은 규칙: 검증 → 먼저 전송 → 캐시는 기다리지 않음. 예외를 던지지 않는다.
-async function handleFlowMessage(io: Server, topic: string, partition: number, message: KafkaMessage, consumedAt: number) {
-  const parsed = parseInvestorFlow(message.value);
+function handleFlowMessage(io: Server, topic: string, partition: number, value: Buffer | null, offset: string, consumedAt: number) {
+  const parsed = parseInvestorFlow(value);
   if (!parsed.ok) {
     invalidTotal.inc({ reason: `flow_${parsed.reason}` });
-    console.warn(`Gateway skipped invalid flow message at ${topic}[${partition}]@${message.offset}: ${parsed.reason}`);
-    await sendToDlq(dlqProducer, { consumer: CONSUMER_NAME, topic, partition, message, reason: parsed.reason });
+    console.warn(`Gateway skipped invalid flow message at ${topic}[${partition}]@${offset}: ${parsed.reason}`);
     return;
   }
   const flow = parsed.flow;
@@ -125,15 +121,14 @@ async function handleFlowMessage(io: Server, topic: string, partition: number, m
 
 // KRX 일별 지수 (docs/Task_ORDER.md T-67). 시세와 같은 'tick' 이벤트로 보내서 화면 카드가 그대로 받는다.
 // 소스 시각이 하루 전이라 지연 지표(e2e·pipeline)에는 넣지 않는다. 최신값 캐시는 더 새로운 날짜일 때만 바꾼다.
-async function handleIndexDailyMessage(io: Server, topic: string, partition: number, message: KafkaMessage) {
-  const parsed = parseTick(message.value);
+function handleIndexDailyMessage(io: Server, topic: string, partition: number, value: Buffer | null, offset: string) {
+  const parsed = parseTick(value);
   // Yahoo 지표의 과거 일봉(T-104 보완, 코스피 200 등)은 DB에만 저장한다. 실시간 값은 Yahoo tick이 주므로 화면에 보내지 않는다
   if (parsed.ok && isKrxHistorySymbol(parsed.tick.symbol)) return;
   const reason = !parsed.ok ? parsed.reason : !isKrxDailySymbol(parsed.tick.symbol) ? 'not_daily_symbol' : undefined;
   if (reason || !parsed.ok) {
     invalidTotal.inc({ reason: `index_${reason ?? 'unknown'}` });
-    console.warn(`Gateway skipped invalid daily index message at ${topic}[${partition}]@${message.offset}: ${reason}`);
-    await sendToDlq(dlqProducer, { consumer: CONSUMER_NAME, topic, partition, message, reason: reason ?? 'unknown' });
+    console.warn(`Gateway skipped invalid daily index message at ${topic}[${partition}]@${offset}: ${reason}`);
     return;
   }
   const tick = parsed.tick;
@@ -146,12 +141,11 @@ async function handleIndexDailyMessage(io: Server, topic: string, partition: num
 }
 
 // DART 공시 (12단계). 수집 주기에 새로 발견한 공시(live)만 화면에 바로 보낸다. 과거 채우기분은 REST로만 보인다.
-async function handleDisclosureMessage(io: Server, topic: string, partition: number, message: KafkaMessage) {
-  const parsed = parseDisclosure(message.value);
+function handleDisclosureMessage(io: Server, topic: string, partition: number, value: Buffer | null, offset: string) {
+  const parsed = parseDisclosure(value);
   if (!parsed.ok) {
     invalidTotal.inc({ reason: `disclosure_${parsed.reason}` });
-    console.warn(`Gateway skipped invalid disclosure message at ${topic}[${partition}]@${message.offset}: ${parsed.reason}`);
-    await sendToDlq(dlqProducer, { consumer: CONSUMER_NAME, topic, partition, message, reason: parsed.reason });
+    console.warn(`Gateway skipped invalid disclosure message at ${topic}[${partition}]@${offset}: ${parsed.reason}`);
     return;
   }
   const { disclosure } = parsed;
@@ -197,7 +191,6 @@ async function startConsumer(io: Server) {
   const consumer = kafka.consumer({ groupId: 'market-group' });
   activeConsumer = consumer;
   try {
-    await dlqProducer.connect();
     await ensureTopics();
     await consumer.connect();
     await consumer.subscribe({ topics: [TOPICS.ticks, TOPICS.flows, TOPICS.indexDaily, TOPICS.disclosures], fromBeginning: false });
@@ -251,7 +244,6 @@ async function connectWithRetry(io: Server) {
 export async function stopMarketGateway() {
   shuttingDown = true;
   await activeConsumer?.disconnect().catch(error => console.error(`Gateway consumer disconnect failed: ${errorMessage(error)}`));
-  await dlqProducer.disconnect().catch(error => console.error(`Gateway DLQ producer disconnect failed: ${errorMessage(error)}`));
   kafkaConnected.set({}, 0);
 }
 
