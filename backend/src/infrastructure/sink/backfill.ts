@@ -2,6 +2,8 @@ import YahooFinance from 'yahoo-finance2';
 import type { Producer } from 'kafkajs';
 import { dbPool } from '../db.js';
 import { TOPICS } from '../kafka.js';
+import { Counter, Gauge, Latency } from '../metrics.js';
+import { TimeoutError, withAbortTimeout } from '../abort-timeout.js';
 import { YAHOO_CATEGORY, YAHOO_DAILY_HISTORY_KEYS, YAHOO_KEYS, YAHOO_SYMBOLS } from '../../shared/symbols.js';
 import type { YahooSymbolKey } from '../../shared/symbols.js';
 import type { YahooDailyMessage } from '../../shared/yahoo-daily.js';
@@ -34,11 +36,40 @@ interface BackfillRow {
   changePrice: number;
 }
 
+// 검증용 (기본 끔, BENCHMARK B-57): 지정한 지표의 Yahoo 호출이 응답 없이 기다리다 실패하는 상황을 흉내 낸다. 외부 호출은 하지 않는다
+const TEST_STALL_SYMBOLS = new Set((process.env.YAHOO_TEST_STALL_SYMBOLS ?? '').split(',').filter(Boolean));
+const TEST_STALL_MS = Number.parseInt(process.env.YAHOO_TEST_STALL_MS ?? '', 10) || 300_000;
+
+const simulateStall = async (): Promise<never> => {
+  await new Promise(resolve => setTimeout(resolve, TEST_STALL_MS));
+  throw new Error('simulated stall (verification only)');
+};
+
+// Yahoo chart 호출 시간 제한 (T-150, B-57). 라이브러리에는 제한이 없고 호출은 지표마다 차례로 진행되므로,
+// 한 지표가 응답하지 않으면 뒤의 지표가 모두 밀렸다. 1년치 일봉도 평소 수 초 안에 끝난다.
+const CHART_TIMEOUT_MS = Number.parseInt(process.env.YAHOO_CHART_TIMEOUT_MS ?? '', 10) || 15_000;
+const chartFetchTotal = new Counter('kospi_sink_yahoo_fetch_total', 'Yahoo chart calls from db-sink by result (ok / timeout / error)');
+const chartFetchDuration = new Latency('kospi_sink_yahoo_fetch_duration_seconds', 'Yahoo chart call duration from db-sink');
+const officialCloseLastSuccess = new Gauge('kospi_sink_official_close_last_success_timestamp_seconds', 'Unix time of the last successful official close fetch, by symbol');
+
+async function fetchChart(symbol: YahooSymbolKey, interval: (typeof RANGES)[number]['interval'], days: number) {
+  const startedAt = Date.now();
+  try {
+    const result = await withAbortTimeout(signal => (TEST_STALL_SYMBOLS.has(symbol)
+      ? simulateStall()
+      : yahooFinance.chart(YAHOO_SYMBOLS[symbol], { period1: new Date(Date.now() - days * DAY_MS), interval }, { fetchOptions: { signal } })), CHART_TIMEOUT_MS);
+    chartFetchTotal.inc({ result: 'ok' });
+    return result;
+  } catch (error) {
+    chartFetchTotal.inc({ result: error instanceof TimeoutError ? 'timeout' : 'error' });
+    throw error;
+  } finally {
+    chartFetchDuration.observe({}, Date.now() - startedAt);
+  }
+}
+
 async function fetchBars(symbol: YahooSymbolKey, interval: (typeof RANGES)[number]['interval'], days: number) {
-  const result = await yahooFinance.chart(YAHOO_SYMBOLS[symbol], {
-    period1: new Date(Date.now() - days * DAY_MS),
-    interval,
-  });
+  const result = await fetchChart(symbol, interval, days);
 
   // 종가가 없거나 0 이하인 봉은 넣지 않는다 (이전 History API는 이런 봉을 0으로 바꿨다, T-21).
   const bars = result.quotes.filter(
@@ -194,6 +225,7 @@ export async function runDailyHistoryBackfill(producer: Producer) {
 const lastCloseFixAt = new Map<YahooSymbolKey, number>();
 
 export async function runOfficialCloseRefresh(producer: Producer) {
+  const startedAt = Date.now();
   let calls = 0;
   let sent = 0;
   for (const symbol of YAHOO_KEYS) {
@@ -208,9 +240,10 @@ export async function runOfficialCloseRefresh(producer: Producer) {
       await sendDailyRows(producer, symbol, rows, true);
       sent += rows.length;
       lastCloseFixAt.set(symbol, now);
+      officialCloseLastSuccess.set({ symbol }, Math.floor(now / 1000));
     } catch (error) {
       console.error(`Official close refresh ${symbol} failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
-  if (calls > 0) console.log(`Official close refresh: ${calls} symbols fetched, ${sent} daily rows sent (last ${CLOSE_FIX_DAYS} days)`);
+  if (calls > 0) console.log(`Official close refresh: ${calls} symbols fetched, ${sent} daily rows sent (last ${CLOSE_FIX_DAYS} days) in ${Date.now() - startedAt}ms`);
 }

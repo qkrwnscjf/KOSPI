@@ -317,6 +317,36 @@ groups:
         annotations:
           summary: "증시 자금 흐름(공공데이터포털) 조회가 13시간 넘게 성공하지 못했습니다. 키 오류·호출 한도·네트워크를 확인하세요."
 
+      # 공식 종가 보정이 멈춤 (T-136, T-150): 지표마다 장이 끝나면 받으므로, 금요일 → 월요일 약 72시간이 정상 최대. 78시간을 넘으면 알린다
+      - uid: kospi-official-close-stale
+        title: 공식 종가 보정 중단
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: time() - min(kospi_sink_official_close_last_success_timestamp_seconds)
+              instant: true
+          - refId: B
+            datasourceUid: __expr__
+            model: { refId: B, type: reduce, expression: A, reducer: last }
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [280800] }
+        for: 15m
+        noDataState: OK
+        execErrState: Error
+        labels: { severity: warning }
+        annotations:
+          summary: "공식 종가(Yahoo 일봉)를 78시간 넘게 받지 못한 지표가 있습니다. 1일 봉이 집계 값으로 남을 수 있습니다. Yahoo 연결과 db-sink 로그를 확인하세요."
+
       # DART 하루 호출 수가 한도(추정 2만 건)의 75%를 넘음
       - uid: kospi-dart-quota
         title: DART 호출 한도 근접
