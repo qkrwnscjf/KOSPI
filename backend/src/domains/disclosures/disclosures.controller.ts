@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify';
-import { redis } from '../../infrastructure/redis.js';
+import { cache } from '../../infrastructure/redis.js';
 import { dbPool } from '../../infrastructure/db.js';
 import { Latency } from '../../infrastructure/metrics.js';
 import { DISCLOSURE_SCOPE, isDisclosureGroup, targetStockCodes } from '../../shared/disclosures.js';
@@ -242,10 +242,10 @@ export function startDisclosureSelfCheck() {
 }
 
 async function cached<T>(key: string, ttl: number, load: () => Promise<T>): Promise<{ value: T; hit: boolean }> {
-  const hit = await redis.get(key);
-  if (hit) return { value: JSON.parse(hit) as T, hit: true };
+  const hit = await cache.readJson<T>(key);
+  if (hit) return { value: hit, hit: true };
   const value = await load();
-  await redis.set(key, JSON.stringify(value), 'EX', ttl);
+  cache.writeJson(key, value, ttl);
   return { value, hit: false };
 }
 

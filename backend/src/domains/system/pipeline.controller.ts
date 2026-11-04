@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify';
-import { redis } from '../../infrastructure/redis.js';
+import { cache } from '../../infrastructure/redis.js';
 import { fetchJson } from '../../infrastructure/http-json.js';
 import { TOPICS } from '../../infrastructure/kafka.js';
 import { Latency } from '../../infrastructure/metrics.js';
@@ -103,13 +103,13 @@ export const pipelineController = async (fastify: FastifyInstance) => {
   fastify.get('/api/v1/system/pipeline', async (_request, reply) => {
     const startedAt = Date.now();
     try {
-      const cached = await redis.get('system:pipeline');
+      const cached = await cache.readJson('system:pipeline');
       if (cached) {
         statusDuration.observe({ result: 'cache_hit' }, Date.now() - startedAt);
-        return JSON.parse(cached);
+        return cached;
       }
       const payload = await getPipelineStatus();
-      await redis.set('system:pipeline', JSON.stringify(payload), 'EX', CACHE_TTL_S);
+      cache.writeJson('system:pipeline', payload, CACHE_TTL_S);
       statusDuration.observe({ result: payload.prometheus === 'ok' ? 'cache_miss' : 'unavailable' }, Date.now() - startedAt);
       return payload;
     } catch (err) {

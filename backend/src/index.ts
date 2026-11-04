@@ -7,6 +7,7 @@ import { historyController, startHistorySelfCheck } from './domains/history/hist
 import { flowsController } from './domains/flows/flows.controller.js';
 import { disclosuresController, startDisclosureSelfCheck } from './domains/disclosures/disclosures.controller.js';
 import { pipelineController, startPipelineSelfCheck } from './domains/system/pipeline.controller.js';
+import { startRestSelfCheck } from './domains/system/rest-self-check.js';
 import { dbPool, initDB } from './infrastructure/db.js';
 import { redis } from './infrastructure/redis.js';
 import { metricsConfig, startMetricsLog, startMetricsServer } from './infrastructure/metrics.js';
@@ -63,6 +64,7 @@ const start = async () => {
     startHistorySelfCheck();
     startDisclosureSelfCheck();
     startPipelineSelfCheck();
+    startRestSelfCheck(fastify);
 
     // 종료 처리 (docs/Task_ORDER.md T-28): 새 요청과 WebSocket을 먼저 닫고, Kafka 컨슈머 → Redis → DB 순서로 정리한다.
     registerShutdown('backend', [

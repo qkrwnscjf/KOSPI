@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify';
-import { redis } from '../../infrastructure/redis.js';
+import { cache } from '../../infrastructure/redis.js';
 import { dbPool } from '../../infrastructure/db.js';
 import { Latency } from '../../infrastructure/metrics.js';
 import { isFlowMarket, type FlowMarket } from '../../shared/flows.js';
@@ -91,13 +91,13 @@ export const flowsController = async (fastify: FastifyInstance) => {
     const startedAt = Date.now();
     try {
       const cacheKey = 'flows:market:1개월';
-      const cached = await redis.get(cacheKey);
+      const cached = await cache.readJson(cacheKey);
       if (cached) {
         flowsDuration.observe({ result: 'cache_hit' }, Date.now() - startedAt);
-        return JSON.parse(cached);
+        return cached;
       }
       const payload = await getMarketFlows();
-      await redis.set(cacheKey, JSON.stringify(payload), 'EX', MARKET_FLOWS_CACHE_TTL_S);
+      cache.writeJson(cacheKey, payload, MARKET_FLOWS_CACHE_TTL_S);
       flowsDuration.observe({ result: 'cache_miss' }, Date.now() - startedAt);
       return payload;
     } catch (err) {
@@ -117,16 +117,16 @@ export const flowsController = async (fastify: FastifyInstance) => {
 
     try {
       const cacheKey = `flows:${market}:${range}`;
-      const cached = await redis.get(cacheKey);
+      const cached = await cache.readJson(cacheKey);
       if (cached) {
         flowsDuration.observe({ result: 'cache_hit' }, Date.now() - startedAt);
-        return JSON.parse(cached);
+        return cached;
       }
 
       const dailyInterval = DAILY_RANGES[range];
       const data = range === INTRADAY || !dailyInterval ? await getIntraday(market) : await getDaily(market, dailyInterval);
       const payload = { market, range, unit: 'million_krw', data };
-      await redis.set(cacheKey, JSON.stringify(payload), 'EX', CACHE_TTL_S);
+      cache.writeJson(cacheKey, payload, CACHE_TTL_S);
       flowsDuration.observe({ result: 'cache_miss' }, Date.now() - startedAt);
       return payload;
     } catch (err) {

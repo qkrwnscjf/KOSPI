@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify';
-import { redis } from '../../infrastructure/redis.js';
+import { cache, redis } from '../../infrastructure/redis.js';
 import { dbPool } from '../../infrastructure/db.js';
 import { Latency } from '../../infrastructure/metrics.js';
 import { DERIVED_SPREADS, isDerivedSymbol, isSubscribableSymbol, isYahooSymbolKey, YAHOO_KEYS } from '../../shared/symbols.js';
@@ -289,14 +289,14 @@ export const historyController = async (fastify: FastifyInstance) => {
 
     try {
       const cacheKey = `recent:${ticker}`;
-      const cached = await redis.get(cacheKey);
+      const cached = await cache.readJson(cacheKey);
       if (cached) {
         recentDuration.observe({ result: 'cache_hit' }, Date.now() - startedAt);
-        return JSON.parse(cached);
+        return cached;
       }
 
       const responsePayload = { ticker, data: await getRecentTicks(ticker) };
-      await redis.set(cacheKey, JSON.stringify(responsePayload), 'EX', RECENT_CACHE_TTL_S);
+      cache.writeJson(cacheKey, responsePayload, RECENT_CACHE_TTL_S);
       recentDuration.observe({ result: 'cache_miss' }, Date.now() - startedAt);
       return responsePayload;
     } catch (err) {
@@ -315,13 +315,13 @@ export const historyController = async (fastify: FastifyInstance) => {
     }
     try {
       const cacheKey = `sector-returns:${range}`;
-      const cached = await redis.get(cacheKey);
+      const cached = await cache.readJson(cacheKey);
       if (cached) {
         historyDuration.observe({ result: 'cache_hit' }, Date.now() - startedAt);
-        return JSON.parse(cached);
+        return cached;
       }
       const payload = { range, data: await getSectorReturns(range) };
-      await redis.set(cacheKey, JSON.stringify(payload), 'EX', SECTOR_RETURNS_CACHE_TTL_S);
+      cache.writeJson(cacheKey, payload, SECTOR_RETURNS_CACHE_TTL_S);
       historyDuration.observe({ result: 'cache_miss' }, Date.now() - startedAt);
       return payload;
     } catch (err) {
@@ -340,13 +340,13 @@ export const historyController = async (fastify: FastifyInstance) => {
     }
     try {
       const cacheKey = `breadth:${range}`;
-      const cached = await redis.get(cacheKey);
+      const cached = await cache.readJson(cacheKey);
       if (cached) {
         historyDuration.observe({ result: 'cache_hit' }, Date.now() - startedAt);
-        return JSON.parse(cached);
+        return cached;
       }
       const payload = { range, ...(await getBreadth(range)) };
-      await redis.set(cacheKey, JSON.stringify(payload), 'EX', BREADTH_CACHE_TTL_S);
+      cache.writeJson(cacheKey, payload, BREADTH_CACHE_TTL_S);
       historyDuration.observe({ result: 'cache_miss' }, Date.now() - startedAt);
       return payload;
     } catch (err) {
@@ -365,13 +365,13 @@ export const historyController = async (fastify: FastifyInstance) => {
     }
     try {
       const cacheKey = `rankings:${market}:${type}:${date ?? 'latest'}`;
-      const cached = await redis.get(cacheKey);
+      const cached = await cache.readJson(cacheKey);
       if (cached) {
         historyDuration.observe({ result: 'cache_hit' }, Date.now() - startedAt);
-        return JSON.parse(cached);
+        return cached;
       }
       const payload = await getRankings(market, type, date);
-      await redis.set(cacheKey, JSON.stringify(payload), 'EX', RANKINGS_CACHE_TTL_S);
+      cache.writeJson(cacheKey, payload, RANKINGS_CACHE_TTL_S);
       historyDuration.observe({ result: 'cache_miss' }, Date.now() - startedAt);
       return payload;
     } catch (err) {
@@ -390,13 +390,13 @@ export const historyController = async (fastify: FastifyInstance) => {
     }
     try {
       const cacheKey = `market-risk:${range}`;
-      const cached = await redis.get(cacheKey);
+      const cached = await cache.readJson(cacheKey);
       if (cached) {
         historyDuration.observe({ result: 'cache_hit' }, Date.now() - startedAt);
-        return JSON.parse(cached);
+        return cached;
       }
       const payload = await getMarketRisk(range);
-      await redis.set(cacheKey, JSON.stringify(payload), 'EX', RISK_CACHE_TTL_S);
+      cache.writeJson(cacheKey, payload, RISK_CACHE_TTL_S);
       historyDuration.observe({ result: 'cache_miss' }, Date.now() - startedAt);
       return payload;
     } catch (err) {
@@ -429,10 +429,10 @@ export const historyController = async (fastify: FastifyInstance) => {
 
     try {
       const cacheKey = `history:db:${ticker}:${timeframe}`;
-      const cached = await redis.get(cacheKey);
+      const cached = await cache.readJson(cacheKey);
       if (cached) {
         historyDuration.observe({ result: 'cache_hit' }, Date.now() - startedAt);
-        return JSON.parse(cached);
+        return cached;
       }
 
       const data = daily
@@ -441,7 +441,7 @@ export const historyController = async (fastify: FastifyInstance) => {
           ? await getSpreadHistory(ticker, timeframe)
           : await getHistory(ticker as YahooSymbolKey, timeframe);
       const responsePayload = { ticker, timeframe, data };
-      await redis.set(cacheKey, JSON.stringify(responsePayload), 'EX', HISTORY_CACHE_TTL_S);
+      cache.writeJson(cacheKey, responsePayload, HISTORY_CACHE_TTL_S);
 
       historyDuration.observe({ result: 'cache_miss' }, Date.now() - startedAt);
       return responsePayload;
