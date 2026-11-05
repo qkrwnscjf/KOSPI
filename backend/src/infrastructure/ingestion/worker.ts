@@ -7,6 +7,7 @@ import { YAHOO_KEYS, isYahooSymbolKey } from '../../shared/symbols.js';
 import type { YahooSymbolKey } from '../../shared/symbols.js';
 import type { MarketState } from '../../shared/market-state.js';
 import { producer, TOPICS, ensureTopics } from '../kafka.js';
+import { reportRun } from '../ingestion-report.js';
 import { Counter, Gauge, Latency, metricsConfig, startMetricsLog, startMetricsServer } from '../metrics.js';
 import { registerShutdown } from '../shutdown.js';
 
@@ -66,6 +67,24 @@ let marketStatuses: Partial<Record<MarketId, MarketStatus>> = {};
 const marketClosedAt = new Map<MarketId, number>();
 let lastFullRequestAt: number | undefined;
 let lastRequestSummary: string | undefined;
+
+// 적재 실행 기록 (T-118): 5초 주기마다 남기면 많아서 1분 단위로 합쳐서 남긴다
+const QUOTE_RUN_INTERVAL_MS = 60_000;
+const newQuoteRun = () => ({ startedAt: Date.now(), cycles: 0, failedCycles: 0, received: 0, sent: 0, notReturned: 0, sendFailed: 0 });
+let quoteRun = newQuoteRun();
+
+async function flushQuoteRun() {
+  const run = quoteRun;
+  quoteRun = newQuoteRun();
+  if (run.cycles === 0) return;
+  const failed = run.failedCycles > 0 || run.sendFailed > 0;
+  await reportRun(producer, {
+    source: 'yahoo_quote', endpoint: 'quote', startedAt: run.startedAt, received: run.received, sent: run.sent,
+    dropped: { not_returned: run.notReturned, kafka_send_failed: run.sendFailed },
+    status: run.failedCycles === run.cycles ? 'error' : failed ? 'partial' : run.received > 0 ? 'ok' : 'empty',
+    errorKind: run.failedCycles > 0 ? 'fetch_failed' : run.sendFailed > 0 ? 'kafka_send_failed' : null,
+  });
+}
 
 type CollectedMarketData = NormalizedMarketData & { collectedAt: number };
 type FetchResult = 'success' | 'empty' | 'timeout' | 'error';
@@ -148,6 +167,11 @@ async function runCycle(): Promise<FetchResult> {
   }
   const yahoo = await collect('yahoo', () => fetchYahooData(plan.keys));
   const allData = yahoo.items;
+  quoteRun.cycles += 1;
+  if (yahoo.result !== 'success') quoteRun.failedCycles += 1;
+  quoteRun.received += allData.length;
+  // 요청이 성공했는데 받지 못한 지표(검증에서 버려졌거나 응답에 없음). 요청 자체가 실패한 주기는 failedCycles로 센다
+  if (yahoo.result === 'success') quoteRun.notReturned += Math.max(0, plan.keys.length - allData.length);
 
   // 소스 장 상태 기록 (T-56)
   for (const item of yahoo.items) {
@@ -204,8 +228,14 @@ async function runCycle(): Promise<FetchResult> {
         };
       });
 
-      await producer.send({ topic: TOPICS.ticks, messages });
+      try {
+        await producer.send({ topic: TOPICS.ticks, messages });
+      } catch (error) {
+        quoteRun.sendFailed += messages.length;
+        throw error;
+      }
       kafkaSendDuration.observe({}, Date.now() - producedAt);
+      quoteRun.sent += messages.length;
 
       // 전송에 성공한 뒤에만 "마지막 전송 시각"을 갱신한다. 실패하면 다음 주기에 다시 보낼 수 있도록.
       for (const data of freshData) {
@@ -285,6 +315,7 @@ async function pollOnce() {
     console.error('Worker loop error:', error);
   }
   cycleDuration.observe({}, Date.now() - cycleStartedAt);
+  if (Date.now() - quoteRun.startedAt >= QUOTE_RUN_INTERVAL_MS) await flushQuoteRun();
 
   consecutiveFailures = yahooResult === 'success' ? 0 : consecutiveFailures + 1;
   const interval = baseInterval();
@@ -363,6 +394,14 @@ async function runIngestionWorker() {
     });
     console.warn('KAFKA_TEST_INJECT_INVALID=true: sent 2 invalid test messages (verification only).');
   }
+  // 검증용 (B-62): 형식 검증은 통과할 수 있지만 DB 컬럼이 거부하는 값(소수 거래량) 1건을 보낸다. 시각이 현재라 정상 tick과 겹치지 않는 지표를 쓴다
+  if (process.env.KAFKA_TEST_INJECT_DB_REJECT === 'true') {
+    await producer.send({
+      topic: TOPICS.ticks,
+      messages: [{ key: 'TEST', value: JSON.stringify({ symbol: 'DQ_TEST', category: 'macro', price: 100, changeRate: 0, changePrice: 0, volume: 1.5, timestamp: Date.now() }) }],
+    });
+    console.warn('KAFKA_TEST_INJECT_DB_REJECT=true: sent 1 tick with a fractional volume (verification only).');
+  }
   if (WORKER_TEST_SEND_UNCHANGED) {
     console.warn('WORKER_TEST_SEND_UNCHANGED=true: change detection is off, every polled tick is sent (verification only).');
   }
@@ -374,6 +413,7 @@ async function runIngestionWorker() {
 
   registerShutdown('worker', [
     { name: 'poll loop', run: () => stopPolling() },
+    { name: 'last ingestion run', run: () => flushQuoteRun() },
     { name: 'kafka producer', run: () => producer.disconnect() },
   ]);
 

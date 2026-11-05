@@ -55,7 +55,7 @@ test('summarizeBreadth: 쓸 수 있는 행이 없으면 null (휴장일·필드 
 });
 
 test('parseMarketBreadth: 알려진 형식만 통과하고, 종목 수 합이 맞아야 한다', () => {
-  const ok = { market: 'KOSPI', time: 1, advancers: 1, decliners: 2, unchanged: 3, stocks: 6, tradingValue: 10 };
+  const ok = { market: 'KOSPI', time: 1_790_000_000_000, advancers: 1, decliners: 2, unchanged: 3, stocks: 6, tradingValue: 10 };
   const parsed = parseMarketBreadth(Buffer.from(JSON.stringify({ ...ok, extra: 'x' })));
   assert.equal(parsed.ok, true);
   if (parsed.ok) assert.deepEqual(parsed.breadth, ok);

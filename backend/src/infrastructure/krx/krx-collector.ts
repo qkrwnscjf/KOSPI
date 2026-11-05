@@ -1,6 +1,7 @@
 import { producer, TOPICS, ensureTopics } from '../kafka.js';
 import { Counter, Gauge, Latency, metricsConfig, startMetricsLog, startMetricsServer } from '../metrics.js';
 import { registerShutdown } from '../shutdown.js';
+import { isoDate, reportRun } from '../ingestion-report.js';
 import { KRX_DAILY_INDICES, KRX_DAILY_KEYS, KRX_HISTORY_KEYS, normalizeIndexName, type KrxEndpoint } from '../../shared/krx-indices.js';
 import { fetchBreadthCoverage, fetchDailyIndexCoverage, fetchRankingsCoverage } from '../backend-coverage.js';
 import type { TickData } from '../../shared/types.js';
@@ -85,6 +86,9 @@ function plannedDates(endpoint: string, window: string[]) {
   return datesToCheck(window, states, Date.now());
 }
 
+// 실행 기록용 오류 종류 (T-118): 고정된 종류와 HTTP 상태만 남긴다
+const errorKind = (error: unknown) => (error instanceof KrxApiError ? (error.status ? `http_${error.status}` : error.message) : 'unexpected_error');
+
 function describeError(error: unknown) {
   if (error instanceof KrxApiError) return `${error.message}${error.status ? ` status=${error.status}` : ''}${error.code ? ` code=${error.code}` : ''}`;
   return 'unexpected_error';
@@ -106,6 +110,7 @@ async function collectDay(client: KrxClient, endpoint: KrxEndpoint, basDd: strin
     if (rows.length === 0) {
       fetchTotal.inc({ endpoint, result: 'empty' });
       noteCheck(endpoint, basDd, 'empty');
+      await reportRun(producer, { source: 'krx_index', endpoint: ENDPOINT_PATHS[endpoint], targetFrom: isoDate(basDd), targetTo: isoDate(basDd), startedAt, received: 0, sent: 0, status: 'empty' });
       return true;
     }
     fetchTotal.inc({ endpoint, result: 'ok' });
@@ -137,9 +142,14 @@ async function collectDay(client: KrxClient, endpoint: KrxEndpoint, basDd: strin
         latestTradeDate.set({ symbol: tick.symbol }, Math.max(Number(basDd), 0));
       }
     }
+    await reportRun(producer, {
+      source: 'krx_index', endpoint: ENDPOINT_PATHS[endpoint], targetFrom: isoDate(basDd), targetTo: isoDate(basDd), startedAt,
+      received: ticks.length + invalid.length, sent: changed.length, dropped: { missing_value: invalid.length }, status: 'ok',
+    });
     return true;
   } catch (error) {
     fetchDuration.observe({}, Date.now() - startedAt);
+    await reportRun(producer, { source: 'krx_index', endpoint: ENDPOINT_PATHS[endpoint], targetFrom: isoDate(basDd), targetTo: isoDate(basDd), startedAt, received: 0, sent: 0, status: 'error', errorKind: errorKind(error) });
     return handleFetchError(endpoint, basDd, error);
   }
 }
@@ -180,11 +190,13 @@ async function collectBreadthDay(client: KrxClient, endpoint: BreadthEndpoint, b
     if (rows.length === 0) {
       fetchTotal.inc({ endpoint, result: 'empty' });
       noteCheck(endpoint, basDd, 'empty');
+      await reportRun(producer, { source: 'krx_stock', endpoint: path, targetFrom: isoDate(basDd), targetTo: isoDate(basDd), startedAt, received: 0, sent: 0, status: 'empty' });
       return true;
     }
     fetchTotal.inc({ endpoint, result: 'ok' });
     noteCheck(endpoint, basDd, 'rows');
     lastSuccessAt.set({ endpoint }, Math.floor(Date.now() / 1000));
+    let sent = 0;
 
     const { breadth, invalid } = summarizeBreadth(market, basDd, rows);
     if (invalid > 0) breadthInvalidRows.inc({ market }, invalid);
@@ -194,6 +206,7 @@ async function collectBreadthDay(client: KrxClient, endpoint: BreadthEndpoint, b
         loggedFields.add(`${endpoint}:empty`);
         console.warn(`[krx] ${endpoint} ${basDd}: no usable stock rows among ${rows.length} (field mapping may differ)`);
       }
+      await reportRun(producer, { source: 'krx_stock', endpoint: path, targetFrom: isoDate(basDd), targetTo: isoDate(basDd), startedAt, received: rows.length, sent: 0, dropped: { missing_value: invalid }, status: 'partial', errorKind: 'no_usable_rows' });
       return true;
     }
     const key = `breadth|${market}|${basDd}`;
@@ -205,6 +218,7 @@ async function collectBreadthDay(client: KrxClient, endpoint: BreadthEndpoint, b
       });
       lastSent.set(key, signature);
       breadthSentTotal.inc({ market });
+      sent += 1;
     }
 
     // 종목 순위 (T-113): 같은 응답에서 4가지 순위의 상위 100개만 보낸다(추가 호출 없음). 바뀐 날만 보낸다
@@ -219,11 +233,14 @@ async function collectBreadthDay(client: KrxClient, endpoint: BreadthEndpoint, b
         });
         lastSent.set(rankKey, rankSignature);
         rankingsSentTotal.inc({ market });
+        sent += 1;
       }
     }
+    await reportRun(producer, { source: 'krx_stock', endpoint: path, targetFrom: isoDate(basDd), targetTo: isoDate(basDd), startedAt, received: rows.length, sent, dropped: { missing_value: invalid }, status: 'ok' });
     return true;
   } catch (error) {
     fetchDuration.observe({}, Date.now() - startedAt);
+    await reportRun(producer, { source: 'krx_stock', endpoint: path, targetFrom: isoDate(basDd), targetTo: isoDate(basDd), startedAt, received: 0, sent: 0, status: 'error', errorKind: errorKind(error) });
     return handleFetchError(endpoint, basDd, error);
   }
 }

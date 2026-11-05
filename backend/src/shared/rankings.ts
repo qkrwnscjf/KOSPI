@@ -5,6 +5,7 @@
 // 종목명·종목코드는 공개 정보다. 나머지 종목(상위 100 밖)은 저장하지 않는다.
 
 import { BREADTH_MARKETS, isBreadthMarket, type BreadthMarket } from './breadth.js';
+import { isPlausibleEventTime } from './event-time.js';
 
 export const RANKING_LIMIT = 100;
 export const RANKING_TYPES = ['gain', 'loss', 'value', 'cap'] as const;
@@ -58,7 +59,7 @@ export function parseStockRankings(value: Buffer | null): RankingsParseResult {
   if (typeof data !== 'object' || data === null || Array.isArray(data)) return fail('not_object');
   const { market, time, entries, collectedAt, producedAt } = data as Record<string, unknown>;
   if (!isBreadthMarket(market)) return fail('market');
-  if (!isPositive(time)) return fail('time');
+  if (!isPlausibleEventTime(time)) return fail('time');
   if (!Array.isArray(entries) || entries.length === 0 || entries.length > RANKING_LIMIT * RANKING_TYPES.length) return fail('entries');
 
   const parsed: RankingEntry[] = [];

@@ -34,14 +34,14 @@ test('rankStocks: 코드·이름·종가가 잘못된 행은 빼고, 쓸 행이 
 
 test('parseStockRankings: 알려진 형식만 통과, 중복 코드·잘못된 순위는 거부', () => {
   const entry = { code: '005930', name: '삼성전자', close: 70000, changeRate: 1.2, tradingValue: 1e12, marketCap: 4e14, ranks: { cap: 1 } };
-  const ok = parseStockRankings(Buffer.from(JSON.stringify({ market: 'KOSPI', time: 1, entries: [entry], extra: 'x' })));
+  const ok = parseStockRankings(Buffer.from(JSON.stringify({ market: 'KOSPI', time: 1_790_000_000_000, entries: [entry], extra: 'x' })));
   assert.equal(ok.ok, true);
-  const bad = (entries: unknown[]) => parseStockRankings(Buffer.from(JSON.stringify({ market: 'KOSPI', time: 1, entries })));
+  const bad = (entries: unknown[]) => parseStockRankings(Buffer.from(JSON.stringify({ market: 'KOSPI', time: 1_790_000_000_000, entries })));
   assert.deepEqual(bad([entry, entry]), { ok: false, reason: 'code' });
   assert.deepEqual(bad([{ ...entry, ranks: { cap: 101 } }]), { ok: false, reason: 'ranks' });
   assert.deepEqual(bad([{ ...entry, ranks: {} }]), { ok: false, reason: 'ranks' });
   assert.deepEqual(bad([{ ...entry, code: '<script>' }]), { ok: false, reason: 'code' });
-  assert.deepEqual(parseStockRankings(Buffer.from(JSON.stringify({ market: 'NYSE', time: 1, entries: [entry] }))), { ok: false, reason: 'market' });
+  assert.deepEqual(parseStockRankings(Buffer.from(JSON.stringify({ market: 'NYSE', time: 1_790_000_000_000, entries: [entry] }))), { ok: false, reason: 'market' });
 });
 
 test('캘린더 날짜: 형식과 실제 날짜만 통과, 예외를 던지지 않음', () => {

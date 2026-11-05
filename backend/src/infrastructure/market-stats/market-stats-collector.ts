@@ -2,6 +2,8 @@ import { producer, TOPICS, ensureTopics } from '../kafka.js';
 import { fetchJson, HttpJsonError, safeLogList, safeLogText } from '../http-json.js';
 import { Counter, Gauge, metricsConfig, startMetricsLog, startMetricsServer } from '../metrics.js';
 import { registerShutdown } from '../shutdown.js';
+import { isoDate, reportRun } from '../ingestion-report.js';
+import type { IngestionStatus } from '../../shared/ingestion-runs.js';
 import { dailyCloseTime, dailyValues, readDataGoKrResponse, type MarketFlow, type MarketFlowDataset } from '../../shared/market-flows.js';
 import { nextCollectDelay } from './collect-schedule.js';
 import { setWallClockTimeout, type WallClockTimer } from '../wall-clock-timer.js';
@@ -61,12 +63,19 @@ function requestUrl(operation: string, key: string, nowMs: number) {
 // 한 오퍼레이션을 받아 바뀐 날짜만 보낸다. 'ok' | 'pause'(하루 멈춤) | 'error'
 async function collect(dataset: MarketFlowDataset, operation: string, key: string): Promise<'ok' | 'pause' | 'error'> {
   const startedAt = Date.now();
+  // 적재 실행 기록 (T-118). 기간은 요청한 최근 35일이다
+  const report = (received: number, sent: number, status: IngestionStatus, errorKind: string | null, sourceTotal: number | null = null, dropped: Record<string, number> = {}) => reportRun(producer, {
+    source: 'kofia', endpoint: operation, startedAt,
+    targetFrom: isoDate(seoulDay(startedAt - WINDOW_DAYS * 86_400_000)), targetTo: isoDate(seoulDay(startedAt)),
+    received, sent, status, errorKind, sourceTotal, covered: sourceTotal === null ? null : received, dropped,
+  });
   let body: unknown;
   try {
     const response = await fetchJson(requestUrl(operation, key, startedAt), { timeoutMs: REQUEST_TIMEOUT_MS, maxBytes: MAX_RESPONSE_BYTES });
     if (!response.ok) {
       fetchTotal.inc({ operation, result: 'error' });
       console.warn(`[market-stats] ${operation}: HTTP ${response.status}`);
+      await report(0, 0, 'error', `http_${response.status}`);
       return response.status === 401 || response.status === 403 || response.status === 429 ? 'pause' : 'error';
     }
     body = response.body;
@@ -74,6 +83,7 @@ async function collect(dataset: MarketFlowDataset, operation: string, key: strin
     fetchTotal.inc({ operation, result: 'error' });
     const kind = error instanceof HttpJsonError ? `${error.message}${error.status ? ` status=${error.status}` : ''}` : 'unexpected_error';
     console.warn(`[market-stats] ${operation}: request failed (${kind})`);
+    await report(0, 0, 'error', error instanceof HttpJsonError ? error.message : 'unexpected_error');
     return 'error';
   }
 
@@ -81,6 +91,7 @@ async function collect(dataset: MarketFlowDataset, operation: string, key: strin
   if (resultCode !== '00') {
     fetchTotal.inc({ operation, result: 'result_code' });
     console.warn(`[market-stats] ${operation}: resultCode=${safeLogText(resultCode ?? 'none', 10)} msg=${safeLogText(resultMsg ?? '', 60)}`);
+    await report(0, 0, 'error', 'result_code');
     return resultCode !== null && PAUSE_CODES.has(resultCode) ? 'pause' : 'error';
   }
   fetchTotal.inc({ operation, result: 'ok' });
@@ -108,6 +119,7 @@ async function collect(dataset: MarketFlowDataset, operation: string, key: strin
   console.log(`[market-stats] ${operation}: ${rows.length} rows, ${days.length} days (latest ${days.at(-1)?.basDt ?? 'none'}), sent ${changed.length} changed` +
     `${skippedFields || rowsWithoutDate ? `, skipped fields ${skippedFields}, rows without date ${rowsWithoutDate}` : ''}` +
     `${rows[0] && changed.length > 0 ? ` · fields ${safeLogList(Object.keys(rows[0]), 60)}` : ''}`);
+  await report(rows.length, changed.length, rows.length > 0 ? 'ok' : 'empty', null, Number.isFinite(totalCount) ? totalCount : null, { rejected_day: problems.length, row_without_date: rowsWithoutDate });
   return 'ok';
 }
 

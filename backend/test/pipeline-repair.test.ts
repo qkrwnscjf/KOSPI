@@ -36,7 +36,7 @@ test('clampWindow · mergeWindows: 기다리는 사이 안전 범위를 벗어�
 });
 
 test('replayDecision: 지금 규칙으로 통과하는 메시지만 원래 토픽으로 되돌리고, 여전히 잘못된 것은 그대로 둔다', () => {
-  const tick = { symbol: 'KOSPI', category: 'domestic', price: 2600, changeRate: 0.1, changePrice: 2.6, timestamp: 1 };
+  const tick = { symbol: 'KOSPI', category: 'domestic', price: 2600, changeRate: 0.1, changePrice: 2.6, timestamp: 1_790_000_000_000 };
   assert.deepEqual(replayDecision(TOPICS.ticks, Buffer.from(JSON.stringify(tick))), { replay: true });
   assert.deepEqual(replayDecision(TOPICS.ticks, Buffer.from('not-json')), { replay: false, reason: 'invalid_json' });
   // db-sink 기준: 등락폭이 없는 tick은 저장할 수 없어 되돌리지 않는다

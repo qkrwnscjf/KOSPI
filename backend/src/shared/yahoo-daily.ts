@@ -4,6 +4,7 @@
 // overwrite: false = 없는 날짜만 넣기(과거 일봉·빈 날 채우기), true = Yahoo 행은 새 값으로 바꾸기(공식 종가 보정, T-136)
 
 import { isYahooSymbolKey, type YahooSymbolKey } from './symbols.js';
+import { isPlausibleEventTime } from './event-time.js';
 
 export interface YahooDailyMessage {
   symbol: YahooSymbolKey;
@@ -32,7 +33,7 @@ export function parseYahooDaily(value: Buffer | null): YahooDailyParseResult {
   if (typeof data !== 'object' || data === null || Array.isArray(data)) return fail('not_object');
   const { symbol, time, close, changeRate, changePrice, overwrite, producedAt } = data as Record<string, unknown>;
   if (typeof symbol !== 'string' || !isYahooSymbolKey(symbol)) return fail('symbol');
-  if (!isFiniteNumber(time) || time <= 0) return fail('time');
+  if (!isPlausibleEventTime(time)) return fail('time');
   if (!isFiniteNumber(close) || close <= 0) return fail('close');
   if (!isFiniteNumber(changeRate)) return fail('change_rate');
   if (!isFiniteNumber(changePrice)) return fail('change_price');

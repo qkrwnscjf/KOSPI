@@ -2,6 +2,8 @@
 // KRX 종목별 일별 매매정보를 krx-collector가 시장별 합계로 줄여서 보낸다. 종목 행은 Kafka·DB에 남기지 않는다.
 // Kafka `market-breadth` → db-sink → market_breadth 테이블 → REST `/api/v1/market/breadth`
 
+import { isPlausibleEventTime } from './event-time.js';
+
 export const BREADTH_MARKETS = ['KOSPI', 'KOSDAQ'] as const;
 export type BreadthMarket = (typeof BREADTH_MARKETS)[number];
 
@@ -22,7 +24,8 @@ export const isBreadthMarket = (value: unknown): value is BreadthMarket => typeo
 
 export type BreadthParseResult = { ok: true; breadth: MarketBreadth } | { ok: false; reason: string };
 
-const isCount = (value: unknown): value is number => typeof value === 'number' && Number.isInteger(value) && value >= 0;
+// INTEGER 칼럼 범위 안 (T-154). 한 시장의 종목 수는 수천 개다
+const isCount = (value: unknown): value is number => typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 1_000_000;
 const isPositiveNumber = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0;
 const fail = (reason: string): BreadthParseResult => ({ ok: false, reason });
 
@@ -40,7 +43,7 @@ export function parseMarketBreadth(value: Buffer | null): BreadthParseResult {
 
   const { market, time, advancers, decliners, unchanged, stocks, tradingValue, collectedAt, producedAt } = data as Record<string, unknown>;
   if (!isBreadthMarket(market)) return fail('market');
-  if (!isPositiveNumber(time)) return fail('time');
+  if (!isPlausibleEventTime(time)) return fail('time');
   if (!isCount(advancers) || !isCount(decliners) || !isCount(unchanged)) return fail('counts');
   if (!isCount(stocks) || stocks === 0 || stocks !== advancers + decliners + unchanged) return fail('stocks');
   if (typeof tradingValue !== 'number' || !Number.isFinite(tradingValue) || tradingValue < 0) return fail('trading_value');

@@ -48,6 +48,8 @@ export const isKrxDailySymbol = (value: unknown): value is KrxDailySymbol =>
 // 내부 심볼은 Yahoo 표(symbols.ts)와 같다.
 export const KRX_HISTORY_INDICES = {
   KOSPI200: { endpoint: 'kospi', names: ['코스피 200', '코스피200'] },
+  // 소스 간 대조 (T-119): 같은 응답에 있어 호출이 늘지 않는다. Yahoo 일봉과 거래소 값을 DB에서 비교한다. 화면 tick으로 보내지 않는다
+  KOSPI: { endpoint: 'kospi', names: ['코스피'] },
 } as const satisfies Record<string, { endpoint: KrxEndpoint; names: readonly string[] }>;
 
 export type KrxHistorySymbol = keyof typeof KRX_HISTORY_INDICES;

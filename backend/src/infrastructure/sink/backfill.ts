@@ -11,6 +11,7 @@ import { BAR_RESOLUTIONS, type YahooBarMessage } from '../../shared/yahoo-bars.j
 import { latestSessionEnd, YAHOO_MARKET } from '../ingestion/market-hours.js';
 import { CLOSE_FIX_DAYS, CLOSE_FIX_MARGIN_MS, GAP_LOOKBACK_DAYS, missingWeekdays, needsDailyHistory, shouldRefreshClose, toDailyRows, usesOfficialDailyClose, type DailyRow } from './daily-history.js';
 import { FILL_PLANS, fillDue, findGap, needsFill, toFillRows } from './intraday-fill.js';
+import { reportRun } from '../ingestion-report.js';
 
 // 최초 1회 과거 데이터 채우기 (docs/Task_ORDER.md T-19, R-05, D-06)
 // 연속 집계에는 직접 넣을 수 없어서, 원본(market_ticks)에 종가를 넣고 → 집계를 전체 갱신하고 →
@@ -186,6 +187,10 @@ async function sendDailyRows(producer: Producer, symbol: YahooSymbolKey, rows: D
 }
 
 export async function runDailyHistoryBackfill(producer: Producer) {
+  const startedAt = Date.now();
+  let calls = 0;
+  let failed = 0;
+  let sent = 0;
   for (const symbol of YAHOO_KEYS) {
     const { rows: [state] } = await dbPool.query<{ last_daily: number | null; first_agg: number | null; first_agg_day: string | null; agg_days: string[] | null; daily_days: string[] | null }>(
       // 마지막 일봉은 출처와 상관없이 본다 (Yahoo가 주지 않는 지표는 KRX 일봉이 있다, T-104 보완)
@@ -204,19 +209,34 @@ export async function runDailyHistoryBackfill(producer: Producer) {
     const gapDue = gaps.length > 0 && now - (lastGapFetchAt.get(symbol) ?? 0) >= GAP_REFETCH_MS;
     if (!seam && !gapDue) continue;
     if (gapDue) lastGapFetchAt.set(symbol, now);
+    calls += 1;
     try {
       const allRows = toDailyRows(await fetchBars(symbol, '1d', 366), now);
       // 이음매 채우기는 1년치 전부(이미 있는 날짜는 건너뜀), 빠진 날 메우기는 그 날짜만 넣는다(집계가 있는 날의 중복 행을 만들지 않음)
       const gapSet = new Set(gaps);
       const rows = seam ? allRows : allRows.filter(row => gapSet.has(new Date(row.time).toISOString().slice(0, 10)));
       await sendDailyRows(producer, symbol, rows, false);
+      sent += rows.length;
       console.log(seam
         ? `Daily history backfill ${symbol}: ${rows.length} days sent`
         : `Daily gap fill ${symbol}: missing ${gaps.join(',')} → ${rows.length} sent (others not provided by the source, e.g. holidays)`);
     } catch (error) {
+      failed += 1;
       console.error(`Daily history backfill ${symbol} failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
+  await reportChartRun(producer, 'daily_history', startedAt, calls, failed, sent);
+}
+
+// 적재 실행 기록 (T-118): Yahoo 차트를 실제로 받은 때만 남긴다. received는 호출 수가 아니라 보낸 행 기준으로 보고, 실패는 지표 호출 수로 센다
+async function reportChartRun(producer: Producer, endpoint: string, startedAt: number, calls: number, failed: number, sent: number) {
+  if (calls === 0) return;
+  await reportRun(producer, {
+    source: 'yahoo_chart', endpoint, startedAt, received: sent, sent,
+    dropped: { fetch_failed: failed },
+    status: failed === 0 ? (sent > 0 ? 'ok' : 'empty') : failed === calls ? 'error' : 'partial',
+    errorKind: failed > 0 ? 'fetch_failed' : null,
+  });
 }
 
 // 공식 종가 보정 (docs/Task_ORDER.md T-136, D-81)
@@ -229,6 +249,7 @@ const lastCloseFixAt = new Map<YahooSymbolKey, number>();
 export async function runOfficialCloseRefresh(producer: Producer) {
   const startedAt = Date.now();
   let calls = 0;
+  let failed = 0;
   let sent = 0;
   for (const symbol of YAHOO_KEYS) {
     if (!usesOfficialDailyClose(symbol)) continue;
@@ -244,10 +265,12 @@ export async function runOfficialCloseRefresh(producer: Producer) {
       lastCloseFixAt.set(symbol, now);
       officialCloseLastSuccess.set({ symbol }, Math.floor(now / 1000));
     } catch (error) {
+      failed += 1;
       console.error(`Official close refresh ${symbol} failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
   if (calls > 0) console.log(`Official close refresh: ${calls} symbols fetched, ${sent} daily rows sent (last ${CLOSE_FIX_DAYS} days) in ${Date.now() - startedAt}ms`);
+  await reportChartRun(producer, 'official_close', startedAt, calls, failed, sent);
 }
 
 // 1일·1주 그래프 공백 채우기 (docs/Task_ORDER.md T-151, BENCHMARK B-58)
@@ -310,4 +333,5 @@ export async function runIntradayFill(producer: Producer) {
   }
   if (calls > 0) console.log(`Intraday fill: ${calls} charts fetched, ${failed} failed, ${sent} bars sent in ${Date.now() - startedAt}ms`);
   else console.log(`Intraday fill: nothing to fetch (checked in ${Date.now() - startedAt}ms)`);
+  await reportChartRun(producer, 'intraday_fill', startedAt, calls, failed, sent);
 }

@@ -3,6 +3,7 @@
 // 같은 db-sink의 컨슈머가 검증 후 market_bars_fill에 저장한다. Gateway는 이 토픽을 읽지 않는다(지난 값이라 화면에 보내지 않음).
 
 import { isYahooSymbolKey, type YahooSymbolKey } from './symbols.js';
+import { isPlausibleEventTime } from './event-time.js';
 
 export const BAR_RESOLUTIONS = ['5m', '1h'] as const;
 export type BarResolution = (typeof BAR_RESOLUTIONS)[number];
@@ -35,7 +36,7 @@ export function parseYahooBar(value: Buffer | null): YahooBarParseResult {
   const { symbol, resolution, time, close, producedAt } = data as Record<string, unknown>;
   if (typeof symbol !== 'string' || !isYahooSymbolKey(symbol)) return fail('symbol');
   if (!isResolution(resolution)) return fail('resolution');
-  if (!isFiniteNumber(time) || time <= 0 || time % BAR_RESOLUTION_MS[resolution] !== 0) return fail('time');
+  if (!isPlausibleEventTime(time) || time % BAR_RESOLUTION_MS[resolution] !== 0) return fail('time');
   if (!isFiniteNumber(close) || close <= 0) return fail('close');
   if (producedAt !== undefined && (!isFiniteNumber(producedAt) || producedAt <= 0)) return fail('produced_at');
   const row: YahooBarMessage = { symbol, resolution, time, close };

@@ -44,7 +44,7 @@ test('Yahoo와 KRX 일별 심볼 이름이 겹치지 않는다', () => {
 
 test('구독 가능한 심볼은 모두 Kafka 메시지 검증의 심볼 형식을 통과한다', () => {
   for (const symbol of [...YAHOO_KEYS, ...KRX_DAILY_KEYS]) {
-    const tick = { symbol, category: 'domestic', price: 1, changeRate: 0, timestamp: 1 };
+    const tick = { symbol, category: 'domestic', price: 1, changeRate: 0, timestamp: 1_790_000_000_000 };
     assert.equal(parseTick(Buffer.from(JSON.stringify(tick))).ok, true, symbol);
   }
 });

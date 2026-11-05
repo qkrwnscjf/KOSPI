@@ -14,7 +14,11 @@ import { parseYahooBar, type YahooBarMessage } from '../../shared/yahoo-bars.js'
 import { YAHOO_DAILY_SOURCE } from '../../shared/symbols.js';
 import { setWallClockTimeout } from '../wall-clock-timer.js';
 import { safeLogText } from '../http-json.js';
-import type { EachBatchPayload } from 'kafkajs';
+import type { EachBatchPayload, KafkaMessage } from 'kafkajs';
+import { parseIngestionRun, safeKind, type IngestionRun } from '../../shared/ingestion-runs.js';
+import { runIsolated } from './batch-isolation.js';
+import { runChecks, storeResults, type DqStatus } from './data-quality.js';
+import { runDqInjection } from './data-quality-inject.js';
 import { runBackfillOnce, runDailyHistoryBackfill, runIntradayFill, runOfficialCloseRefresh } from './backfill.js';
 import { clampWindow, mergeWindows, planLateRefresh, POLICY_START_OFFSET_MS, SAFE_RAW_WINDOW_MS, type RefreshWindow } from './late-refresh.js';
 import { runDlqReplay } from './dlq-replay.js';
@@ -50,7 +54,7 @@ const DB_SIZE_INTERVAL_MS = 5 * 60 * 1000;
 const DAILY_HISTORY_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const CLOSE_REFRESH_CHECK_MS = 30 * 60 * 1000;
 // 11단계·12단계·T-67에서 추가한 테이블 (용량·청크·행 수 기록). 이름은 고정 목록이고 매개변수로만 SQL에 넘긴다.
-const EXTRA_TABLES = ['investor_flows', 'index_daily', 'disclosures', 'market_breadth', 'stock_rankings', 'market_flows', 'market_bars_fill'];
+const EXTRA_TABLES = ['investor_flows', 'index_daily_krx', 'index_daily_yahoo', 'disclosures', 'market_breadth', 'stock_rankings', 'market_flows', 'market_bars_fill', 'ingestion_runs', 'dq_results'];
 const dbRows = new Gauge('kospi_db_rows', 'Row count of the smaller hypertables added in stages 11-12 (investor_flows, index_daily, disclosures)');
 
 // 여러 행을 INSERT 한 번으로 저장한다 (P-16). 단일 문장이라 전부 들어가거나 전부 실패한다.
@@ -182,12 +186,13 @@ async function upsertIndexDaily(ticks: TickData[]) {
   const rows = ticks.map((tick, index) => {
     const base = index * 5;
     values.push(tick.timestamp, tick.symbol, tick.price, tick.changeRate, tick.changePrice ?? null);
-    return `(to_timestamp($${base + 1} / 1000.0), $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, 'krx')`;
+    return `(to_timestamp($${base + 1} / 1000.0), $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5})`;
   });
+  // API별 표 (T-122, D-87): KRX 값은 index_daily_krx에만 쓴다. 읽는 쪽은 뷰 index_daily를 쓴다
   const result = await dbPool.query(
-    `INSERT INTO index_daily (time, symbol, close, change_rate, change_price, source) VALUES ${rows.join(', ')}
+    `INSERT INTO index_daily_krx (time, symbol, close, change_rate, change_price) VALUES ${rows.join(', ')}
      ON CONFLICT (symbol, time) DO UPDATE SET
-       close = EXCLUDED.close, change_rate = EXCLUDED.change_rate, change_price = EXCLUDED.change_price`,
+       close = EXCLUDED.close, change_rate = EXCLUDED.change_rate, change_price = EXCLUDED.change_price, ingested_at = now()`,
     values
   );
   return result.rowCount ?? 0;
@@ -404,16 +409,16 @@ async function writeYahooDaily(rows: YahooDailyMessage[], overwrite: boolean) {
   if (rows.length === 0) return 0;
   const values: unknown[] = [];
   const placeholders = rows.map((row, index) => {
-    const base = index * 6;
-    values.push(row.time, row.symbol, row.close, row.changeRate, row.changePrice, YAHOO_DAILY_SOURCE);
-    return `(to_timestamp($${base + 1} / 1000.0), $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6})`;
+    const base = index * 5;
+    values.push(row.time, row.symbol, row.close, row.changeRate, row.changePrice);
+    return `(to_timestamp($${base + 1} / 1000.0), $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5})`;
   });
+  // API별 표 (T-122, D-87): Yahoo 값은 index_daily_yahoo에만 쓴다. KRX 값과 섞이지 않고, 같은 날짜가 양쪽에 있으면 뷰가 KRX 값을 고른다
   const conflict = overwrite
-    ? `DO UPDATE SET close = EXCLUDED.close, change_rate = EXCLUDED.change_rate, change_price = EXCLUDED.change_price
-       WHERE index_daily.source = EXCLUDED.source`
+    ? `DO UPDATE SET close = EXCLUDED.close, change_rate = EXCLUDED.change_rate, change_price = EXCLUDED.change_price, ingested_at = now()`
     : 'DO NOTHING';
   const result = await dbPool.query(
-    `INSERT INTO index_daily (time, symbol, close, change_rate, change_price, source) VALUES ${placeholders.join(', ')}
+    `INSERT INTO index_daily_yahoo (time, symbol, close, change_rate, change_price) VALUES ${placeholders.join(', ')}
      ON CONFLICT (symbol, time) ${conflict}`,
     values
   );
@@ -495,6 +500,150 @@ async function handleYahooBarsBatch({ batch, resolveOffset, heartbeat }: EachBat
   await heartbeat();
 }
 
+// 적재 실행 기록 저장 (T-118). 같은 실행 ID를 다시 받으면 건너뛴다(at-least-once).
+const ingestionRunsWritten = new Counter('kospi_sink_ingestion_runs_written_total', 'Ingestion run rows written, by source');
+
+async function writeIngestionRuns(runs: IngestionRun[]) {
+  const values: unknown[] = [];
+  const placeholders = runs.map((run, index) => {
+    const base = index * 15;
+    const droppedTotal = Object.values(run.dropped).reduce((sum, count) => sum + count, 0);
+    values.push(run.startedAt, run.finishedAt, run.runId, run.source, run.endpoint, run.targetFrom, run.targetTo, run.received, run.sent, droppedTotal, JSON.stringify(run.dropped), run.status, run.errorKind, run.sourceTotal, run.covered);
+    return `(to_timestamp($${base + 1} / 1000.0), to_timestamp($${base + 2} / 1000.0), $${base + 3}::uuid, $${base + 4}, $${base + 5}, $${base + 6}::date, $${base + 7}::date, $${base + 8}, $${base + 9}, $${base + 10}, $${base + 11}::jsonb, $${base + 12}, $${base + 13}, $${base + 14}, $${base + 15})`;
+  });
+  const result = await dbPool.query(
+    `INSERT INTO ingestion_runs (started_at, finished_at, run_id, source, endpoint, target_from, target_to, received, sent, dropped_total, dropped, status, error_kind, source_total, covered)
+     VALUES ${placeholders.join(', ')} ON CONFLICT (run_id, started_at) DO NOTHING`,
+    values
+  );
+  return result.rowCount ?? 0;
+}
+
+async function handleIngestionRunsBatch({ batch, resolveOffset, heartbeat }: EachBatchPayload) {
+  const valid: IngestionRun[] = [];
+  for (const message of batch.messages) {
+    const parsed = parseIngestionRun(message.value);
+    if (!parsed.ok) {
+      invalidTotal.inc({ reason: `ingestion_run_${parsed.reason}` });
+      console.warn(`DB sink skipped invalid ingestion run at ${batch.topic}[${batch.partition}]@${message.offset}: ${parsed.reason}`);
+      await sendToDlq(dlqProducer, { consumer: CONSUMER_NAME, topic: batch.topic, partition: batch.partition, message, reason: parsed.reason });
+      continue;
+    }
+    valid.push(parsed.run);
+  }
+  for (let index = 0; index < valid.length; index += 500) {
+    const chunk = valid.slice(index, index + 500);
+    await writeIngestionRuns(chunk);
+    for (const run of chunk) ingestionRunsWritten.inc({ source: run.source });
+    await heartbeat();
+  }
+  const lastMessage = batch.messages[batch.messages.length - 1];
+  if (lastMessage) resolveOffset(lastMessage.offset);
+  await heartbeat();
+}
+
+// 시세 묶음 처리 (T-12, T-15). 잘못된 메시지는 DLQ, 저장에 성공한 뒤에만 오프셋 확정
+async function handleTicksBatch({ batch, resolveOffset, heartbeat }: EachBatchPayload) {
+  const valid: TickData[] = [];
+
+  for (const message of batch.messages) {
+    const parsed = parseTick(message.value);
+    // change_price 컬럼은 NOT NULL이라, 없으면 묶음 전체가 계속 실패한다. 그래서 DLQ로 보낸다.
+    const reason = !parsed.ok ? parsed.reason : parsed.tick.changePrice === undefined ? 'change_price_missing' : undefined;
+    if (reason || !parsed.ok) {
+      invalidTotal.inc({ reason: reason ?? 'unknown' });
+      console.warn(`DB sink skipped invalid message at ${batch.topic}[${batch.partition}]@${message.offset}: ${reason}`);
+      await sendToDlq(dlqProducer, { consumer: CONSUMER_NAME, topic: batch.topic, partition: batch.partition, message, reason: reason ?? 'unknown' });
+      continue;
+    }
+    valid.push(parsed.tick);
+  }
+
+  if (valid.length > 0) {
+    const startedAt = Date.now();
+    let inserted: number;
+    try {
+      const result = await insertBatch(valid);
+      inserted = result.inserted;
+      scheduleLateRefresh(result.times);
+    } catch (error) {
+      insertDuration.observe({ result: 'error' }, Date.now() - startedAt);
+      // 예외를 던져서 오프셋을 커밋하지 않는다. 값 오류면 runIsolated가 한 건씩 나눠 저장하고, 그 밖의 오류는 kafkajs가 같은 묶음을 다시 시도한다.
+      console.error(`DB sink insert failed (${valid.length} rows): ${error instanceof Error ? error.message : String(error)}`);
+      throw error;
+    }
+    const committedAt = Date.now();
+    insertDuration.observe({ result: 'commit' }, committedAt - startedAt);
+    batchesTotal.inc();
+    rowsInsertedTotal.inc({}, inserted);
+    if (inserted < valid.length) {
+      duplicatesSkippedTotal.inc({}, valid.length - inserted);
+    }
+    for (const tick of valid) {
+      if (tick.collectedAt !== undefined) {
+        storeLatency.observe({}, committedAt - tick.collectedAt);
+      }
+    }
+  }
+
+  const lastMessage = batch.messages[batch.messages.length - 1];
+  if (lastMessage) {
+    resolveOffset(lastMessage.offset);
+  }
+  await heartbeat();
+}
+
+// 토픽별 묶음 처리 함수
+const BATCH_HANDLERS: Record<string, (payload: EachBatchPayload) => Promise<void>> = {
+  [TOPICS.ticks]: handleTicksBatch,
+  [TOPICS.flows]: handleFlowsBatch,
+  [TOPICS.indexDaily]: handleDailyBatch,
+  [TOPICS.disclosures]: handleDailyBatch,
+  [TOPICS.breadth]: handleBreadthBatch,
+  [TOPICS.rankings]: handleRankingsBatch,
+  [TOPICS.marketFlows]: handleMarketFlowsBatch,
+  [TOPICS.yahooDaily]: handleYahooDailyBatch,
+  [TOPICS.yahooBars]: handleYahooBarsBatch,
+  [TOPICS.ingestionRuns]: handleIngestionRunsBatch,
+};
+
+// DB가 거부한 메시지 (T-154): 묶음을 멈추지 않고 그 메시지만 DLQ로 보낸다
+const dbRejectedTotal = new Counter('kospi_sink_db_rejected_total', 'Messages rejected by the DB after passing validation and sent to the DLQ, by topic and SQLSTATE');
+
+async function sendRejectedToDlq(payload: EachBatchPayload, message: KafkaMessage, code: string) {
+  const { batch } = payload;
+  const reason = `db_rejected_${safeKind(code.toLowerCase())}`;
+  dbRejectedTotal.inc({ topic: batch.topic, code: safeKind(code.toLowerCase()) });
+  invalidTotal.inc({ reason });
+  console.warn(`DB sink rejected by the database at ${batch.topic}[${batch.partition}]@${message.offset}: ${reason}`);
+  await sendToDlq(dlqProducer, { consumer: CONSUMER_NAME, topic: batch.topic, partition: batch.partition, message, reason });
+}
+
+// 품질 검사 (T-119): 15분마다 읽기 전용으로 확인해 dq_results와 지표에 남긴다. 실패해도 적재에는 영향이 없다
+const DQ_INTERVAL_MS = Number.parseInt(process.env.DQ_INTERVAL_MS ?? '', 10) || 15 * 60_000;
+const DQ_FIRST_DELAY_MS = Number.parseInt(process.env.DQ_FIRST_DELAY_MS ?? '', 10) || 10 * 60_000;
+const DQ_STATUS_CODE: Record<DqStatus, number> = { ok: 0, warn: 1, fail: 2, error: 3 };
+const dqStatus = new Gauge('kospi_dq_status', 'Latest data quality check status by dataset and check (0 ok, 1 warn, 2 fail, 3 error)');
+const dqObserved = new Gauge('kospi_dq_observed', 'Latest data quality check observed value by dataset and check');
+
+async function runDataQuality() {
+  const startedAt = Date.now();
+  try {
+    const results = await runChecks((sql, params) => dbPool.query(sql, params as unknown[]));
+    await storeResults((sql, params) => dbPool.query(sql, params as unknown[]), results);
+    for (const result of results) {
+      const labels = { dataset: result.dataset, check: result.check };
+      dqStatus.set(labels, DQ_STATUS_CODE[result.status]);
+      dqObserved.set(labels, result.observed);
+    }
+    const count = (status: DqStatus) => results.filter(result => result.status === status).length;
+    const items = results.filter(result => result.status !== 'ok').map(result => ({ dataset: result.dataset, check: result.check, status: result.status, observed: result.observed, detail: result.detail }));
+    console.log(`[dq] ${JSON.stringify({ checks: results.length, ok: count('ok'), warn: count('warn'), fail: count('fail'), error: count('error'), ms: Date.now() - startedAt, items })}`);
+  } catch (error) {
+    console.error(`[dq] failed: ${error instanceof Error ? error.message : 'unexpected_error'}`);
+  }
+}
+
 // 데이터 신선도 (15단계 T-112): 데이터셋마다 가장 최근 값이 얼마나 오래됐는지(초). 앱 설정 화면의 파이프라인 상태와 Grafana에 쓴다.
 // 테이블 이름은 고정 목록이다. 비어 있는 데이터셋은 기록하지 않는다(값이 생긴 뒤부터 나타남).
 const dataLatestAge = new Gauge('kospi_db_latest_data_age_seconds', 'Seconds since the newest row of each dataset (market_ticks, index_daily, market_breadth, disclosures, stock_rankings, market_flows)');
@@ -550,12 +699,16 @@ async function recordDbSize() {
     // 새 테이블은 행이 적어서(수만 행 이하) 정확한 행 수를 센다. 행당 용량을 계산해 1년 용량 추정에 쓴다.
     const counts = await dbPool.query<{ relation: string; rows: string }>(`
       SELECT 'investor_flows' AS relation, count(*)::text AS rows FROM investor_flows
-      UNION ALL SELECT 'index_daily', count(*)::text FROM index_daily
+      UNION ALL SELECT 'index_daily_krx', count(*)::text FROM index_daily_krx
+      UNION ALL SELECT 'index_daily_yahoo', count(*)::text FROM index_daily_yahoo
+      UNION ALL SELECT 'index_daily_legacy', count(*)::text FROM index_daily_legacy
       UNION ALL SELECT 'disclosures', count(*)::text FROM disclosures
       UNION ALL SELECT 'market_breadth', count(*)::text FROM market_breadth
       UNION ALL SELECT 'stock_rankings', count(*)::text FROM stock_rankings
       UNION ALL SELECT 'market_flows', count(*)::text FROM market_flows
       UNION ALL SELECT 'market_bars_fill', count(*)::text FROM market_bars_fill
+      UNION ALL SELECT 'ingestion_runs', count(*)::text FROM ingestion_runs
+      UNION ALL SELECT 'dq_results', count(*)::text FROM dq_results
     `);
     for (const row of counts.rows) {
       dbRows.set({ relation: row.relation }, Number(row.rows));
@@ -639,7 +792,7 @@ async function run() {
   await ensureTopics();
   await consumer.connect();
   // 그룹이 처음 시작할 때만 토픽의 처음부터 읽는다. 이후에는 커밋된 오프셋부터 이어서 읽는다.
-  await consumer.subscribe({ topics: [TOPICS.ticks, TOPICS.flows, TOPICS.indexDaily, TOPICS.disclosures, TOPICS.breadth, TOPICS.rankings, TOPICS.marketFlows, TOPICS.yahooDaily, TOPICS.yahooBars], fromBeginning: true });
+  await consumer.subscribe({ topics: Object.keys(BATCH_HANDLERS), fromBeginning: true });
 
   // kafkajs가 스스로 재시작하지 않는 중단이면 종료해서 docker-compose의 restart: on-failure가 다시 띄우게 한다.
   consumer.on(consumer.events.CRASH, event => {
@@ -653,83 +806,10 @@ async function run() {
   await consumer.run({
     eachBatchAutoResolve: false,
     eachBatch: async payload => {
-      // 토픽별로 나눠 처리한다 (11단계: investor-flows 추가)
-      if (payload.batch.topic === TOPICS.flows) {
-        await handleFlowsBatch(payload);
-        return;
-      }
-      if (payload.batch.topic === TOPICS.indexDaily || payload.batch.topic === TOPICS.disclosures) {
-        await handleDailyBatch(payload);
-        return;
-      }
-      if (payload.batch.topic === TOPICS.breadth) {
-        await handleBreadthBatch(payload);
-        return;
-      }
-      if (payload.batch.topic === TOPICS.rankings) {
-        await handleRankingsBatch(payload);
-        return;
-      }
-      if (payload.batch.topic === TOPICS.marketFlows) {
-        await handleMarketFlowsBatch(payload);
-        return;
-      }
-      if (payload.batch.topic === TOPICS.yahooDaily) {
-        await handleYahooDailyBatch(payload);
-        return;
-      }
-      if (payload.batch.topic === TOPICS.yahooBars) {
-        await handleYahooBarsBatch(payload);
-        return;
-      }
-      const { batch, resolveOffset, heartbeat } = payload;
-      const valid: TickData[] = [];
-
-      for (const message of batch.messages) {
-        const parsed = parseTick(message.value);
-        // change_price 컬럼은 NOT NULL이라, 없으면 묶음 전체가 계속 실패한다. 그래서 DLQ로 보낸다.
-        const reason = !parsed.ok ? parsed.reason : parsed.tick.changePrice === undefined ? 'change_price_missing' : undefined;
-        if (reason || !parsed.ok) {
-          invalidTotal.inc({ reason: reason ?? 'unknown' });
-          console.warn(`DB sink skipped invalid message at ${batch.topic}[${batch.partition}]@${message.offset}: ${reason}`);
-          await sendToDlq(dlqProducer, { consumer: CONSUMER_NAME, topic: batch.topic, partition: batch.partition, message, reason: reason ?? 'unknown' });
-          continue;
-        }
-        valid.push(parsed.tick);
-      }
-
-      if (valid.length > 0) {
-        const startedAt = Date.now();
-        let inserted: number;
-        try {
-          const result = await insertBatch(valid);
-          inserted = result.inserted;
-          scheduleLateRefresh(result.times);
-        } catch (error) {
-          insertDuration.observe({ result: 'error' }, Date.now() - startedAt);
-          // 예외를 던져서 오프셋을 커밋하지 않는다. kafkajs가 같은 묶음을 다시 시도한다 (데이터가 유효하므로 poison이 아님).
-          console.error(`DB sink insert failed (${valid.length} rows): ${error instanceof Error ? error.message : String(error)}`);
-          throw error;
-        }
-        const committedAt = Date.now();
-        insertDuration.observe({ result: 'commit' }, committedAt - startedAt);
-        batchesTotal.inc();
-        rowsInsertedTotal.inc({}, inserted);
-        if (inserted < valid.length) {
-          duplicatesSkippedTotal.inc({}, valid.length - inserted);
-        }
-        for (const tick of valid) {
-          if (tick.collectedAt !== undefined) {
-            storeLatency.observe({}, committedAt - tick.collectedAt);
-          }
-        }
-      }
-
-      const lastMessage = batch.messages[batch.messages.length - 1];
-      if (lastMessage) {
-        resolveOffset(lastMessage.offset);
-      }
-      await heartbeat();
+      // 토픽별로 나눠 처리한다. 값 오류는 그 메시지만 DLQ로 보내고, 그 밖의 오류는 다시 시도한다 (T-154)
+      const handler = BATCH_HANDLERS[payload.batch.topic];
+      if (!handler) return;
+      await runIsolated(payload, handler, (message, code) => sendRejectedToDlq(payload, message, code));
     },
   });
 
@@ -751,6 +831,18 @@ async function run() {
     .finally(() => void recordDbSize());
 
   setInterval(() => void recordDbSize(), DB_SIZE_INTERVAL_MS);
+
+  // 품질 검사 (T-119): 기동 직후는 지표가 아직 모이지 않아 잠시 뒤에 시작한다. 잠자기 뒤에도 실제 시각에 맞춰 실행한다 (T-140)
+  const scheduleDataQuality = (delayMs: number) => setWallClockTimeout(() => {
+    void runDataQuality().finally(() => scheduleDataQuality(DQ_INTERVAL_MS));
+  }, delayMs);
+  scheduleDataQuality(DQ_FIRST_DELAY_MS);
+  if (process.env.DQ_TEST_INJECT === 'true') {
+    console.warn('DQ_TEST_INJECT=true: running quality checks against rolled-back test data (verification only).');
+    setWallClockTimeout(() => {
+      runDqInjection(dbPool).catch(error => console.error(`[dq-inject] failed: ${error instanceof Error ? error.message : 'unexpected_error'}`));
+    }, DQ_FIRST_DELAY_MS + 30_000);
+  }
 
   // DLQ 다시 처리 (T-129): 검증용 스위치로 켰을 때만 한 번 실행한다. 실패해도 적재는 계속한다
   if (process.env.DLQ_REPLAY === 'true') {

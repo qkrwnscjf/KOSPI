@@ -3,6 +3,8 @@
 // 응답 필드 이름은 첫 응답으로 확인한다(D-53 방식). 그래서 숫자 필드를 모두 지표로 받고, 이름은 형식만 검사한다.
 // 값이 없거나 숫자가 아니면 0으로 채우지 않고 뺀다(D-14와 같은 원칙).
 
+import { isPlausibleEventTime } from './event-time.js';
+
 export const MARKET_FLOW_DATASETS = ['capital', 'credit'] as const;
 export type MarketFlowDataset = (typeof MARKET_FLOW_DATASETS)[number];
 
@@ -56,7 +58,7 @@ export function parseMarketFlow(input: Buffer | null | undefined): MarketFlowPar
   }
   if (!data || typeof data !== 'object') return { ok: false, reason: 'not_object' };
   const { time, dataset, values, collectedAt, producedAt } = data as Record<string, unknown>;
-  if (typeof time !== 'number' || !Number.isFinite(time) || time <= 0) return { ok: false, reason: 'time' };
+  if (!isPlausibleEventTime(time)) return { ok: false, reason: 'time' };
   if (!isDataset(dataset)) return { ok: false, reason: 'dataset' };
   if (!values || typeof values !== 'object' || Array.isArray(values)) return { ok: false, reason: 'values' };
   const entries = Object.entries(values as Record<string, unknown>);

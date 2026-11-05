@@ -343,6 +343,96 @@ const MIGRATIONS: Migration[] = [
       )`,
     ],
   },
+  {
+    version: 12,
+    name: 'T-122 split index_daily by API (index_daily_krx, index_daily_yahoo), keep the old table, read through a view',
+    statements: [
+      // D-87: 품질관리를 위해 일별 값을 API별 표로 나눈다. 같은 날의 KRX·Yahoo 값을 함께 둘 수 있어 DB에서 대조할 수 있다.
+      // 옛 표는 지우지 않고 index_daily_legacy로 남긴다(삭제는 검증 뒤 사용자 승인으로). 읽는 쪽은 같은 이름의 뷰를 그대로 쓴다.
+      // ingested_at: DB에 들어온 시각. 옮겨 온 행은 실제 시각을 알 수 없어 NULL이다.
+      ...['index_daily_krx', 'index_daily_yahoo'].flatMap(table => [
+        `CREATE TABLE IF NOT EXISTS ${table} (
+          time TIMESTAMPTZ NOT NULL,
+          symbol TEXT NOT NULL,
+          close DOUBLE PRECISION NOT NULL CHECK (close > 0),
+          change_rate DOUBLE PRECISION NOT NULL,
+          change_price DOUBLE PRECISION,
+          ingested_at TIMESTAMPTZ DEFAULT now()
+        )`,
+        `SELECT create_hypertable('${table}', 'time', chunk_time_interval => INTERVAL '90 days', if_not_exists => TRUE)`,
+        `CREATE UNIQUE INDEX IF NOT EXISTS ${table}_symbol_time_key ON ${table} (symbol, time)`,
+        `SELECT add_retention_policy('${table}', drop_after => INTERVAL '1 year', if_not_exists => true)`,
+      ]),
+      // 복사·이름 변경·뷰 생성을 한 문장(한 트랜잭션)으로 한다. 중간에 실패하면 모두 취소되고 다음 기동에서 다시 시도한다.
+      `DO $$
+      BEGIN
+        IF to_regclass('public.index_daily_legacy') IS NULL THEN
+          INSERT INTO index_daily_krx (time, symbol, close, change_rate, change_price, ingested_at)
+            SELECT time, symbol, close, change_rate, change_price, NULL FROM index_daily WHERE source = 'krx'
+            ON CONFLICT (symbol, time) DO NOTHING;
+          INSERT INTO index_daily_yahoo (time, symbol, close, change_rate, change_price, ingested_at)
+            SELECT time, symbol, close, change_rate, change_price, NULL FROM index_daily WHERE source = 'yahoo'
+            ON CONFLICT (symbol, time) DO NOTHING;
+          ALTER TABLE index_daily RENAME TO index_daily_legacy;
+          -- 같은 날짜가 양쪽에 있으면 거래소 값(KRX)을 쓴다. 지금까지의 규칙("KRX 행은 Yahoo 값으로 바꾸지 않음")과 같다
+          CREATE VIEW index_daily AS
+            SELECT time, symbol, close, change_rate, change_price, 'krx'::text AS source, ingested_at FROM index_daily_krx
+            UNION ALL
+            SELECT y.time, y.symbol, y.close, y.change_rate, y.change_price, 'yahoo'::text AS source, y.ingested_at
+            FROM index_daily_yahoo y
+            WHERE NOT EXISTS (SELECT 1 FROM index_daily_krx k WHERE k.symbol = y.symbol AND k.time = y.time);
+        END IF;
+      END
+      $$`,
+    ],
+  },
+  {
+    version: 13,
+    name: 'T-118 ingestion_runs (one row per collection run)',
+    statements: [
+      // 수집 실행 기록. URL·키·오류 원문은 넣지 않는다(형식 검사는 shared/ingestion-runs.ts). 하루 약 2,500행(추정)이라 30일 보관.
+      `CREATE TABLE IF NOT EXISTS ingestion_runs (
+        started_at TIMESTAMPTZ NOT NULL,
+        finished_at TIMESTAMPTZ NOT NULL,
+        run_id UUID NOT NULL,
+        source TEXT NOT NULL,
+        endpoint TEXT NOT NULL,
+        target_from DATE,
+        target_to DATE,
+        received INTEGER NOT NULL,
+        sent INTEGER NOT NULL,
+        dropped_total INTEGER NOT NULL,
+        dropped JSONB NOT NULL,
+        status TEXT NOT NULL,
+        error_kind TEXT,
+        source_total INTEGER,
+        covered INTEGER
+      )`,
+      `SELECT create_hypertable('ingestion_runs', 'started_at', chunk_time_interval => INTERVAL '7 days', if_not_exists => TRUE)`,
+      `CREATE UNIQUE INDEX IF NOT EXISTS ingestion_runs_key ON ingestion_runs (run_id, started_at)`,
+      `CREATE INDEX IF NOT EXISTS ingestion_runs_source_idx ON ingestion_runs (source, started_at DESC)`,
+      `SELECT add_retention_policy('ingestion_runs', drop_after => INTERVAL '30 days', if_not_exists => true)`,
+    ],
+  },
+  {
+    version: 14,
+    name: 'T-119 dq_results (scheduled data quality check results)',
+    statements: [
+      // 품질 검사 결과. 검사 1개당 1행(15분마다 약 30행, 하루 약 2,900행 추정)이라 30일 보관.
+      `CREATE TABLE IF NOT EXISTS dq_results (
+        checked_at TIMESTAMPTZ NOT NULL,
+        dataset TEXT NOT NULL,
+        check_name TEXT NOT NULL,
+        status TEXT NOT NULL,
+        observed DOUBLE PRECISION NOT NULL,
+        expected DOUBLE PRECISION,
+        detail JSONB NOT NULL
+      )`,
+      `SELECT create_hypertable('dq_results', 'checked_at', chunk_time_interval => INTERVAL '7 days', if_not_exists => TRUE)`,
+      `CREATE INDEX IF NOT EXISTS dq_results_check_idx ON dq_results (dataset, check_name, checked_at DESC)`,
+      `SELECT add_retention_policy('dq_results', drop_after => INTERVAL '30 days', if_not_exists => true)`,
+    ],
+  },
 ];
 
 // 집계의 실제 저장 테이블(materialization hypertable)을 찾아 청크 간격을 바꾼다 (T-31).

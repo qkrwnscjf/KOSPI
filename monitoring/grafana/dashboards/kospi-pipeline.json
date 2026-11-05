@@ -437,6 +437,49 @@
       "targets": [
         { "refId": "A", "legendFormat": "전송 {{market}}", "expr": "sum by (market) (increase(kospi_krx_rankings_sent_total[1d]))" }
       ]
+    },
+    {
+      "id": 35,
+      "type": "stat",
+      "title": "데이터 품질 검사 (경고 · 실패 수, T-119)",
+      "description": "15분마다 API별 규칙을 확인합니다. 경고는 공휴일 등 정상일 수 있고, 실패는 데이터가 틀렸거나 수집 전체가 멈춘 경우입니다. 이력은 dq_results 표에 30일 남습니다.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 108, "w": 6, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0 }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "legendFormat": "경고", "expr": "count(kospi_dq_status == 1) or vector(0)" },
+        { "refId": "B", "legendFormat": "실패", "expr": "count(kospi_dq_status >= 2) or vector(0)" }
+      ]
+    },
+    {
+      "id": 36,
+      "type": "bargauge",
+      "title": "데이터 품질 검사 결과 (0 정상, 1 경고, 2 실패, 3 검사 오류)",
+      "description": "API·검사 항목별 최근 결과입니다. 어느 지표·날짜인지는 db-sink 로그의 [dq] 줄과 dq_results 표의 detail에 있습니다.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 6, "y": 108, "w": 18, "h": 16 },
+      "options": { "orientation": "horizontal", "displayMode": "basic", "showUnfilled": true },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none", "decimals": 0, "min": 0, "max": 3,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 1 }, { "color": "red", "value": 2 }] }
+        },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "legendFormat": "{{dataset}} / {{check}}", "expr": "kospi_dq_status" }
+      ]
+    },
+    {
+      "id": 37,
+      "type": "timeseries",
+      "title": "적재 실행 기록 (시간당, 수집 경로별, T-118)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 116, "w": 6, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0 }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "legendFormat": "{{source}}", "expr": "sum by (source) (increase(kospi_sink_ingestion_runs_written_total[1h]))" }
+      ]
     }
   ]
 }

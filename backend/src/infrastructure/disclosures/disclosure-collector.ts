@@ -1,7 +1,8 @@
 import { producer, TOPICS, ensureTopics } from '../kafka.js';
 import { Counter, Gauge, Latency, metricsConfig, startMetricsLog, startMetricsServer } from '../metrics.js';
 import { registerShutdown } from '../shutdown.js';
-import { DISCLOSURE_SCOPE, isTargetStock, type Disclosure } from '../../shared/disclosures.js';
+import { isoDate, reportRun } from '../ingestion-report.js';
+import { DISCLOSURE_SCOPE, isTargetStock, RCEPT_NO_PATTERN, type Disclosure } from '../../shared/disclosures.js';
 import { DART_KEY_ERRORS, DART_STATUS, DartApiError, DartClient, readDartConfig } from './dart-client.js';
 import { backfillRanges, DETAIL_ENDPOINTS, mapListItem, sumAmountFields, toDartDate, type DisclosureBase } from './dart-disclosures.js';
 import { safeLogList } from '../http-json.js';
@@ -39,6 +40,8 @@ const configured = new Gauge('kospi_disclosure_configured', 'Whether the DART AP
 const lastSuccessAt = new Gauge('kospi_disclosure_last_success_timestamp_seconds', 'Unix time of the last successful DART list fetch');
 
 const seen = new Set<string>();
+// 형식 오류로 버린 항목까지 포함해 읽은 접수번호 (소스 전체 건수와 비교, T-119)
+const readNos = new Map<string, string>();
 const loggedDetailFields = new Set<string>();
 let loggedListFields = false;
 let stopping = false;
@@ -120,11 +123,19 @@ async function fetchListPage(client: DartClient, bgnDe: string, endDe: string, p
     console.log(`[dart] list response fields: ${safeLogList(Object.keys(list[0] as object))}`);
   }
   const totalPage = typeof body.total_page === 'number' ? body.total_page : Number(body.total_page ?? 0) || 0;
+  // 소스가 알려 준 전체 건수 (T-119 source_coverage). 없으면 null
+  const parsedTotal = Number(body.total_count ?? NaN);
+  const totalCount = Number.isSafeInteger(parsedTotal) && parsedTotal >= 0 ? parsedTotal : null;
   const mapped = list.map(mapListItem).filter((item): item is DisclosureBase => item !== null);
+  // 형식이 맞지 않아 버린 항목도 "읽은 공시"로 센다. 버린 건수는 실행 기록의 unmapped로 따로 남는다
+  for (const item of list) {
+    const { rcept_no: rawNo, rcept_dt: rawDate } = (item && typeof item === 'object' ? item : {}) as Record<string, unknown>;
+    if (typeof rawNo === 'string' && RCEPT_NO_PATTERN.test(rawNo) && typeof rawDate === 'string') readNos.set(rawNo, rawDate);
+  }
   // 이미 본 공시인지는 대상 여부와 상관없이 접수번호로 판단한다 (대상 외 공시만 있는 쪽에서 계속 넘어가지 않게)
   const rceptNos = mapped.map(item => item.rceptNo);
   const items = mapped.filter(item => isTargetStock(item.stockCode));
-  return { items, rceptNos, totalPage, rawCount: list.length };
+  return { items, rceptNos, totalPage, totalCount, rawCount: list.length };
 }
 
 // 희석·주주환원 공시의 금액. 같은 회사·같은 API는 한 번에 조회한다 (접수일 범위로 받아 접수번호로 짝지음).
@@ -194,8 +205,12 @@ async function pollOnce(client: DartClient) {
   const endDe = toDartDate(seoulDate());
   const fresh: DisclosureBase[] = [];
   const pageNos: string[] = [];
+  let sourceTotal: number | null = null;
+  let rawTotal = 0;
   for (let pageNo = 1; pageNo <= MAX_LIVE_PAGES && !stopping; pageNo += 1) {
-    const { items, rceptNos, totalPage, rawCount } = await fetchListPage(client, bgnDe, endDe, pageNo);
+    const { items, rceptNos, totalPage, totalCount, rawCount } = await fetchListPage(client, bgnDe, endDe, pageNo);
+    if (pageNo === 1) sourceTotal = totalCount;
+    rawTotal += rawCount;
     fresh.push(...items.filter(item => !seen.has(item.rceptNo)));
     pageNos.push(...rceptNos);
     // 이 쪽에 이미 본 공시가 있거나 마지막 쪽이면 멈춘다 (최신순이라 그 뒤는 모두 본 공시)
@@ -214,6 +229,16 @@ async function pollOnce(client: DartClient) {
   // 주기 조회 범위(어제 ~ 오늘)보다 오래된 접수번호는 기억할 필요가 없다
   const oldest = toDartDate(daysAgo(2));
   for (const rceptNo of seen) if (rceptNo.slice(0, 8) < oldest) seen.delete(rceptNo);
+  for (const [rceptNo, date] of readNos) if (date < oldest) readNos.delete(rceptNo);
+
+  // 적재 실행 기록 (T-118). covered: 조회 범위(어제 ~ 오늘)에서 지금까지 읽은 접수번호 수. 소스 전체 건수와 비교한다(T-119, 추가 호출 없음)
+  // 범위 비교는 접수번호 앞자리가 아니라 소스가 준 접수일(rcept_dt)로 한다
+  const covered = [...readNos.values()].filter(date => date >= bgnDe && date <= endDe).length;
+  await reportRun(producer, {
+    source: 'dart', endpoint: 'list.json', startedAt: collectedAt, targetFrom: isoDate(bgnDe), targetTo: isoDate(endDe),
+    received: rawTotal, sent: fresh.length, dropped: { unmapped: rawTotal - pageNos.length }, status: rawTotal > 0 ? 'ok' : 'empty',
+    sourceTotal, covered,
+  });
 }
 
 // 시작 시 1회: 최근 BACKFILL_DAYS일 중 아직 저장되지 않은 기간만 (docs/security.md SEC-014).
@@ -262,6 +287,10 @@ async function backfill(client: DartClient): Promise<boolean> {
   console.log(`[dart] backfill done: ${total} disclosures in ${rangeText} (target ${targetStart}, stored ${storedText}, ${DISCLOSURE_SCOPE}) in ${Math.round((Date.now() - startedAt) / 1000)}s, requests ${requestCount}`);
   // 당일 누락 점검(B-26)의 기준: 이 시점까지 받은 오늘 공시 중 가장 늦은 접수번호. 이후 공시는 실시간 조회로 받아야 한다
   liveBaseline = [...seen].filter(rceptNo => rceptNo.startsWith(today)).sort().pop() ?? `${today}000000`;
+  await reportRun(producer, {
+    source: 'dart', endpoint: 'list.json:backfill', startedAt, targetFrom: ranges[0] ? isoDate(ranges[0][0]) : null, targetTo: isoDate(today),
+    received: total, sent: total, status: total > 0 ? 'ok' : 'empty',
+  });
   return true;
 }
 
@@ -333,6 +362,11 @@ async function loop(client: DartClient) {
     consecutiveFailures += 1;
     delay = retryDelay(error);
     console.warn(`[dart] collection failed: ${describeError(error)}. Next try in ${Math.round(delay / 1000)}s`);
+    // 적재 실행 기록 (T-118): 오류 종류와 코드만 남긴다
+    await reportRun(producer, {
+      source: 'dart', endpoint: 'list.json', startedAt: Date.now(), received: 0, sent: 0, status: 'error',
+      errorKind: error instanceof DartApiError ? (error.code ? `dart_${error.code}` : error.status ? `http_${error.status}` : error.message) : 'unexpected_error',
+    });
   }
   if (!stopping) timer = setTimeout(() => void loop(client), delay);
 }
