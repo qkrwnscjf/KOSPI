@@ -1,6 +1,7 @@
 import { Kafka } from 'kafkajs';
 import type { KafkaMessage, Producer } from 'kafkajs';
 import 'dotenv/config';
+import { Counter } from './metrics.js';
 
 export const kafka = new Kafka({
   clientId: 'kospi-dashboard',
@@ -111,6 +112,8 @@ const DLQ_FOR: Record<string, string> = {
   [TOPICS.ingestionRuns]: TOPICS.ingestionRunsDlq,
 };
 const dlqTopicFor = (topic: string) => DLQ_FOR[topic] ?? TOPICS.dlq;
+// DLQ 전송 실패 (T-157): 메시지는 원래 토픽의 보관 기간 동안만 남으므로 알아챌 수 있어야 한다
+const dlqSendFailedTotal = new Counter('kospi_dlq_send_failed_total', 'Messages that could not be sent to a DLQ, by source topic');
 
 export async function sendToDlq(
   dlqProducer: Producer,
@@ -132,6 +135,7 @@ export async function sendToDlq(
       }],
     });
   } catch (error) {
+    dlqSendFailedTotal.inc({ topic: source.topic });
     console.error(`Failed to send message to DLQ: ${error instanceof Error ? error.message : String(error)}`);
   }
 }

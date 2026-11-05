@@ -45,6 +45,23 @@ export async function fetchDailyIndexCoverage(symbols: readonly string[]): Promi
   return result;
 }
 
+// KRX에서 받는 Yahoo 지표의 저장 날짜 (T-155): KRX 표의 값만 본다. 확인하지 못하면 null
+export function parseKrxHistoryDays(body: Record<string, unknown>): Map<string, ReadonlySet<string>> | null {
+  const data = body.data;
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+  const result = new Map<string, ReadonlySet<string>>();
+  for (const [symbol, days] of Object.entries(data as Record<string, unknown>).slice(0, 20)) {
+    if (!Array.isArray(days)) return null;
+    result.set(symbol, new Set(days.filter((day): day is string => typeof day === 'string' && ISO_DATE.test(day)).map(day => day.replace(/-/g, ''))));
+  }
+  return result;
+}
+
+export async function fetchKrxHistoryDays(): Promise<Map<string, ReadonlySet<string>> | null> {
+  const body = await getJson('/api/v1/market/krx-history-days');
+  return body ? parseKrxHistoryDays(body) : null;
+}
+
 // 시장 폭 (T-106): 시장별 저장된 첫 날짜·마지막 날짜. 저장된 것이 없는 시장은 null, 확인하지 못하면 null.
 export async function fetchBreadthCoverage(markets: readonly string[]): Promise<Map<string, DateCoverage | null> | null> {
   const body = await getJson(`/api/v1/market/breadth?range=${encodeURIComponent('1년')}`);

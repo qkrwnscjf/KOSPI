@@ -31,6 +31,10 @@ export function datesToCheck(dates: string[], states: ReadonlyMap<string, DateCh
   });
 }
 
+// 이번 주기에 받을 날짜 + 실패해서 다시 받을 날짜 (T-159). 오래된 날부터, 중복 없이
+export const mergeRetryDates = (planned: readonly string[], retry: ReadonlySet<string> | undefined): string[] =>
+  [...new Set([...planned, ...(retry ?? [])])].sort();
+
 // 받은 결과를 날짜 상태에 반영한다 (실패는 반영하지 않아 다음 주기에 다시 받는다)
 export function recordCheck(state: DateCheckState | undefined, result: 'rows' | 'empty', nowMs: number): DateCheckState {
   const next: DateCheckState = { ...state };

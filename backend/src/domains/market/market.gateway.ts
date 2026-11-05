@@ -275,11 +275,11 @@ export const initMarketGateway = (io: Server) => {
         if (symbol === DISCLOSURE_ROOM) {
           // 공시 목록의 첫 화면은 REST로 받는다. 방에는 참여만 한다.
         } else if (flowMarket !== undefined) {
-          const latestFlow = isFlowMarket(flowMarket) ? await marketService.getLatestFlow(flowMarket) : null;
+          const latestFlow = isFlowMarket(flowMarket) ? await marketService.readLatestFlowForSubscribe(flowMarket) : null;
           if (latestFlow) socket.emit('flow', latestFlow);
         } else {
-          // KRX 일별 지수는 캐시가 비어 있으면(Gateway가 뜨기 전에 수집된 경우) DB의 마지막 값으로 채운다 (T-67)
-          const latestTick = (await marketService.getLatestTick(symbol))
+          // KRX 일별 지수는 캐시가 비어 있거나 Redis가 끊겼으면 DB의 마지막 값으로 채운다 (T-67, T-160)
+          const latestTick = (await marketService.readLatestTickForSubscribe(symbol))
             ?? (isKrxDailySymbol(symbol) ? await marketService.getLatestDailyIndex(symbol) : null);
           if (latestTick) {
             socket.emit('tick', latestTick);

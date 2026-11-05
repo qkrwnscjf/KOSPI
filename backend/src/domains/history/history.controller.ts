@@ -7,7 +7,7 @@ import { isMarketState } from '../../shared/market-state.js';
 import { usesOfficialDailyClose } from '../../infrastructure/sink/daily-history.js';
 import { BREADTH_MARKETS, type BreadthMarket } from '../../shared/breadth.js';
 import type { DerivedSymbol, YahooSymbolKey } from '../../shared/symbols.js';
-import { isKrxDailySymbol, KRX_SECTOR_KEYS, type KrxDailySymbol } from '../../shared/krx-indices.js';
+import { isKrxDailySymbol, KRX_HISTORY_KEYS, KRX_SECTOR_KEYS, type KrxDailySymbol } from '../../shared/krx-indices.js';
 import { computeMarketRisk, isRiskRange, RISK_BASE, RISK_RANGES, RISK_TARGETS, type RiskRange } from '../../shared/market-risk.js';
 import { isRankingMarket, isRankingType, RANKING_MARKETS, type RankingType } from '../../shared/rankings.js';
 import { isCalendarDate } from '../../shared/disclosure-calendar.js';
@@ -281,6 +281,21 @@ export const historyController = async (fastify: FastifyInstance) => {
     } catch (err) {
       console.error('Error reading latest tick times:', err instanceof Error ? err.message : String(err));
       return reply.code(500).send({ error: 'Failed to read latest tick times' });
+    }
+  });
+
+  // 코스피 200 등의 빈 날 찾기 (T-155): KRX 표에 저장된 날짜만 돌려준다. 입력이 없고 고정 목록만 읽는다. 값은 내보내지 않는다(공개 날짜 정보)
+  fastify.get('/api/v1/market/krx-history-days', async (_request, reply) => {
+    try {
+      const { rows } = await dbPool.query<{ symbol: string; days: string[] }>(
+        `SELECT symbol, array_agg(to_char(time AT TIME ZONE 'Asia/Seoul', 'YYYY-MM-DD') ORDER BY time) AS days
+         FROM index_daily_krx WHERE symbol = ANY($1::text[]) GROUP BY symbol`,
+        [KRX_HISTORY_KEYS]
+      );
+      return { data: Object.fromEntries(KRX_HISTORY_KEYS.map(symbol => [symbol, rows.find(row => row.symbol === symbol)?.days ?? []])) };
+    } catch (err) {
+      console.error('Error reading KRX history days:', err instanceof Error ? err.message : String(err));
+      return reply.code(500).send({ error: 'Failed to read KRX history days' });
     }
   });
 

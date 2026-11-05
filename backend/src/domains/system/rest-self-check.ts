@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { redis } from '../../infrastructure/redis.js';
+import { marketService } from '../market/market.service.js';
 
 // 검증용 REST 점검 (기본 끔, BENCHMARK B-56, 스위치 REST_SELF_CHECK=true)
 // 에이전트는 curl을 쓸 수 없어서, backend가 자기 라우트를 내부 호출(fastify.inject, 네트워크 없음)해 결과를 남긴다.
@@ -21,8 +22,29 @@ const ROUTES = [
   '/api/v1/system/pipeline',
 ];
 
+// 구독 첫 값 읽기 비교 (B-63): 이전 방식(Redis를 기다림)과 지금 방식의 시간. 공개 시세의 있음·없음만 남긴다
+async function logSubscribeCheck() {
+  const timed = async (run: () => Promise<unknown>) => {
+    const startedAt = Date.now();
+    try {
+      const value = await run();
+      return { ms: Date.now() - startedAt, found: value !== null };
+    } catch {
+      return { ms: Date.now() - startedAt, error: true };
+    }
+  };
+  const guarded = await timed(() => marketService.readLatestTickForSubscribe('KOSPI'));
+  const daily = await timed(async () => (await marketService.readLatestTickForSubscribe('KRX_SEMI')) ?? marketService.getLatestDailyIndex('KRX_SEMI'));
+  const previous = await timed(() => marketService.getLatestTick('KOSPI'));
+  console.log(`[subscribe-check] ${JSON.stringify({ guarded, daily, previous })}`);
+}
+
 export function startRestSelfCheck(fastify: FastifyInstance) {
   if (process.env.REST_SELF_CHECK !== 'true') return;
+  void (async function loop() {
+    await logSubscribeCheck();
+    setTimeout(() => void loop(), 5000);
+  })();
   console.warn('REST_SELF_CHECK=true: calling 12 REST routes internally every 5s (verification only).');
   const run = async () => {
     const redisAtStart = redis.status;

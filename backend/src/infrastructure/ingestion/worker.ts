@@ -8,6 +8,7 @@ import type { YahooSymbolKey } from '../../shared/symbols.js';
 import type { MarketState } from '../../shared/market-state.js';
 import { producer, TOPICS, ensureTopics } from '../kafka.js';
 import { reportRun } from '../ingestion-report.js';
+import { TimeoutError, withAbortTimeout } from '../abort-timeout.js';
 import { Counter, Gauge, Latency, metricsConfig, startMetricsLog, startMetricsServer } from '../metrics.js';
 import { registerShutdown } from '../shutdown.js';
 
@@ -89,15 +90,33 @@ async function flushQuoteRun() {
 type CollectedMarketData = NormalizedMarketData & { collectedAt: number };
 type FetchResult = 'success' | 'empty' | 'timeout' | 'error';
 
-class FetchTimeoutError extends Error {}
+// 시간 제한 안에 끝나지 않은 요청은 실제로 끊는다 (T-156, B-63). 결과만 버리면 멈춘 요청이 라이브러리 큐와 연결을 계속 차지한다(T-150과 같은 이유).
+const yahooInflight = new Gauge('kospi_worker_yahoo_inflight', 'Yahoo quote requests that have not finished yet');
+yahooInflight.set({}, 0);
+const kafkaSendFailedTotal = new Counter('kospi_worker_kafka_send_failed_total', 'Ticks that could not be sent to Kafka (T-157)');
 
-// 정해진 시간 안에 끝나지 않으면 실패로 처리한다. 원래 요청은 중단되지 않고 결과만 버려진다.
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new FetchTimeoutError(`timed out after ${timeoutMs}ms`)), timeoutMs);
+// 검증용 (기본 끔, B-63): 'abort' = 응답 없는 요청을 흉내 내고 중단 신호를 따름, 'noabort' = 신호를 무시함(결과만 버리던 이전 동작). 외부 호출은 하지 않는다
+const TEST_STALL = process.env.YAHOO_TEST_STALL_QUOTE;
+
+function simulateStall(signal: AbortSignal): Promise<NormalizedMarketData[]> {
+  return new Promise((_, reject) => {
+    const timer = setTimeout(() => reject(new Error('simulated stall ended')), 300_000);
+    if (TEST_STALL === 'abort') {
+      signal.addEventListener('abort', () => {
+        clearTimeout(timer);
+        reject(new Error('aborted'));
+      });
+    }
   });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+async function trackInflight<T>(run: () => Promise<T>): Promise<T> {
+  yahooInflight.inc();
+  try {
+    return await run();
+  } finally {
+    yahooInflight.dec();
+  }
 }
 
 // Yahoo는 timestamp에 소스 기준 시각(regularMarketTime)을 넣으므로, 이 값이 바뀌는 간격이 곧 소스 갱신 주기다.
@@ -117,17 +136,17 @@ function trackSourceUpdate(item: NormalizedMarketData) {
 // 소스별 응답 시간과 수집 시각을 기록한다. 결과는 success / empty(0건) / timeout / error로 나눈다 (T-04, T-05).
 async function collect(
   source: string,
-  fetcher: () => Promise<NormalizedMarketData[]>
+  fetcher: (signal: AbortSignal) => Promise<NormalizedMarketData[]>
 ): Promise<{ result: FetchResult; items: CollectedMarketData[] }> {
   const startedAt = Date.now();
   let items: NormalizedMarketData[] = [];
   let result: FetchResult;
 
   try {
-    items = await withTimeout(fetcher(), FETCH_TIMEOUT_MS);
+    items = await withAbortTimeout(signal => trackInflight(() => fetcher(signal)), FETCH_TIMEOUT_MS);
     result = items.length > 0 ? 'success' : 'empty';
   } catch (error) {
-    if (error instanceof FetchTimeoutError) {
+    if (error instanceof TimeoutError) {
       result = 'timeout';
       console.warn(`[${source}] fetch ${error.message}`);
     } else {
@@ -165,7 +184,7 @@ async function runCycle(): Promise<FetchResult> {
       lastRequestSummary = summary;
     }
   }
-  const yahoo = await collect('yahoo', () => fetchYahooData(plan.keys));
+  const yahoo = await collect('yahoo', signal => (TEST_STALL ? simulateStall(signal) : fetchYahooData(plan.keys, signal)));
   const allData = yahoo.items;
   quoteRun.cycles += 1;
   if (yahoo.result !== 'success') quoteRun.failedCycles += 1;
@@ -232,6 +251,7 @@ async function runCycle(): Promise<FetchResult> {
         await producer.send({ topic: TOPICS.ticks, messages });
       } catch (error) {
         quoteRun.sendFailed += messages.length;
+        kafkaSendFailedTotal.inc({}, messages.length);
         throw error;
       }
       kafkaSendDuration.observe({}, Date.now() - producedAt);

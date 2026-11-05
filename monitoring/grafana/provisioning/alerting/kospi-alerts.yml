@@ -441,6 +441,36 @@ groups:
         annotations:
           summary: "TimescaleDB 집계 갱신 또는 보관 작업 중 하나가 주기의 3배가 넘도록 성공하지 못했습니다. 5분 봉 갱신이 멈추면 원본이 지워진 구간이 집계에서 빠질 수 있습니다."
 
+      # Kafka·DLQ 전송 실패 (T-157): Yahoo는 최신값만 주므로 보내지 못한 틱은 되찾을 수 없다
+      - uid: kospi-kafka-send-failed
+        title: Kafka 전송 실패
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: (sum(increase(kospi_worker_kafka_send_failed_total[5m])) or vector(0)) + (sum(increase(kospi_dlq_send_failed_total[5m])) or vector(0))
+              instant: true
+          - refId: B
+            datasourceUid: __expr__
+            model: { refId: B, type: reduce, expression: A, reducer: last }
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels: { severity: warning }
+        annotations:
+          summary: "최근 5분 안에 Kafka 또는 DLQ 전송이 실패했습니다. 그 사이의 틱은 되찾을 수 없습니다."
+
       # 데이터 품질 검사 실패 (T-119): 값이 틀렸거나 빠진 날이 있거나 수집 전체가 멈춤. 어느 항목인지는 패널과 [dq] 로그에 있다
       - uid: kospi-data-quality-fail
         title: 데이터 품질 검사 실패

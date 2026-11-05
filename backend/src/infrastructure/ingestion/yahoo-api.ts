@@ -46,13 +46,28 @@ function validateQuote(
 
 // 요청 실패는 삼키지 않고 던진다. worker가 result="error"로 집계하고 백오프한다 (docs/Task_ORDER.md T-05).
 // keys: 이번에 요청할 지표(T-131, 열린 시장 지표만 요청할 때). 기본은 전체
-export async function fetchYahooData(keys: readonly YahooSymbolKey[] = YAHOO_KEYS): Promise<NormalizedMarketData[]> {
+// signal: 시간 제한 때 요청 자체를 끊는다 (T-156). 라이브러리에는 시간 제한이 없다(T-150에서 확인)
+export async function fetchYahooData(keys: readonly YahooSymbolKey[] = YAHOO_KEYS, signal?: AbortSignal): Promise<NormalizedMarketData[]> {
   const symbols = keys.map(key => YAHOO_SYMBOLS[key]);
   if (symbols.length === 0) return [];
 
   // yahoo-finance2 supports fetching multiple quotes at once
-  const quotes = await yahooFinance.quote(symbols);
+  const quotes = await yahooFinance.quote(symbols, {}, signal ? { fetchOptions: { signal } } : {});
+  return mapYahooQuotes(quotes as unknown as readonly YahooQuoteFields[]);
+}
 
+// 필드 이름 계약 테스트 대상 (T-123). 응답 항목 → 내부 형식. 맞지 않는 항목은 사유를 세고 버린다
+export interface YahooQuoteFields {
+  symbol: string;
+  regularMarketPrice?: unknown;
+  regularMarketTime?: unknown;
+  regularMarketChangePercent?: unknown;
+  regularMarketChange?: unknown;
+  regularMarketVolume?: unknown;
+  marketState?: unknown;
+}
+
+export function mapYahooQuotes(quotes: readonly YahooQuoteFields[]): NormalizedMarketData[] {
   const results: NormalizedMarketData[] = [];
   const seen = new Set<YahooSymbolKey>();
 

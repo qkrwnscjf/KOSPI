@@ -1,4 +1,4 @@
-import { redis } from '../../infrastructure/redis.js';
+import { cache, redis } from '../../infrastructure/redis.js';
 import { dbPool } from '../../infrastructure/db.js';
 import { KRX_DAILY_INDICES, type KrxDailySymbol } from '../../shared/krx-indices.js';
 import type { TickData } from '../../shared/types.js';
@@ -21,6 +21,15 @@ export class MarketService {
   async getLatestTick(symbol: string): Promise<TickData | null> {
     const data = await redis.get(`latest_tick:${symbol}`);
     return data ? JSON.parse(data) : null;
+  }
+
+  // 구독 첫 값 (T-160): Redis가 끊겨도 오래 기다리지 않고 "값 없음"으로 본다(REST의 T-149와 같은 규칙)
+  readLatestTickForSubscribe(symbol: string): Promise<TickData | null> {
+    return cache.readJson<TickData>(`latest_tick:${symbol}`);
+  }
+
+  readLatestFlowForSubscribe(market: FlowMarket): Promise<InvestorFlow | null> {
+    return cache.readJson<InvestorFlow>(`latest_flow:${market}`);
   }
 
   // KRX 일별 지수 (T-67): 과거 날짜를 다시 받는 경우가 있어서, 캐시보다 새 날짜일 때만 바꾼다
