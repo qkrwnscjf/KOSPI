@@ -29,12 +29,13 @@ export interface ChartCardConfig {
 export const CATEGORY_DATA: Record<string, ChartCardConfig[]> = {
   // 지표 확장 (D-67, D-70): 새 Yahoo 지표의 과거 1개월 ~ 1년은 과거 일봉을 이어 붙인다 (T-104 ③). 카드는 소분류로 묶는다 (T-108)
   category1: [
-    { title: '코스피 지수', symbol: 'KOSPI', ready: true, decimals: 2, suffix: 'pt', market: 'krx', group: '지수' },
-    { title: '코스닥 지수', symbol: 'KOSDAQ', ready: true, decimals: 2, suffix: 'pt', market: 'krx', group: '지수' },
-    { title: '코스피 200', symbol: 'KOSPI200', ready: true, decimals: 2, suffix: 'pt', market: 'krx', group: '지수' },
-    { title: '삼성전자', symbol: 'SAMSUNG', ready: true, decimals: 0, suffix: '원', market: 'krx', group: '대형주' },
-    { title: 'SK하이닉스', symbol: 'SK_HYNIX', ready: true, decimals: 0, suffix: '원', market: 'krx', group: '대형주' },
-    { title: '현대차', symbol: 'HYUNDAI', ready: true, decimals: 0, suffix: '원', market: 'krx', group: '대형주' },
+    // 지연 분: BENCHMARK B-61 실측(국내 장중, 원천 시각 → 수집, p50). 국내 6종 약 20분
+    { title: '코스피 지수', symbol: 'KOSPI', ready: true, decimals: 2, suffix: 'pt', market: 'krx', delayMinutes: 20, group: '지수' },
+    { title: '코스닥 지수', symbol: 'KOSDAQ', ready: true, decimals: 2, suffix: 'pt', market: 'krx', delayMinutes: 20, group: '지수' },
+    { title: '코스피 200', symbol: 'KOSPI200', ready: true, decimals: 2, suffix: 'pt', market: 'krx', delayMinutes: 20, group: '지수' },
+    { title: '삼성전자', symbol: 'SAMSUNG', ready: true, decimals: 0, suffix: '원', market: 'krx', delayMinutes: 20, group: '대형주' },
+    { title: 'SK하이닉스', symbol: 'SK_HYNIX', ready: true, decimals: 0, suffix: '원', market: 'krx', delayMinutes: 20, group: '대형주' },
+    { title: '현대차', symbol: 'HYUNDAI', ready: true, decimals: 0, suffix: '원', market: 'krx', delayMinutes: 20, group: '대형주' },
     { title: '코스피200 변동성지수', symbol: 'VKOSPI', ready: true, decimals: 2, daily: true, group: 'KRX 일별 지수' },
     { title: '코리아 밸류업 지수', symbol: 'KRX_VALUEUP', ready: true, decimals: 2, suffix: 'pt', daily: true, group: 'KRX 일별 지수' },
     { title: 'KRX 300', symbol: 'KRX_300', ready: true, decimals: 2, suffix: 'pt', daily: true, group: 'KRX 일별 지수' },
@@ -59,8 +60,9 @@ export const CATEGORY_DATA: Record<string, ChartCardConfig[]> = {
     { title: '다우존스 산업평균', symbol: 'DOW', ready: true, decimals: 2, suffix: 'pt', market: 'us_equity', group: '미국 지수' },
     { title: '러셀 2000', symbol: 'RUSSELL', ready: true, decimals: 2, suffix: 'pt', market: 'us_equity', delayMinutes: 15, group: '미국 지수' },
     { title: '필라델피아 반도체', symbol: 'SOX', ready: true, decimals: 2, suffix: 'pt', market: 'us_equity', group: '미국 지수' },
-    { title: '니케이 225', symbol: 'NIKKEI', ready: true, decimals: 2, suffix: 'pt', market: 'tokyo', group: '아시아 지수' },
-    { title: '대만 가권', symbol: 'TAIEX', ready: true, decimals: 2, suffix: 'pt', market: 'taiwan', group: '아시아 지수' },
+    // 지연 분: BENCHMARK B-61 실측. 니케이 약 15분, 대만 약 20분
+    { title: '니케이 225', symbol: 'NIKKEI', ready: true, decimals: 2, suffix: 'pt', market: 'tokyo', delayMinutes: 15, group: '아시아 지수' },
+    { title: '대만 가권', symbol: 'TAIEX', ready: true, decimals: 2, suffix: 'pt', market: 'taiwan', delayMinutes: 20, group: '아시아 지수' },
     { title: 'WTI 원유 선물', symbol: 'WTI', ready: true, decimals: 2, prefix: '$', market: 'global_24h', delayMinutes: 10, group: '원자재' },
     { title: '브렌트유 선물', symbol: 'BRENT', ready: true, decimals: 2, prefix: '$', market: 'global_24h', delayMinutes: 10, group: '원자재' },
     { title: '천연가스 선물', symbol: 'NATGAS', ready: true, decimals: 3, prefix: '$', market: 'global_24h', delayMinutes: 10, group: '원자재' },
