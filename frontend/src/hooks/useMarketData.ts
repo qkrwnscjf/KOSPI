@@ -1,7 +1,11 @@
-import { useEffect, useState, useSyncExternalStore } from 'react'
+import { useEffect, useMemo, useState, useSyncExternalStore } from 'react'
 import { getConnectionStatus, getLastReceivedAt, subscribeStatus, subscribeTicks, type TickData } from '@/lib/marketSocket'
 import { appendPoint, mergePoints, type ChartPoint } from '@/lib/chartPoints'
 import { spreadValue } from '@/lib/spread'
+import { requestStatus, type RequestStatus } from '@/lib/api'
+import { parseHistory } from '@/lib/parsers'
+import { useApiQuery } from '@/hooks/useApiQuery'
+import { recentKey, trackRealtime } from '@/hooks/realtimeCache'
 
 export type { ChartPoint }
 
@@ -9,14 +13,23 @@ export type { ChartPoint }
 export const useConnectionStatus = () => useSyncExternalStore(subscribeStatus, getConnectionStatus)
 export const useLastReceivedAt = () => useSyncExternalStore(subscribeStatus, getLastReceivedAt)
 
-// loading: 불러오는 중, loaded: 응답을 받음(데이터가 0개일 수 있음), not_ready: 수집 보류 중인 지표(R-04), error: 요청 실패
-export type ChartStatus = 'loading' | 'loaded' | 'not_ready' | 'error'
-
-const HISTORY_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001/api/v1/market/history'
-// 최근 tick API는 같은 경로 아래에 있다 (T-25)
-const RECENT_URL = HISTORY_URL.replace(/history$/, 'recent')
+// 화면 상태. 공통 정의는 lib/api.ts (T-165). 기존 import 경로를 위해 이름을 그대로 둔다
+export type ChartStatus = RequestStatus
 
 const REALTIME = '실시간'
+
+// 기간별 캐시 유지·자동 갱신 (T-165, D-92). 서버 캐시(30초)보다 짧게 두지 않는다
+// - 1일(5분 봉): 장중 5분마다 새 칸이 생겨 2분마다 다시 받는다
+// - 1주(1시간 봉): 10분마다
+// - 1개월 ~ 1년(1일 봉): 하루 1번 바뀌어 자동 갱신 없이 30분 동안 캐시를 쓴다
+const HISTORY_CACHE: Record<string, { staleTime: number; refetchInterval: number | false }> = {
+  '1일': { staleTime: 60_000, refetchInterval: 2 * 60_000 },
+  '1주': { staleTime: 5 * 60_000, refetchInterval: 10 * 60_000 },
+}
+const DAILY_CACHE = { staleTime: 30 * 60_000, refetchInterval: false as const }
+// 실시간 그래프의 첫 화면(최근 tick 50개)은 한 번만 받는다. 그 뒤로는 탭을 떠나 있어도 소켓이 캐시에 tick을 계속 붙이므로(realtimeCache.ts)
+// 다시 열 때 새로 받지 않는다. 캐시를 지우지 않아야 붙여 온 값이 남는다. 연결이 끊겼다 붙으면 realtimeCache가 새로 받게 한다
+const REALTIME_CACHE = { staleTime: Infinity, gcTime: Infinity, refetchInterval: false as const }
 
 // 심볼의 최신 tick만 받는다 (Header의 현재가 등). 공유 소켓을 쓰므로 연결이 늘지 않는다 (T-24).
 export function useLatestTick(symbol: string, enabled = true) {
@@ -42,62 +55,39 @@ export function useSpreadTick(symbol: string, spread: { long: string; short: str
 
 // live: false이면 이 심볼의 실시간 tick을 구독하지 않는다(계산 지표처럼 구독 방이 없는 경우, T-107)
 export function useMarketData(symbol: string, timeframe: string, ready: boolean, live = true) {
-  const [chartData, setChartData] = useState<ChartPoint[]>([])
-  const [status, setStatus] = useState<ChartStatus>(ready ? 'loading' : 'not_ready')
-
   // 현재가와 기준 시각은 타임프레임과 상관없이 실시간 값으로 표시한다 (소켓 1개를 공유하므로 추가 연결이 없음, T-24).
   const latest = useLatestTick(symbol, ready && live)
+  const isRealtime = timeframe === REALTIME
 
+  // 실시간: DB의 최근 tick으로 첫 화면을 채운다 (T-25). 나머지 기간: 집계 그래프 (T-20). 기간마다 캐시가 따로라 섞이지 않는다 (T-27, P-13)
+  const query = useApiQuery(
+    isRealtime ? recentKey(symbol) : ['history', symbol, timeframe],
+    isRealtime ? 'market/recent' : 'market/history',
+    isRealtime ? { ticker: symbol } : { ticker: symbol, timeframe },
+    parseHistory,
+    { enabled: ready, ...(isRealtime ? REALTIME_CACHE : HISTORY_CACHE[timeframe] ?? DAILY_CACHE) }
+  )
+
+  // 첫 화면을 받으면 이 지표의 tick을 캐시에 계속 붙인다(탭을 떠나도 유지)
+  const seeded = isRealtime && query.isSuccess
   useEffect(() => {
-    if (!ready) {
-      setChartData([])
-      setStatus('not_ready')
-      return
-    }
+    if (ready && seeded) trackRealtime(symbol)
+  }, [ready, seeded, symbol])
 
-    // 타임프레임을 바꾸면 이전 데이터를 비우고 새로 불러온다. 과거 데이터와 실시간 데이터가 섞이지 않는다 (T-27, P-13).
-    let cancelled = false
-    setChartData([])
-    setStatus('loading')
+  // 첫 응답보다 먼저 온 tick도 화면에 보이도록 카드가 열려 있는 동안 따로 모아 합친다(같은 시각은 하나로)
+  const [livePoints, setLivePoints] = useState<ChartPoint[]>([])
+  useEffect(() => {
+    setLivePoints([])
+    if (!ready || !isRealtime) return
+    return subscribeTicks(symbol, tick => setLivePoints(previous => appendPoint(previous, { time: tick.timestamp, value: tick.price })))
+  }, [symbol, isRealtime, ready])
 
-    const isRealtime = timeframe === REALTIME
-    // 실시간 차트의 첫 화면은 mock 대신 DB에 있는 실제 최근 tick으로 채운다 (T-25, P-02).
-    const url = isRealtime
-      ? `${RECENT_URL}?ticker=${encodeURIComponent(symbol)}`
-      : `${HISTORY_URL}?ticker=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}`
+  const fetched = query.data?.points
+  const chartData = useMemo(() => {
+    if (!ready) return []
+    return isRealtime ? mergePoints(fetched ?? [], livePoints) : fetched ?? []
+  }, [ready, isRealtime, fetched, livePoints])
 
-    fetch(url)
-      .then(res => (res.ok ? res.json() : Promise.reject(new Error(`HTTP ${res.status}`))))
-      .then(body => {
-        if (cancelled) return
-        if (body?.status === 'not_ready') {
-          setStatus('not_ready')
-          return
-        }
-        const points: ChartPoint[] = Array.isArray(body?.data) ? body.data : []
-        setChartData(previous => (isRealtime ? mergePoints(points, previous) : points))
-        setStatus('loaded')
-      })
-      .catch(err => {
-        if (cancelled) return
-        console.error('Failed to fetch chart data', err)
-        setStatus('error')
-      })
-
-    if (!isRealtime) {
-      return () => {
-        cancelled = true
-      }
-    }
-
-    const unsubscribe = subscribeTicks(symbol, tick => {
-      setChartData(previous => appendPoint(previous, { time: tick.timestamp, value: tick.price }))
-    })
-    return () => {
-      cancelled = true
-      unsubscribe()
-    }
-  }, [symbol, timeframe, ready])
-
+  const status: ChartStatus = ready ? requestStatus(query, query.data?.notReady ?? false) : 'not_ready'
   return { latest, chartData, status }
 }

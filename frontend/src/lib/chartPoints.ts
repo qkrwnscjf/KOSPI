@@ -26,6 +26,14 @@ export function mergePoints(fetched: ChartPoint[], live: ChartPoint[]) {
   return [...byTime.values()].sort((a, b) => a.time - b.time).slice(-MAX_REALTIME_POINTS)
 }
 
+// 캐시에 들어 있는 실시간 그래프(첫 화면 + 이어 붙인 tick)에 새 tick을 붙인다 (T-165 보완, B-68).
+// 아직 첫 화면을 받지 않은 그래프(undefined)는 만들지 않는다. 일부 tick만으로 첫 화면을 대신하면 그 앞의 값이 빠지기 때문이다.
+export function appendToSeries<T extends { points: ChartPoint[] }>(series: T | undefined, point: ChartPoint): T | undefined {
+  if (!series) return undefined
+  const points = appendPoint(series.points, point)
+  return points === series.points ? series : { ...series, points }
+}
+
 // 그래프에 보이는 기간의 방향: 첫 값 대비 마지막 값 (D-37)
 export function periodDirection(points: ChartPoint[]): Direction | null {
   const first = points[0]

@@ -2,6 +2,7 @@ import { cache, redis } from '../../infrastructure/redis.js';
 import { dbPool } from '../../infrastructure/db.js';
 import { KRX_DAILY_INDICES, type KrxDailySymbol } from '../../shared/krx-indices.js';
 import type { TickData } from '../../shared/types.js';
+import { parseSourceLag, type SourceLag } from '../../shared/source-lag.js';
 
 // 최신 tick 캐시의 만료 시간 (docs/Task_ORDER.md T-23, D-28)
 // 수집이 멈추면 오래된 값이 끝없이 "현재가"로 남지 않도록 만료시킨다.
@@ -49,6 +50,24 @@ export class MarketService {
     await this.saveLatestTickIfNewer(tick).catch(() => false);
     return tick;
   }
+
+  // 소스 지연 측정값 (T-162). 장이 닫힌 주말·연휴에도 마지막 장중 측정값을 보여 주도록 14일 보관한다
+  async saveSourceLag(symbol: string, lag: SourceLag): Promise<boolean> {
+    if (redis.status !== 'ready') return false;
+    await redis.set(`source_lag:${symbol}`, JSON.stringify(lag), 'EX', SOURCE_LAG_TTL_S);
+    return true;
+  }
+
+  // REST용: Redis가 끊겨도 기다리지 않는다(T-149 cache 규칙). 형식이 맞는 값만 돌려준다
+  async readSourceLags(symbols: readonly string[]): Promise<Record<string, SourceLag>> {
+    const values = await Promise.all(symbols.map(symbol => cache.readJson<unknown>(`source_lag:${symbol}`)));
+    return Object.fromEntries(symbols.flatMap((symbol, index) => {
+      const lag = parseSourceLag(values[index]);
+      return lag ? [[symbol, lag]] : [];
+    }));
+  }
 }
+
+const SOURCE_LAG_TTL_S = 14 * 24 * 60 * 60;
 
 export const marketService = new MarketService();

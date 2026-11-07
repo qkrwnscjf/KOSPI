@@ -12,6 +12,7 @@ import { computeMarketRisk, isRiskRange, RISK_BASE, RISK_RANGES, RISK_TARGETS, t
 import { isRankingMarket, isRankingType, RANKING_MARKETS, type RankingType } from '../../shared/rankings.js';
 import { isCalendarDate } from '../../shared/disclosure-calendar.js';
 import type { BarResolution } from '../../shared/yahoo-bars.js';
+import { marketService } from '../market/market.service.js';
 
 // 측정 지표 (docs/Task_ORDER.md T-01, BENCHMARK M-11)
 const historyDuration = new Latency('kospi_history_request_duration_seconds', 'History API response time by result (cache_hit / cache_miss / not_ready / error)');
@@ -281,6 +282,17 @@ export const historyController = async (fastify: FastifyInstance) => {
     } catch (err) {
       console.error('Error reading latest tick times:', err instanceof Error ? err.message : String(err));
       return reply.code(500).send({ error: 'Failed to read latest tick times' });
+    }
+  });
+
+  // 소스 지연 측정값 (T-162): 화면의 "지연 N분" 배지용. 입력이 없고 고정 목록(Yahoo 27종)만 읽는다.
+  // Gateway가 장중에 남긴 마지막 측정값이라 주말·연휴에도 직전 장의 값이 나온다. 측정값이 없는 지표는 빠진다.
+  fastify.get('/api/v1/market/source-lags', async (_request, reply) => {
+    try {
+      return { data: await marketService.readSourceLags(YAHOO_KEYS) };
+    } catch (err) {
+      console.error('Error reading source lags:', err instanceof Error ? err.message : String(err));
+      return reply.code(500).send({ error: 'Failed to read source lags' });
     }
   });
 

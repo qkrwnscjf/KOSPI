@@ -1,9 +1,16 @@
 // 차트 점 계산 테스트 (docs/Task_ORDER.md T-45, T-25, T-27, D-37)
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { MAX_REALTIME_POINTS, appendPoint, mergePoints, periodDirection } from '../src/lib/chartPoints.ts'
+import { MAX_REALTIME_POINTS, appendPoint, appendToSeries, mergePoints, periodDirection } from '../src/lib/chartPoints.ts'
 
 const point = (time: number, value = time) => ({ time, value })
+
+test('appendToSeries: 첫 화면이 있는 캐시에만 tick을 붙이고, 없으면 만들지 않는다 (T-165 보완)', () => {
+  const series = { notReady: false, points: [point(1, 10)] }
+  assert.deepEqual(appendToSeries(series, point(2, 11))?.points, [point(1, 10), point(2, 11)])
+  assert.equal(appendToSeries(series, point(0, 9)), series) // 더 이른 시각은 버리고 같은 객체 그대로
+  assert.equal(appendToSeries(undefined, point(2, 11)), undefined)
+})
 
 test('appendPoint: 새 시각의 점은 뒤에 붙는다', () => {
   assert.deepEqual(appendPoint([point(1)], point(2)), [point(1), point(2)])

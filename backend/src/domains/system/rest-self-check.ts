@@ -20,6 +20,7 @@ const ROUTES = [
   `/api/v1/disclosures/capital-events?range=${q('1개월')}`,
   `/api/v1/disclosures/calendar?month=${new Date().toISOString().slice(0, 7)}`,
   '/api/v1/system/pipeline',
+  '/api/v1/market/source-lags', // T-162
 ];
 
 // 구독 첫 값 읽기 비교 (B-63): 이전 방식(Redis를 기다림)과 지금 방식의 시간. 공개 시세의 있음·없음만 남긴다
@@ -45,7 +46,7 @@ export function startRestSelfCheck(fastify: FastifyInstance) {
     await logSubscribeCheck();
     setTimeout(() => void loop(), 5000);
   })();
-  console.warn('REST_SELF_CHECK=true: calling 12 REST routes internally every 5s (verification only).');
+  console.warn(`REST_SELF_CHECK=true: calling ${ROUTES.length} REST routes internally every 5s (verification only).`);
   const run = async () => {
     const redisAtStart = redis.status;
     const startedAt = Date.now();

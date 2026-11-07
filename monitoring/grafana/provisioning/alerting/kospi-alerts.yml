@@ -1,6 +1,5 @@
 # Grafana 알림 규칙 자동 등록 (docs/Task_ORDER.md T-46)
-# 알림 수신처(메일·Slack 등)는 만들지 않는다. 외부 전송 대상과 비밀값이 생기기 때문이다.
-# 상태는 Grafana의 Alerting → Alert rules 화면에서 확인한다. 기본 수신처(이메일)는 SMTP가 없어서 실제로 보내지 않는다.
+# 수신처와 알림 경로는 kospi-slack.yml에 있다(T-163, Slack). 상태는 Grafana의 Alerting → Alert rules 화면에서도 확인한다.
 apiVersion: 1
 
 groups:

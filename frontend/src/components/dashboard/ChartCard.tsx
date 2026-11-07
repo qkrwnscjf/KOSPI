@@ -7,6 +7,8 @@ import { formatAxisNumber, formatClock, formatDate, formatNumber } from '@/lib/f
 import { isMarketOpen, marketBadge, type MarketId, type MarketState } from '@/lib/marketHours'
 import { useMarketData, useSpreadTick, type ChartStatus } from '@/hooks/useMarketData'
 import { periodDirection, type Direction } from '@/lib/chartPoints'
+import { combineLags, delayBadgeMinutes } from '@/lib/sourceLag'
+import { useSourceLags } from '@/hooks/useSourceLags'
 import type { ChartCardConfig } from '@/constants/data'
 
 const TIME_RANGES = ['실시간', '1일', '1주', '1개월', '3개월', '1년']
@@ -90,7 +92,7 @@ const DIRECTION_ICON = { up: TrendingUp, down: TrendingDown, flat: Minus }
 // 그래프 선·채우기 색 (D-37): 상승 초록, 하락 빨강, 변화 없음은 본문색. 기간 방향은 lib/chartPoints.ts
 const CHART_COLOR: Record<Direction, string> = { up: 'text-up', down: 'text-down', flat: 'text-fg' }
 
-export function ChartCard({ title, symbol, ready, decimals, prefix, suffix, market, delayMinutes, daily, spread }: ChartCardConfig) {
+export function ChartCard({ title, symbol, ready, decimals, prefix, suffix, market, daily, spread }: ChartCardConfig) {
   const ranges = daily ? DAILY_RANGES : spread ? SPREAD_RANGES : TIME_RANGES
   const [activeRange, setActiveRange] = useState(daily ? '1개월' : spread ? '1일' : '실시간')
   const { latest: ownLatest, chartData, status } = useMarketData(symbol, activeRange, ready, !spread)
@@ -109,6 +111,10 @@ export function ChartCard({ title, symbol, ready, decimals, prefix, suffix, mark
   // 1일 ~ 1년은 그래프에 보이는 기간의 등락을 따른다.
   const chartDirection = activeRange === '실시간' ? direction : periodDirection(chartData)
   const chartColor = chartDirection ? CHART_COLOR[chartDirection] : 'text-fg'
+  // 지연 배지 (T-162): 고정값 대신 backend가 장중에 측정한 값. 계산 카드는 두 지표 중 늦은 쪽, 일별 지표는 해당 없음
+  const sourceLags = useSourceLags()
+  const lag = daily ? undefined : spread ? combineLags(sourceLags[spread.long], sourceLags[spread.short]) : sourceLags[symbol]
+  const delayMinutes = delayBadgeMinutes(lag)
 
   return (
     <motion.div
@@ -124,8 +130,11 @@ export function ChartCard({ title, symbol, ready, decimals, prefix, suffix, mark
             <div className="mb-1 flex flex-wrap items-center gap-1.5">
               <h3 className="text-[13px] font-medium text-fg-muted">{title}</h3>
               {ready && market && <MarketBadge market={market} state={latest?.marketState} />}
-              {ready && delayMinutes && (
-                <span className={cn(badgeClass, 'border-line text-fg-muted')} title={`소스가 약 ${delayMinutes}분 늦은 시세를 제공합니다`}>
+              {ready && lag && delayMinutes !== null && (
+                <span
+                  className={cn(badgeClass, 'border-line text-fg-muted')}
+                  title={`소스가 약 ${delayMinutes}분 늦은 시세를 제공합니다 (장중 실측, ${formatDate(lag.measuredAt)} ${formatClock(lag.measuredAt, false)} 기준)`}
+                >
                   지연 {delayMinutes}분
                 </span>
               )}

@@ -85,7 +85,7 @@ function StatusFooter() {
         </div>
       </div>
 
-      <span className="text-[11px] text-fg-muted">시세 출처: Yahoo Finance(일부 10~15분 지연) · KRX Open API(일별) · 공시: 금융감독원 DART · 증시 자금: 금융투자협회(공공데이터포털)</span>
+      <span className="text-[11px] text-fg-muted">시세 출처: Yahoo Finance(일부 지연 시세, 카드에 장중 실측 지연 표시) · KRX Open API(일별) · 공시: 금융감독원 DART · 증시 자금: 금융투자협회(공공데이터포털)</span>
     </footer>
   )
 }

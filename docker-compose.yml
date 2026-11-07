@@ -256,12 +256,14 @@ services:
       - GF_PLUGINS_PREINSTALL_DISABLED=true          # 기본 플러그인 자동 설치
       - GF_NEWS_NEWS_FEED_ENABLED=false              # 홈 화면 뉴스 피드
       - GF_SECURITY_DISABLE_GRAVATAR=true            # 프로필 이미지를 gravatar.com에서 받아 오지 않음
+      # Slack 알림 웹훅 (T-163, SEC-018). 값은 프로젝트 루트 .env에만 둔다(비밀값). 없으면 컨테이너 안의 닫힌 포트로 보내 외부 전송이 없다
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-http://127.0.0.1:9/slack-webhook-not-configured}
     volumes:
       - grafana_data:/var/lib/grafana
       # 데이터소스·대시보드 자동 설정 (docs/Task_ORDER.md T-02). 모두 읽기 전용.
       - ./monitoring/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
       - ./monitoring/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
-      # 알림 규칙 (T-46). 수신처는 만들지 않고 규칙만 등록한다. 읽기 전용.
+      # 알림 규칙 (T-46)과 Slack 수신처·알림 경로 (T-163). 읽기 전용.
       - ./monitoring/grafana/provisioning/alerting:/etc/grafana/provisioning/alerting:ro
       - ./monitoring/grafana/dashboards:/etc/grafana/dashboards:ro
     ports:

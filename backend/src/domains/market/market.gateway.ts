@@ -6,8 +6,10 @@ import { kafka, TOPICS, ensureTopics } from '../../infrastructure/kafka.js';
 import { Counter, Gauge, Latency } from '../../infrastructure/metrics.js';
 import { marketService } from './market.service.js';
 import { parseTick } from '../../shared/tick-validation.js';
-import { isSubscribableSymbol } from '../../shared/symbols.js';
+import { isSubscribableSymbol, isYahooSymbolKey } from '../../shared/symbols.js';
 import type { TickData } from '../../shared/types.js';
+import { isLagSample, pushLagSample, summarizeLag } from '../../shared/source-lag.js';
+import { MARKETS, YAHOO_MARKET } from '../../infrastructure/ingestion/market-hours.js';
 
 // 측정 지표 (docs/Task_ORDER.md T-01)
 const messagesTotal = new Counter('kospi_gateway_messages_total', 'Kafka messages processed by the gateway');
@@ -41,6 +43,32 @@ const disclosureMessagesTotal = new Counter('kospi_gateway_disclosure_messages_t
 
 // DLQ 다시 처리 (T-129)
 const replayedSkippedTotal = new Counter('kospi_gateway_replayed_skipped_total', 'Messages replayed from a DLQ, skipped by the gateway (storage only)');
+
+// 소스 지연 측정 (T-162): 지표별 최근 표본의 중앙값을 1분에 한 번 Redis에 남기고 지표로도 내보낸다
+const sourceLagGauge = new Gauge('kospi_gateway_source_lag_seconds', 'Measured source delay (worker collection time - source timestamp, median of recent in-session ticks) by symbol');
+const LAG_SAVE_INTERVAL_MS = 60_000;
+const lagSamples = new Map<string, number[]>();
+const lagSavedAt = new Map<string, number>();
+const isMarketOpenAt = (market: string, ms: number) => MARKETS.find(item => item.id === market)?.isOpen(new Date(ms)) ?? false;
+
+// 예외를 던지지 않는다. 실시간 전송이 끝난 뒤에 부르고 Redis 저장은 기다리지 않는다 (T-23과 같은 원칙)
+function recordSourceLag(tick: TickData) {
+  if (tick.collectedAt === undefined || !isYahooSymbolKey(tick.symbol)) return;
+  const lagMs = tick.collectedAt - tick.timestamp;
+  if (!isLagSample(lagMs, isMarketOpenAt(YAHOO_MARKET[tick.symbol], tick.collectedAt))) return;
+  const samples = pushLagSample(lagSamples.get(tick.symbol) ?? [], lagMs);
+  lagSamples.set(tick.symbol, samples);
+  const now = Date.now();
+  if (now - (lagSavedAt.get(tick.symbol) ?? 0) < LAG_SAVE_INTERVAL_MS) return;
+  const lag = summarizeLag(samples, now);
+  if (!lag) return;
+  lagSavedAt.set(tick.symbol, now);
+  sourceLagGauge.set({ symbol: tick.symbol }, lag.lagSeconds);
+  void marketService.saveSourceLag(tick.symbol, lag).catch(error => {
+    redisErrorsTotal.inc();
+    console.error(`Gateway failed to cache source lag for ${tick.symbol}: ${errorMessage(error)}`);
+  });
+}
 
 const RECONNECT_INITIAL_DELAY_MS = 1000;
 const RECONNECT_MAX_DELAY_MS = 30000;
@@ -88,6 +116,7 @@ const handleMessage = (io: Server) => async ({ topic, partition, message }: Each
   messagesTotal.inc();
 
   void cacheLatestTick(tick);
+  recordSourceLag(tick);
 };
 
 // KRX 일별 지수 (docs/Task_ORDER.md T-67). 시세와 같은 'tick' 이벤트로 보내서 화면 카드가 그대로 받는다.
