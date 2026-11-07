@@ -37,6 +37,11 @@ test('목록에 없는 값, 문자열이 아닌 값, 객체 속성 이름은 거
   assert.equal(isYahooSymbolKey('VKOSPI'), false);
 });
 
+test('데이터 원천이 없는 투자자별 흐름 방은 구독할 수 없다 (T-164)', () => {
+  for (const room of ['flows:KOSPI', 'flows:KOSDAQ', 'flows:']) assert.equal(isSubscribableSymbol(room), false, room);
+  assert.equal(isSubscribableSymbol('disclosures:KOSPI'), true);
+});
+
 test('Yahoo와 KRX 일별 심볼 이름이 겹치지 않는다', () => {
   const yahoo = new Set<string>(YAHOO_KEYS);
   assert.deepEqual(KRX_DAILY_KEYS.filter(key => yahoo.has(key)), []);

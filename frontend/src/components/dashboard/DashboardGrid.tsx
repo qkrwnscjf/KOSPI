@@ -130,7 +130,7 @@ export function DashboardGrid({ categoryId }: DashboardGridProps) {
         </div>
       )}
 
-      {/* 증시 자금 흐름 탭: 금융투자협회 일별 통계 1개월 (11단계 B′ T-98, D-77). 투자자별 순매수 화면(FlowDashboard)은 원천이 없어 쓰지 않는다 */}
+      {/* 증시 자금 흐름 탭: 금융투자협회 일별 통계 1개월 (11단계 B′ T-98, D-77). 투자자별 순매수 화면은 원천이 없어 T-164에서 지웠다 */}
       {categoryId === 'category5' ? (
         <MarketFlowsReport />
       ) : categoryId === 'category6' ? (

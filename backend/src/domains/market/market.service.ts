@@ -2,7 +2,6 @@ import { cache, redis } from '../../infrastructure/redis.js';
 import { dbPool } from '../../infrastructure/db.js';
 import { KRX_DAILY_INDICES, type KrxDailySymbol } from '../../shared/krx-indices.js';
 import type { TickData } from '../../shared/types.js';
-import type { FlowMarket, InvestorFlow } from '../../shared/flows.js';
 
 // 최신 tick 캐시의 만료 시간 (docs/Task_ORDER.md T-23, D-28)
 // 수집이 멈추면 오래된 값이 끝없이 "현재가"로 남지 않도록 만료시킨다.
@@ -28,10 +27,6 @@ export class MarketService {
     return cache.readJson<TickData>(`latest_tick:${symbol}`);
   }
 
-  readLatestFlowForSubscribe(market: FlowMarket): Promise<InvestorFlow | null> {
-    return cache.readJson<InvestorFlow>(`latest_flow:${market}`);
-  }
-
   // KRX 일별 지수 (T-67): 과거 날짜를 다시 받는 경우가 있어서, 캐시보다 새 날짜일 때만 바꾼다
   async saveLatestTickIfNewer(tick: TickData): Promise<boolean> {
     if (redis.status !== 'ready') return false;
@@ -53,18 +48,6 @@ export class MarketService {
     if (row.change_price !== null) tick.changePrice = row.change_price;
     await this.saveLatestTickIfNewer(tick).catch(() => false);
     return tick;
-  }
-
-  // 증시 자금 흐름 최신값 (11단계). 시세와 같은 규칙: Redis가 연결되어 있지 않으면 건너뜀, TTL 7일.
-  async saveLatestFlow(flow: InvestorFlow): Promise<boolean> {
-    if (redis.status !== 'ready') return false;
-    await redis.set(`latest_flow:${flow.market}`, JSON.stringify(flow), 'EX', LATEST_TICK_TTL_S);
-    return true;
-  }
-
-  async getLatestFlow(market: FlowMarket): Promise<InvestorFlow | null> {
-    const data = await redis.get(`latest_flow:${market}`);
-    return data ? JSON.parse(data) : null;
   }
 }
 

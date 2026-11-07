@@ -74,7 +74,7 @@
       "id": 6,
       "type": "timeseries",
       "title": "수집 결과 (초당, M-06)",
-      "description": "result=empty는 0건 반환(Naver는 P-01로 현재 항상 empty).",
+      "description": "result=empty는 0건 반환입니다.",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "x": 12, "y": 16, "w": 12, "h": 8 },
       "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },

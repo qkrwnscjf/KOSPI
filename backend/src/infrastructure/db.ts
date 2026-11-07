@@ -433,6 +433,22 @@ const MIGRATIONS: Migration[] = [
       `SELECT add_retention_policy('dq_results', drop_after => INTERVAL '30 days', if_not_exists => true)`,
     ],
   },
+  {
+    version: 15,
+    name: 'T-164 drop investor_flows (no collector ever wrote to it)',
+    statements: [
+      // 투자자별 흐름 표 (마이그레이션 5). 보내는 수집기가 없어 항상 비어 있었고(2026-11-07 행 0 확인), 읽고 쓰는 코드는 T-164에서 지웠다.
+      // 2026-11-07 사용자 승인("지워도 영향 없으면 정리"). 비어 있을 때만 지운다. 행이 있으면 그대로 두어 데이터가 사라지지 않게 한다.
+      // 하이퍼테이블을 지우면 그 표의 보관 작업도 함께 지워진다.
+      `DO $$
+      BEGIN
+        IF to_regclass('public.investor_flows') IS NOT NULL AND NOT EXISTS (SELECT 1 FROM investor_flows) THEN
+          DROP TABLE investor_flows;
+        END IF;
+      END
+      $$`,
+    ],
+  },
 ];
 
 // 집계의 실제 저장 테이블(materialization hypertable)을 찾아 청크 간격을 바꾼다 (T-31).

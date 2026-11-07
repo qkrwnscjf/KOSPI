@@ -1,7 +1,6 @@
 import type { KafkaMessage, Producer } from 'kafkajs';
 import { kafka, TOPICS } from '../kafka.js';
 import { parseTick } from '../../shared/tick-validation.js';
-import { parseInvestorFlow } from '../../shared/flows.js';
 import { parseDisclosure } from '../../shared/disclosures.js';
 import { parseMarketBreadth } from '../../shared/breadth.js';
 import { parseStockRankings } from '../../shared/rankings.js';
@@ -39,7 +38,6 @@ export function replayDecision(sourceTopic: string, value: Buffer | null): Repla
     return isKrxDailySymbol(parsed.tick.symbol) || isKrxHistorySymbol(parsed.tick.symbol) ? { replay: true } : fail('not_daily_symbol');
   }
   const parsers: Record<string, (input: Buffer | null) => { ok: boolean; reason?: string }> = {
-    [TOPICS.flows]: parseInvestorFlow,
     [TOPICS.disclosures]: parseDisclosure,
     [TOPICS.breadth]: parseMarketBreadth,
     [TOPICS.rankings]: parseStockRankings,

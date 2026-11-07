@@ -84,7 +84,6 @@ export const RETENTION_LIMITS: Record<string, { column: string; limitMs: number 
   stock_rankings: { column: 'time', limitMs: YEAR + 31 * DAY },
   market_flows: { column: 'time', limitMs: YEAR + 366 * DAY },
   market_bars_fill: { column: 'time', limitMs: 10 * DAY },
-  investor_flows: { column: 'time', limitMs: YEAR + 8 * DAY },
   ingestion_runs: { column: 'started_at', limitMs: 38 * DAY },
   dq_results: { column: 'checked_at', limitMs: 38 * DAY },
 };

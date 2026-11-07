@@ -1,6 +1,5 @@
 import { Server, Socket } from 'socket.io';
 import type { Consumer, EachMessagePayload } from 'kafkajs';
-import { flowRoom, isFlowMarket, parseInvestorFlow } from '../../shared/flows.js';
 import { DISCLOSURE_ROOM, isTargetStock, parseDisclosure } from '../../shared/disclosures.js';
 import { isKrxDailySymbol, isKrxHistorySymbol } from '../../shared/krx-indices.js';
 import { kafka, TOPICS, ensureTopics } from '../../infrastructure/kafka.js';
@@ -36,10 +35,6 @@ const redisSkippedTotal = new Counter('kospi_gateway_redis_skipped_total', 'Late
 // 구독 요청 검증 (docs/security.md SEC-005)
 const subscribeRejectedTotal = new Counter('kospi_gateway_subscribe_rejected_total', 'Rejected subscribe / unsubscribe requests by reason');
 
-// 증시 자금 흐름 (11단계)
-const flowMessagesTotal = new Counter('kospi_gateway_flow_messages_total', 'Investor flow messages emitted by the gateway');
-const flowPipelineLatency = new Latency('kospi_gateway_flow_pipeline_latency_seconds', 'Flows collector collection to WebSocket emit');
-
 // KRX 일별 지수·DART 공시 (T-67, 12단계)
 const dailyMessagesTotal = new Counter('kospi_gateway_daily_index_messages_total', 'KRX daily index messages emitted by the gateway');
 const disclosureMessagesTotal = new Counter('kospi_gateway_disclosure_messages_total', 'Live DART disclosures emitted by the gateway');
@@ -58,10 +53,6 @@ const handleMessage = (io: Server) => async ({ topic, partition, message }: Each
   // DLQ에서 되돌린 메시지(T-129)는 저장용이다. 지난 값이라 화면에 보내거나 최신값 캐시를 덮어쓰지 않는다
   if (message.headers?.['replayed-from'] !== undefined) {
     replayedSkippedTotal.inc();
-    return;
-  }
-  if (topic === TOPICS.flows) {
-    handleFlowMessage(io, topic, partition, message.value, message.offset, consumedAt);
     return;
   }
   if (topic === TOPICS.indexDaily) {
@@ -98,26 +89,6 @@ const handleMessage = (io: Server) => async ({ topic, partition, message }: Each
 
   void cacheLatestTick(tick);
 };
-
-// 증시 자금 흐름 (docs/Task_ORDER.md 11단계 A). 시세와 같은 규칙: 검증 → 먼저 전송 → 캐시는 기다리지 않음. 예외를 던지지 않는다.
-function handleFlowMessage(io: Server, topic: string, partition: number, value: Buffer | null, offset: string, consumedAt: number) {
-  const parsed = parseInvestorFlow(value);
-  if (!parsed.ok) {
-    invalidTotal.inc({ reason: `flow_${parsed.reason}` });
-    console.warn(`Gateway skipped invalid flow message at ${topic}[${partition}]@${offset}: ${parsed.reason}`);
-    return;
-  }
-  const flow = parsed.flow;
-  io.to(flowRoom(flow.market)).emit('flow', flow);
-  flowMessagesTotal.inc();
-  if (flow.collectedAt !== undefined) flowPipelineLatency.observe({}, Date.now() - flow.collectedAt);
-  emitDelay.observe({}, Date.now() - consumedAt);
-
-  void marketService.saveLatestFlow(flow).catch(error => {
-    redisErrorsTotal.inc();
-    console.error(`Gateway failed to cache latest flow for ${flow.market}: ${errorMessage(error)}`);
-  });
-}
 
 // KRX 일별 지수 (docs/Task_ORDER.md T-67). 시세와 같은 'tick' 이벤트로 보내서 화면 카드가 그대로 받는다.
 // 소스 시각이 하루 전이라 지연 지표(e2e·pipeline)에는 넣지 않는다. 최신값 캐시는 더 새로운 날짜일 때만 바꾼다.
@@ -193,7 +164,7 @@ async function startConsumer(io: Server) {
   try {
     await ensureTopics();
     await consumer.connect();
-    await consumer.subscribe({ topics: [TOPICS.ticks, TOPICS.flows, TOPICS.indexDaily, TOPICS.disclosures], fromBeginning: false });
+    await consumer.subscribe({ topics: [TOPICS.ticks, TOPICS.indexDaily, TOPICS.disclosures], fromBeginning: false });
 
     consumer.on(consumer.events.GROUP_JOIN, () => kafkaConnected.set({}, 1));
     consumer.on(consumer.events.CRASH, event => {
@@ -256,7 +227,7 @@ export const initMarketGateway = (io: Server) => {
 
     // 구독 요청은 허용된 심볼 문자열만 받는다 (docs/security.md SEC-005).
     // 목록에 없는 값은 방을 만들지 않고, 로그에도 받은 값을 그대로 쓰지 않는다(로그 위조 방지).
-    // 이미 참여한 방이면 다시 조회하지 않으므로, 연결 하나가 만드는 방과 Redis 조회는 허용 목록 수(시세 16 + 자금 흐름 2)를 넘지 않는다.
+    // 이미 참여한 방이면 다시 조회하지 않으므로, 연결 하나가 만드는 방과 Redis 조회는 허용 목록 수(Yahoo 27 + KRX 일별 21 + 공시 1)를 넘지 않는다.
     socket.on('subscribe_market', async (symbol: unknown) => {
       if (!isSubscribableSymbol(symbol)) {
         subscribeRejectedTotal.inc({ event: 'subscribe', reason: 'unknown_symbol' });
@@ -269,14 +240,10 @@ export const initMarketGateway = (io: Server) => {
       socket.join(symbol);
       console.log(`Client ${socket.id} subscribed to ${symbol}`);
 
-      // Send the most recent cached value immediately upon subscription (자금 흐름 방은 최신 flow)
+      // Send the most recent cached value immediately upon subscription
       try {
-        const flowMarket = symbol.startsWith('flows:') ? symbol.slice('flows:'.length) : undefined;
         if (symbol === DISCLOSURE_ROOM) {
           // 공시 목록의 첫 화면은 REST로 받는다. 방에는 참여만 한다.
-        } else if (flowMarket !== undefined) {
-          const latestFlow = isFlowMarket(flowMarket) ? await marketService.readLatestFlowForSubscribe(flowMarket) : null;
-          if (latestFlow) socket.emit('flow', latestFlow);
         } else {
           // KRX 일별 지수는 캐시가 비어 있거나 Redis가 끊겼으면 DB의 마지막 값으로 채운다 (T-67, T-160)
           const latestTick = (await marketService.readLatestTickForSubscribe(symbol))

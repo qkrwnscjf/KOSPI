@@ -18,23 +18,6 @@ export interface TickData {
 
 type TickListener = (tick: TickData) => void
 
-// 증시 자금 흐름 (docs/Task_ORDER.md 11단계 A). 금액 단위는 백만원
-export interface InvestorFlowData {
-  market: 'KOSPI' | 'KOSDAQ'
-  time: number
-  foreignNet: number
-  institutionNet: number
-  individualNet: number
-  status: 'provisional' | 'final'
-  source: string
-}
-
-type FlowListener = (flow: InvestorFlowData) => void
-
-const flowRoom = (market: InvestorFlowData['market']) => `flows:${market}`
-const flowListeners = new Map<string, Set<FlowListener>>()
-const latestFlows = new Map<string, InvestorFlowData>()
-
 // DART 공시 (docs/Task_ORDER.md 12단계). 서버가 보내는 필드만 있다 (개인 이름 없음)
 export interface DisclosureData {
   rceptNo: string
@@ -79,9 +62,6 @@ function getSocket() {
     for (const symbol of listeners.keys()) {
       created.emit('subscribe_market', symbol)
     }
-    for (const room of flowListeners.keys()) {
-      created.emit('subscribe_market', room)
-    }
     if (disclosureListeners.size > 0) created.emit('subscribe_market', DISCLOSURE_ROOM)
   })
   created.on('disconnect', () => {
@@ -101,16 +81,6 @@ function getSocket() {
     lastReceivedAt = Date.now()
     notifyStatus()
     listeners.get(tick.symbol)?.forEach(listener => listener(tick))
-  })
-
-  created.on('flow', (flow: InvestorFlowData) => {
-    const room = flowRoom(flow.market)
-    const previous = latestFlows.get(room)
-    if (previous && flow.time < previous.time) return
-    latestFlows.set(room, flow)
-    lastReceivedAt = Date.now()
-    notifyStatus()
-    flowListeners.get(room)?.forEach(listener => listener(flow))
   })
 
   created.on('disclosure', (disclosure: DisclosureData) => {
@@ -167,33 +137,6 @@ export function subscribeTicks(symbol: string, listener: TickListener): () => vo
     if (set.size === 0) {
       listeners.delete(symbol)
       if (current.connected) current.emit('unsubscribe_market', symbol)
-    }
-  }
-}
-
-// 시장의 자금 흐름을 구독한다 (같은 소켓, 방 이름 `flows:<시장>`). 이미 받은 최신값이 있으면 바로 한 번 전달한다.
-export function subscribeFlows(market: InvestorFlowData['market'], listener: FlowListener): () => void {
-  const current = getSocket()
-  const room = flowRoom(market)
-
-  let roomListeners = flowListeners.get(room)
-  if (!roomListeners) {
-    roomListeners = new Set()
-    flowListeners.set(room, roomListeners)
-    if (current.connected) current.emit('subscribe_market', room)
-  }
-  roomListeners.add(listener)
-
-  const cached = latestFlows.get(room)
-  if (cached) listener(cached)
-
-  return () => {
-    const set = flowListeners.get(room)
-    if (!set) return
-    set.delete(listener)
-    if (set.size === 0) {
-      flowListeners.delete(room)
-      if (current.connected) current.emit('unsubscribe_market', room)
     }
   }
 }

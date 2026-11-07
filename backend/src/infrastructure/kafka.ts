@@ -9,15 +9,12 @@ export const kafka = new Kafka({
 });
 
 export const producer = kafka.producer();
-export const consumer = kafka.consumer({ groupId: 'market-group' });
 
 // 토픽 구성 (docs/Task_ORDER.md T-11, D-17)
+// 투자자별 흐름(investor-flows)은 보내는 수집기가 없어 T-164에서 지웠다(로컬 볼륨의 토픽도 2026-11-07 삭제)
 export const TOPICS = {
   ticks: 'market-ticks',
   dlq: 'market-ticks.dlq',
-  // 증시 자금 흐름 (docs/Task_ORDER.md 11단계, D-44)
-  flows: 'investor-flows',
-  flowsDlq: 'investor-flows.dlq',
   // KRX 일별 지수 (T-67): 하루 1개 값이라 원본 tick(market-ticks, 3시간 보관)과 섞지 않는다
   indexDaily: 'index-daily',
   indexDailyDlq: 'index-daily.dlq',
@@ -47,7 +44,7 @@ export const TOPICS = {
 const TICKS_PARTITIONS = Number.parseInt(process.env.KAFKA_TOPIC_PARTITIONS ?? '', 10) || 1;
 const TICKS_RETENTION_MS = 24 * 60 * 60 * 1000; // 24시간: DB Sink가 하루 멈춰도 다시 채울 수 있는 재처리 버퍼
 const DLQ_RETENTION_MS = 7 * 24 * 60 * 60 * 1000; // 7일: 잘못된 메시지 원인 분석용
-const FLOWS_RETENTION_MS = 7 * 24 * 60 * 60 * 1000; // 7일: 하루 수천 건 이하라 길게 둬도 작음. DB Sink가 며칠 멈춰도 다시 채울 수 있음
+const DAILY_TOPIC_RETENTION_MS = 7 * 24 * 60 * 60 * 1000; // 7일: 하루 수천 건 이하라 길게 둬도 작음. DB Sink가 며칠 멈춰도 다시 채울 수 있음
 
 const topicDefinition = (topic: string, retentionMs: number, numPartitions = 1) => ({
   topic,
@@ -59,10 +56,8 @@ const topicDefinition = (topic: string, retentionMs: number, numPartitions = 1) 
 const TOPIC_DEFINITIONS = [
   topicDefinition(TOPICS.ticks, TICKS_RETENTION_MS, TICKS_PARTITIONS),
   topicDefinition(TOPICS.dlq, DLQ_RETENTION_MS),
-  topicDefinition(TOPICS.flows, FLOWS_RETENTION_MS),
-  topicDefinition(TOPICS.flowsDlq, DLQ_RETENTION_MS),
   // KRX 일별 지수·DART 공시도 하루 수백 건 이하라 7일 보관 (DB Sink가 며칠 멈춰도 다시 채울 수 있음)
-  ...[TOPICS.indexDaily, TOPICS.disclosures, TOPICS.breadth, TOPICS.rankings, TOPICS.marketFlows, TOPICS.yahooDaily, TOPICS.yahooBars, TOPICS.ingestionRuns].map(topic => topicDefinition(topic, FLOWS_RETENTION_MS)),
+  ...[TOPICS.indexDaily, TOPICS.disclosures, TOPICS.breadth, TOPICS.rankings, TOPICS.marketFlows, TOPICS.yahooDaily, TOPICS.yahooBars, TOPICS.ingestionRuns].map(topic => topicDefinition(topic, DAILY_TOPIC_RETENTION_MS)),
   ...[TOPICS.indexDailyDlq, TOPICS.disclosuresDlq, TOPICS.breadthDlq, TOPICS.rankingsDlq, TOPICS.marketFlowsDlq, TOPICS.yahooDailyDlq, TOPICS.yahooBarsDlq, TOPICS.ingestionRunsDlq].map(topic => topicDefinition(topic, DLQ_RETENTION_MS)),
 ];
 
@@ -99,9 +94,8 @@ export async function ensureTopics() {
 
 // 잘못된 메시지를 원본 그대로 DLQ에 보낸다 (docs/Task_ORDER.md T-13, D-19).
 // 실패해도 예외를 던지지 않는다. 컨슈머가 같은 메시지에서 멈추지 않게 하기 위함.
-// 원래 토픽에 맞는 DLQ로 보낸다 (market-ticks → market-ticks.dlq, investor-flows → investor-flows.dlq 등)
+// 원래 토픽에 맞는 DLQ로 보낸다 (market-ticks → market-ticks.dlq, index-daily → index-daily.dlq 등)
 const DLQ_FOR: Record<string, string> = {
-  [TOPICS.flows]: TOPICS.flowsDlq,
   [TOPICS.indexDaily]: TOPICS.indexDailyDlq,
   [TOPICS.disclosures]: TOPICS.disclosuresDlq,
   [TOPICS.breadth]: TOPICS.breadthDlq,
