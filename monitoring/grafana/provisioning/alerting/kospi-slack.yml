@@ -9,10 +9,14 @@ apiVersion: 1
 templates:
   - orgId: 1
     name: kospi-slack
+    # 발생과 해결을 나눠 보여 준다(2026-11-08). 요약 문구는 규칙에 고정된 "문제" 설명이라 해결된 알림에는 쓰지 않는다
     template: |
-      {{ define "kospi.slack.title" }}[{{ .Status }}] KOSPI 파이프라인 알림 {{ len .Alerts }}건{{ end }}
-      {{ define "kospi.slack.text" }}{{ range .Alerts }}• {{ .Labels.alertname }} ({{ .Labels.severity }}, {{ .Status }}) {{ .Annotations.summary }}
-      {{ end }}{{ end }}
+      {{ define "kospi.slack.title" }}KOSPI 파이프라인 알림 — 발생 {{ len .Alerts.Firing }}건 · 해결 {{ len .Alerts.Resolved }}건{{ end }}
+      {{ define "kospi.slack.text" }}{{ if .Alerts.Firing }}*발생*
+      {{ range .Alerts.Firing }}• {{ .Labels.alertname }} ({{ .Labels.severity }}): {{ .Annotations.summary }}
+      {{ end }}{{ end }}{{ if .Alerts.Resolved }}*해결*
+      {{ range .Alerts.Resolved }}• {{ .Labels.alertname }}{{ if .Labels.job }} ({{ .Labels.job }}){{ end }}: 정상으로 돌아왔습니다.
+      {{ end }}{{ end }}{{ end }}
 
 contactPoints:
   - orgId: 1
