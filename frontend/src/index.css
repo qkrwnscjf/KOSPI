@@ -22,8 +22,6 @@
     --color-up: 21 128 61;            /* 상승 */
     --color-down: 220 38 38;          /* 하락 */
     --color-neon: 2 132 199;          /* 강조 (아이콘·테두리·빛에만, 글자에는 쓰지 않음) */
-    --color-holiday: 220 38 38;       /* 달력의 일요일·공휴일 (T-167, 달력 날짜에만) */
-    --color-saturday: 37 99 235;      /* 달력의 토요일 (T-167, 달력 날짜에만) */
     --glow-strength: 0.10;            /* 배경 빛 번짐 세기 */
     color-scheme: light;
   }
@@ -38,8 +36,6 @@
     --color-up: 74 222 128;
     --color-down: 248 113 113;
     --color-neon: 56 189 248;
-    --color-holiday: 248 113 113;
-    --color-saturday: 96 165 250;
     --glow-strength: 0.14;
     color-scheme: dark;
   }
