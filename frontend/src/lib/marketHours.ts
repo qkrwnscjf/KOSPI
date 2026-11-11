@@ -26,26 +26,40 @@ export function marketBadge(timeOpen: boolean, state: MarketState | undefined): 
 const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
 const formatters = new Map<string, Intl.DateTimeFormat>()
 
-// 주어진 시간대의 요일(0=일요일)과 자정 이후 분(minute)
+// 주어진 시간대의 요일(0=일요일), 자정 이후 분(minute), 날짜(YYYY-MM-DD)
 function zonedClock(date: Date, timeZone: string) {
   let formatter = formatters.get(timeZone)
   if (!formatter) {
-    formatter = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
+    formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone, year: 'numeric', month: '2-digit', day: '2-digit', weekday: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+    })
     formatters.set(timeZone, formatter)
   }
   const parts = formatter.formatToParts(date)
   const part = (type: Intl.DateTimeFormatPartTypes) => parts.find(p => p.type === type)?.value ?? ''
-  return { day: WEEKDAYS.indexOf(part('weekday')), minutes: Number(part('hour')) * 60 + Number(part('minute')) }
+  return {
+    day: WEEKDAYS.indexOf(part('weekday')),
+    minutes: Number(part('hour')) * 60 + Number(part('minute')),
+    date: `${part('year')}-${part('month')}-${part('day')}`,
+  }
 }
 
 const isWeekday = (day: number) => day >= 1 && day <= 5
 const hm = (hour: number, minute = 0) => hour * 60 + minute
 
+// 국내 특수 거래일 (T-166): backend market-hours.ts의 KRX_SPECIAL_SESSIONS와 같은 표다. 바꾸면 두 파일을 함께 고친다
+const KRX_SPECIAL_SESSIONS: Readonly<Record<string, { open: number; close: number }>> = {
+  '2026-11-19': { open: hm(10), close: hm(16, 30) }, // 대학수학능력시험
+  '2027-01-04': { open: hm(10), close: hm(15, 30) }, // 새해 첫 거래일
+}
+const KRX_REGULAR_SESSION = { open: hm(9), close: hm(15, 30) }
+
 export function isMarketOpen(market: MarketId, now: Date): boolean {
   if (market === 'krx') {
-    // KOSPI, KOSDAQ: 월~금 09:00 ~ 15:30 (서울)
-    const { day, minutes } = zonedClock(now, 'Asia/Seoul')
-    return isWeekday(day) && minutes >= hm(9) && minutes < hm(15, 30)
+    // KOSPI, KOSDAQ: 월~금 09:00 ~ 15:30 (서울). 특수 거래일은 표의 시간
+    const { day, minutes, date } = zonedClock(now, 'Asia/Seoul')
+    const session = KRX_SPECIAL_SESSIONS[date] ?? KRX_REGULAR_SESSION
+    return isWeekday(day) && minutes >= session.open && minutes < session.close
   }
   if (market === 'tokyo') {
     // NIKKEI: 월~금 09:00 ~ 11:30, 12:30 ~ 15:30 (도쿄, 점심 휴장)

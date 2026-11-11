@@ -2,7 +2,7 @@
 // frontend/test/marketHours.test.ts에 같은 사례가 있다. 두 파일의 규칙이 어긋나면 한쪽이 실패한다 (D-36).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { MARKETS, YAHOO_MARKET, decideMarketStatus, type MarketId } from '../src/infrastructure/ingestion/market-hours.js';
+import { KRX_SPECIAL_SESSIONS, MARKETS, YAHOO_MARKET, decideMarketStatus, latestSessionEnd, type MarketId } from '../src/infrastructure/ingestion/market-hours.js';
 import { YAHOO_KEYS } from '../src/shared/symbols.js';
 
 const isOpen = (market: MarketId, iso: string) => {
@@ -40,6 +40,15 @@ const CASES: [MarketId, string, boolean, string][] = [
   ['taiwan', '2026-10-16T05:29:00Z', true, '금 13:29 대만'],
   ['taiwan', '2026-10-16T05:30:00Z', false, '금 13:30 대만 (마감)'],
   ['taiwan', '2026-10-16T00:59:00Z', false, '금 08:59 대만'],
+  // 국내 특수 거래일 (T-166)
+  ['krx', '2026-11-19T00:30:00Z', false, '수능일 09:30 KST (1시간 늦게 개장)'],
+  ['krx', '2026-11-19T01:00:00Z', true, '수능일 10:00 KST (개장)'],
+  ['krx', '2026-11-19T07:29:00Z', true, '수능일 16:29 KST'],
+  ['krx', '2026-11-19T07:30:00Z', false, '수능일 16:30 KST (마감)'],
+  ['krx', '2026-11-20T00:00:00Z', true, '수능 다음 날 09:00 KST (평소대로)'],
+  ['krx', '2027-01-04T00:30:00Z', false, '새해 첫 거래일 09:30 KST'],
+  ['krx', '2027-01-04T01:00:00Z', true, '새해 첫 거래일 10:00 KST (개장)'],
+  ['krx', '2027-01-04T06:30:00Z', false, '새해 첫 거래일 15:30 KST (마감)'],
 ];
 
 for (const [market, iso, expected, label] of CASES) {
@@ -68,6 +77,26 @@ test('decideMarketStatus: 장 시간인데 소스가 모두 닫혀 있으면 hol
   assert.equal(decideMarketStatus(true, ['CLOSED', 'CLOSED']), 'holiday');
   assert.equal(decideMarketStatus(true, ['CLOSED', undefined]), 'holiday');
   assert.equal(decideMarketStatus(true, ['PRE', 'POST']), 'holiday');
+});
+
+test('latestSessionEnd: 수능일은 16:30 마감이라 공식 종가를 17:00부터 받는다 (T-166)', () => {
+  const margin = 30 * 60_000;
+  const iso = (value: number | null) => (value === null ? null : new Date(value).toISOString().slice(0, 16));
+  // 수능일 16:10 KST: 평소라면 마감 + 30분이 지났지만 아직 장중이라 전날(수) 장
+  assert.equal(iso(latestSessionEnd('krx', Date.parse('2026-11-19T07:10:00Z'), margin)), '2026-11-18T06:30');
+  // 수능일 17:00 KST: 그날 16:30 마감
+  assert.equal(iso(latestSessionEnd('krx', Date.parse('2026-11-19T08:00:00Z'), margin)), '2026-11-19T07:30');
+  // 다음 날 10:00 KST: 직전 장은 수능일(16:30 마감)
+  assert.equal(iso(latestSessionEnd('krx', Date.parse('2026-11-20T01:00:00Z'), margin)), '2026-11-19T07:30');
+});
+
+test('KRX_SPECIAL_SESSIONS: 날짜 형식과 시간 범위가 올바르다 (T-166)', () => {
+  for (const [date, session] of Object.entries(KRX_SPECIAL_SESSIONS)) {
+    assert.match(date, /^\d{4}-\d{2}-\d{2}$/, date);
+    assert.ok(session.open < session.close, date);
+    const weekday = new Date(`${date}T00:00:00Z`).getUTCDay();
+    assert.ok(weekday >= 1 && weekday <= 5, `${date}는 평일이어야 한다`);
+  }
 });
 
 test('모든 Yahoo 지표에 시장이 지정되어 있다', () => {

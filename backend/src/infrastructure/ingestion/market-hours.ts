@@ -58,12 +58,15 @@ const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
 const formatters = new Map<string, Intl.DateTimeFormat>();
 
-// 주어진 시간대의 요일(0=일요일)과 자정 이후 분(minute)을 구한다.
+// 주어진 시간대의 요일(0=일요일), 자정 이후 분(minute), 날짜(YYYY-MM-DD)를 구한다.
 function zonedClock(date: Date, timeZone: string) {
   let formatter = formatters.get(timeZone);
   if (!formatter) {
     formatter = new Intl.DateTimeFormat('en-US', {
       timeZone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
       weekday: 'short',
       hour: '2-digit',
       minute: '2-digit',
@@ -76,15 +79,27 @@ function zonedClock(date: Date, timeZone: string) {
   return {
     day: WEEKDAYS.indexOf(part('weekday')),
     minutes: Number(part('hour')) * 60 + Number(part('minute')),
+    date: `${part('year')}-${part('month')}-${part('day')}`,
   };
 }
 
 const isWeekday = (day: number) => day >= 1 && day <= 5;
 const hm = (hour: number, minute = 0) => hour * 60 + minute;
 
-// 정규 장 마감 시각 (T-145). 24시간 시장은 하루 종가의 기준이 없어 넣지 않는다
+// 국내 특수 거래일 (docs/Task_ORDER.md T-166, BENCHMARK B-69): 거래소가 그날만 장 시간을 바꾸는 날(수능일, 새해 첫 거래일).
+// 요일 규칙으로 알 수 없어 서울 날짜별로 적는다. 거래소 공지로 확인한 날짜만 넣는다.
+// frontend/src/lib/marketHours.ts에 같은 표가 있다. 바꾸면 두 파일을 함께 고친다.
+// 이 표를 쓰는 곳: 장 열림(수집 요청·지연 측정·그래프 공백 판단·화면 배지), 마감 시각(공식 종가를 받는 시점, T-145)
+export const KRX_SPECIAL_SESSIONS: Readonly<Record<string, { open: number; close: number; reason: string }>> = {
+  '2026-11-19': { open: hm(10), close: hm(16, 30), reason: '대학수학능력시험: 개장·마감 1시간씩 늦춤' },
+  '2027-01-04': { open: hm(10), close: hm(15, 30), reason: '새해 첫 거래일: 개장 1시간 늦춤' },
+};
+const KRX_REGULAR_SESSION = { open: hm(9), close: hm(15, 30) };
+export const krxSession = (seoulDate: string) => KRX_SPECIAL_SESSIONS[seoulDate] ?? KRX_REGULAR_SESSION;
+
+// 정규 장 마감 시각 (T-145). 24시간 시장은 하루 종가의 기준이 없어 넣지 않는다. 국내는 특수 거래일이면 그날 마감 시각을 쓴다(T-166)
 const SESSION_CLOSE: Partial<Record<MarketId, { timeZone: string; close: number }>> = {
-  krx: { timeZone: 'Asia/Seoul', close: hm(15, 30) },
+  krx: { timeZone: 'Asia/Seoul', close: KRX_REGULAR_SESSION.close },
   us_equity: { timeZone: 'America/New_York', close: hm(16) },
   tokyo: { timeZone: 'Asia/Tokyo', close: hm(15, 30) },
   taiwan: { timeZone: 'Asia/Taipei', close: hm(13, 30) },
@@ -96,22 +111,28 @@ export function latestSessionEnd(market: MarketId, nowMs: number, marginMs: numb
   const session = SESSION_CLOSE[market];
   if (!session) return null;
   const at = nowMs - marginMs;
-  const { day, minutes } = zonedClock(new Date(at), session.timeZone);
-  const todayClose = at - (minutes - session.close) * 60_000;
-  for (let back = minutes >= session.close ? 0 : 1; back <= 7; back += 1) {
-    const candidate = todayClose - back * 86_400_000;
-    if (isWeekday((day - back + 7) % 7)) return candidate;
+  const { day, minutes, date } = zonedClock(new Date(at), session.timeZone);
+  const closeOn = (back: number) => {
+    if (market !== 'krx') return session.close;
+    return krxSession(back === 0 ? date : zonedClock(new Date(at - back * 86_400_000), session.timeZone).date).close;
+  };
+  for (let back = 0; back <= 7; back += 1) {
+    if (!isWeekday((day - back + 7) % 7)) continue;
+    const close = closeOn(back);
+    if (back === 0 && minutes < close) continue; // 오늘 장은 아직 끝나지 않음
+    return at - (minutes - close) * 60_000 - back * 86_400_000;
   }
   return null;
 }
 
 export const MARKETS: { id: MarketId; isOpen: (now: Date) => boolean }[] = [
   {
-    // KOSPI, KOSDAQ: 월~금 09:00 ~ 15:30 (서울)
+    // KOSPI, KOSDAQ: 월~금 09:00 ~ 15:30 (서울). 특수 거래일은 KRX_SPECIAL_SESSIONS의 시간 (T-166)
     id: 'krx',
     isOpen: now => {
-      const { day, minutes } = zonedClock(now, 'Asia/Seoul');
-      return isWeekday(day) && minutes >= hm(9) && minutes < hm(15, 30);
+      const { day, minutes, date } = zonedClock(now, 'Asia/Seoul');
+      const session = krxSession(date);
+      return isWeekday(day) && minutes >= session.open && minutes < session.close;
     },
   },
   {
