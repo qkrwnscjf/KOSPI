@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react'
 import { motion } from 'framer-motion'
 import { ChevronLeft, ChevronRight, ExternalLink } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import { CALENDAR_LABELS, CALENDAR_TYPES, monthGrid, monthOf, shiftMonth, type CalendarType } from '@/lib/calendar'
+import { CALENDAR_LABELS, CALENDAR_TYPES, dayKind, holidayName, monthGrid, monthOf, shiftMonth, type CalendarType, type DayKind } from '@/lib/calendar'
 import { dartViewerUrl, seoulToday } from '@/lib/disclosures'
 import { useCalendarDay, useDisclosureCalendar } from '@/hooks/useAnalytics'
 
@@ -19,6 +19,11 @@ const TYPE_STYLE: Record<CalendarType, string> = {
   report: 'bg-fg/30',
 }
 
+// 일요일·공휴일은 빨강, 토요일은 파랑 (T-167). 공휴일은 이름을 함께 적어 색만으로 구분하지 않는다
+const DAY_TEXT: Record<DayKind, string> = { holiday: 'text-holiday', sunday: 'text-holiday', saturday: 'text-saturday', weekday: '' }
+const DAY_TINT: Record<DayKind, string> = { holiday: 'bg-holiday/[0.05]', sunday: 'bg-holiday/[0.05]', saturday: 'bg-saturday/[0.05]', weekday: '' }
+const WEEKDAY_TEXT: Record<string, string> = { 토: 'text-saturday', 일: 'text-holiday' }
+
 function TypeDot({ type }: { type: CalendarType }) {
   return <span className={cn('inline-block h-2 w-2 shrink-0 rounded-full', TYPE_STYLE[type])} aria-hidden />
 }
@@ -26,9 +31,12 @@ function TypeDot({ type }: { type: CalendarType }) {
 function DayDetail({ date, filter }: { date: string; filter: Set<CalendarType> }) {
   const { data, status } = useCalendarDay(date)
   const items = (data?.items ?? []).filter(item => filter.has(item.type))
+  const holiday = holidayName(date)
   return (
     <div className={cn(cardClass, 'flex flex-col p-5')}>
-      <h3 className="mb-3 text-[13px] font-medium text-fg-muted">{date} 공시 <span className="text-[11px]">({items.length}건)</span></h3>
+      <h3 className="mb-3 text-[13px] font-medium text-fg-muted">
+        <span className={DAY_TEXT[dayKind(date)]}>{date}{holiday && ` · ${holiday}`}</span> 공시 <span className="text-[11px]">({items.length}건)</span>
+      </h3>
       {status === 'loading' && <p className="py-6 text-center text-xs text-fg-muted">불러오는 중</p>}
       {status === 'error' && <p className="py-6 text-center text-xs text-fg-muted">데이터를 불러오지 못했습니다</p>}
       {status === 'loaded' && items.length === 0 && <p className="py-6 text-center text-xs text-fg-muted">이 날의 공시가 없습니다</p>}
@@ -114,19 +122,26 @@ export function EarningsCalendar() {
       <div className="grid w-full grid-cols-1 gap-5 xl:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
         <div className={cn(cardClass, 'overflow-x-auto p-3 md:p-4')}>
           <div className="grid min-w-[560px] grid-cols-7 gap-1">
-            {WEEKDAYS.map(day => <div key={day} className="pb-1 text-center text-[11px] font-medium text-fg-muted">{day}</div>)}
+            {WEEKDAYS.map(day => <div key={day} className={cn('pb-1 text-center text-[11px] font-medium text-fg-muted', WEEKDAY_TEXT[day])}>{day}</div>)}
             {weeks.flat().map((date, index) => {
               if (date === null) return <div key={`empty-${index}`} className="min-h-[92px]" />
               const day = byDate.get(date)
               const counts = CALENDAR_TYPES.filter(type => filter.has(type)).map(type => [type, day?.[type] ?? 0] as const).filter(([, count]) => count > 0)
               const highlights = (day?.highlights ?? []).filter(item => filter.has(item.type)).slice(0, 3)
               const isSelected = selected === date
+              const kind = dayKind(date)
+              const holiday = holidayName(date)
               return (
                 <button key={date} type="button" onClick={() => setSelected(date)} aria-pressed={isSelected}
                   className={cn('flex min-h-[92px] flex-col gap-1 rounded-lg border p-1.5 text-left transition-colors duration-150',
-                    isSelected ? 'border-neon/60 bg-neon/5' : 'border-line hover:border-line-strong',
+                    isSelected ? 'border-neon/60 bg-neon/5' : cn('border-line hover:border-line-strong', DAY_TINT[kind]),
                     date === today && 'ring-1 ring-inset ring-fg/30')}>
-                  <span className={cn('text-[11px] tabular-nums', date === today ? 'font-semibold text-fg' : 'text-fg-muted')}>{Number(date.slice(8))}</span>
+                  <span className="flex items-baseline gap-1">
+                    <span className={cn('text-[11px] tabular-nums', date === today ? 'font-semibold text-fg' : 'text-fg-muted', DAY_TEXT[kind], kind !== 'weekday' && 'font-medium')}>
+                      {Number(date.slice(8))}
+                    </span>
+                    {holiday && <span className="truncate text-[10px] leading-3 text-holiday">{holiday}</span>}
+                  </span>
                   {counts.map(([type, count]) => (
                     <span key={type} className="flex items-center gap-1 text-[10px] leading-3 text-fg">
                       <TypeDot type={type} /> {CALENDAR_LABELS[type]} {count}
@@ -146,7 +161,7 @@ export function EarningsCalendar() {
 
       <p className="text-[11px] leading-relaxed text-fg-muted">
         출처: 금융감독원 DART(유가증권시장). 이미 접수된 공시만 보여 주며, 앞으로의 발표 예정일은 다루지 않습니다.
-        {since && ` 수집 시작 ${since}.`} 정정 공시는 빼고 원 공시만 셉니다.
+        {since && ` 수집 시작 ${since}.`} 정정 공시는 빼고 원 공시만 셉니다. 날짜 색: <span className="text-holiday">일요일·공휴일</span>, <span className="text-saturday">토요일</span>.
       </p>
     </motion.div>
   )
