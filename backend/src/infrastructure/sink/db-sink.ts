@@ -711,12 +711,14 @@ async function logTelemetryLevel() {
 
 // TimescaleDB 작업 오류 기록 (T-147): 누적 실패 수만으로는 원인을 알 수 없어(B-52) 처음 보는 오류를 로그로 남긴다.
 // 기동 때는 DB에 남아 있는 최근 오류(최대 5건)도 함께 남긴다. 이 조회가 실패해도 수집에는 영향이 없다.
-let lastJobErrorAt: Date | null = null;
+// 마지막으로 남긴 오류 시각은 DB 값 그대로(마이크로초까지 담긴 문자열) 보관한다 (T-169, B-71).
+// JS Date로 받으면 밀리초로 잘려, 같은 오류가 다음 조회에서 "더 새로운 오류"로 다시 잡혀 5분마다 반복됐다(B-62 관찰)
+let lastJobErrorAt: string | null = null;
 
 async function logJobErrors() {
   try {
-    const { rows } = await dbPool.query<{ job_id: number; proc_name: string; hypertable_name: string | null; finish_time: Date; sqlerrcode: string | null; err_message: string | null }>(
-      `SELECT e.job_id, e.proc_name, j.hypertable_name, e.finish_time, e.sqlerrcode, e.err_message
+    const { rows } = await dbPool.query<{ job_id: number; proc_name: string; hypertable_name: string | null; finish_time: Date; finish_key: string; sqlerrcode: string | null; err_message: string | null }>(
+      `SELECT e.job_id, e.proc_name, j.hypertable_name, e.finish_time, e.finish_time::text AS finish_key, e.sqlerrcode, e.err_message
        FROM timescaledb_information.job_errors e
        LEFT JOIN timescaledb_information.jobs j ON j.job_id = e.job_id
        WHERE $1::timestamptz IS NULL OR e.finish_time > $1::timestamptz
@@ -730,7 +732,7 @@ async function logJobErrors() {
         at: row.finish_time, code: safeLogText(row.sqlerrcode ?? '', 10), message: safeLogText(row.err_message ?? '', 200),
       })}`);
     }
-    lastJobErrorAt = rows[0]?.finish_time ?? lastJobErrorAt ?? new Date();
+    lastJobErrorAt = rows[0]?.finish_key ?? lastJobErrorAt ?? new Date().toISOString();
   } catch (error) {
     console.warn(`DB job error check failed: ${error instanceof Error ? error.message : String(error)}`);
   }
