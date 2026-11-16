@@ -16,6 +16,14 @@ export const CLOSE_FIX_MARGIN_MS = 30 * 60_000;
 export const shouldRefreshClose = (lastFetchedMs: number | undefined, sessionEndMs: number | null, marginMs = CLOSE_FIX_MARGIN_MS) =>
   sessionEndMs !== null && (lastFetchedMs === undefined || lastFetchedMs < sessionEndMs + marginMs);
 
+// 받은 일봉에 그 장의 날짜 봉이 없으면 다음 확인(30분 뒤)에 다시 받는다 (T-171, B-73).
+// 소스가 그날 봉을 늦게 주는 경우 한 번만 받고 끝내면 다음 장까지 빠져 있었다(11/11 지수 4종 close_missing).
+// 공휴일처럼 끝내 없는 날을 위해 횟수를 제한한다(30분 간격 6회 = 약 3시간)
+export const CLOSE_DAY_MAX_TRIES = 6;
+export const closeFetchDone = (found: boolean, attempts: number, maxTries = CLOSE_DAY_MAX_TRIES) => found || attempts >= maxTries;
+// 일봉 행의 거래일(YYYY-MM-DD). 행 시각은 그 거래일 15:30 KST(06:30 UTC)라 UTC 날짜와 같다
+export const rowDay = (row: DailyRow) => new Date(row.time).toISOString().slice(0, 10);
+
 export interface DailyBar {
   time: Date;
   price: number;

@@ -5,7 +5,7 @@
 
 import { KRX_DAILY_KEYS } from '../../shared/krx-indices.js';
 import { MARKET_FLOW_METRICS } from '../../shared/market-flows.js';
-import { YAHOO_KEYS, type YahooSymbolKey } from '../../shared/symbols.js';
+import { KRX_STOCK_BY_CODE, YAHOO_KEYS, type YahooSymbolKey } from '../../shared/symbols.js';
 import { BAR_RESOLUTIONS, type BarResolution } from '../../shared/yahoo-bars.js';
 import { latestSessionEnd, MARKETS, YAHOO_MARKET, type MarketId } from '../ingestion/market-hours.js';
 import { safeLogText } from '../http-json.js';
@@ -62,6 +62,11 @@ export function evalCloseMissing(latestDaily: ReadonlyMap<string, number>, nowMs
   return issues('yahoo_chart', 'close_missing', missing);
 }
 
+// rate_consistency 경고 문구 (T-170): 지표, 걸린 tick 수, 최대 차이(%p), 최근 tick의 등락률과 등락폭으로 계산한 등락률
+const round2 = (value: number) => Math.round(value * 100) / 100;
+export const rateIssueDetail = (row: { symbol: string; n: number; max_diff: number; rate: number; implied: number }) =>
+  `${row.symbol}:n=${row.n},max_diff=${round2(row.max_diff)}%p,rate=${round2(row.rate)}%,implied=${round2(row.implied)}%`;
+
 // 있어야 할 날짜(expected)에 없는 항목. 항목이 시작된 날 이전은 보지 않는다.
 export function evalMissingDays(expected: readonly string[], present: ReadonlyMap<string, readonly string[]>, keys: readonly string[]): string[] {
   return keys.flatMap(key => {
@@ -101,7 +106,8 @@ export const RUN_LIMITS: Record<string, number> = {
   kofia: 13 * HOUR,
 };
 
-const STOCK_CODES: Record<string, string> = { '005930': 'SAMSUNG', '000660': 'SK_HYNIX', '005380': 'HYUNDAI' };
+// 종목코드 → 심볼. 표는 shared/symbols.ts 한 곳 (T-172)
+const STOCK_CODES: Record<string, string> = Object.fromEntries(KRX_STOCK_BY_CODE);
 const CROSS_TOLERANCE_RATIO = 0.0001; // 0.01%. 반올림 차이만 허용한다
 
 // ── 검사 묶음 ──
@@ -117,16 +123,22 @@ async function yahooQuoteChecks(query: QueryFn, nowMs: number): Promise<DqResult
        SELECT symbol, price, lag(price) OVER (PARTITION BY symbol ORDER BY time) AS prev FROM market_ticks
      ) t WHERE prev > 0 AND abs(price / prev - 1) > 0.2`
   );
-  // 등락률은 등락폭 ÷ 전일 종가와 맞아야 한다 (같은 응답의 값끼리 비교)
+  // 등락률은 등락폭 ÷ 전일 종가와 맞아야 한다 (같은 응답의 값끼리 비교).
+  // 걸리면 원인을 볼 수 있도록 지표마다 건수·최대 차이·최근 값을 결과에 함께 남긴다 (T-170, B-74). 공개 시세의 숫자만
   const rates = await query(
-    `SELECT DISTINCT symbol FROM market_ticks
-     WHERE price - change_price > 0 AND abs(change_rate - change_price / (price - change_price) * 100) > 0.1`
+    `SELECT symbol, count(*)::int AS n,
+            max(abs(change_rate - change_price / (price - change_price) * 100))::float8 AS max_diff,
+            (array_agg(change_rate ORDER BY time DESC))[1]::float8 AS rate,
+            (array_agg(change_price / (price - change_price) * 100 ORDER BY time DESC))[1]::float8 AS implied
+     FROM market_ticks
+     WHERE price - change_price > 0 AND abs(change_rate - change_price / (price - change_price) * 100) > 0.1
+     GROUP BY symbol`
   );
   return [
     evalFreshness(new Map(latest.rows.map(row => [row.symbol as string, row.ms as number])), nowMs),
     issues('yahoo_quote', 'future_time', future.rows.map(row => row.symbol), 'fail'),
     issues('yahoo_quote', 'price_jump', jumps.rows.map(row => row.symbol)),
-    issues('yahoo_quote', 'rate_consistency', rates.rows.map(row => row.symbol)),
+    issues('yahoo_quote', 'rate_consistency', rates.rows.map(row => rateIssueDetail(row))),
     ...(await Promise.all(BAR_RESOLUTIONS.map(resolution => graphGap(query, resolution, nowMs)))),
   ];
 }

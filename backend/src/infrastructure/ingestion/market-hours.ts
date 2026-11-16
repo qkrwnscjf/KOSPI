@@ -105,6 +105,12 @@ const SESSION_CLOSE: Partial<Record<MarketId, { timeZone: string; close: number 
   taiwan: { timeZone: 'Asia/Taipei', close: hm(13, 30) },
 };
 
+// 장 마감 시각이 속한 그 시장의 날짜(YYYY-MM-DD). 공식 종가에 그날 봉이 들어왔는지 볼 때 쓴다 (T-171). 24시간 시장은 null
+export function sessionDate(market: MarketId, ms: number): string | null {
+  const session = SESSION_CLOSE[market];
+  return session ? zonedClock(new Date(ms), session.timeZone).date : null;
+}
+
 // 마감 후 marginMs가 지난 가장 최근 평일 장의 마감 시각(ms). 공휴일은 시간표로 알 수 없어 평일로 친다(그날 봉이 없을 뿐이다).
 // 일수를 빼서 계산하므로 미국 서머타임이 바뀌는 주말을 건너뛸 때 1시간 어긋날 수 있다(받는 시점만 달라지고 값은 같다).
 export function latestSessionEnd(market: MarketId, nowMs: number, marginMs: number): number | null {

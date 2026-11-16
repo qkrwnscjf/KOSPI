@@ -3,6 +3,7 @@ import { Counter, Gauge, Latency, metricsConfig, startMetricsLog, startMetricsSe
 import { registerShutdown } from '../shutdown.js';
 import { isoDate, reportRun } from '../ingestion-report.js';
 import { KRX_DAILY_INDICES, KRX_DAILY_KEYS, KRX_HISTORY_KEYS, normalizeIndexName, type KrxEndpoint } from '../../shared/krx-indices.js';
+import { KRX_STOCK_BY_CODE } from '../../shared/symbols.js';
 import { fetchBreadthCoverage, fetchDailyIndexCoverage, fetchKrxHistoryDays, fetchRankingsCoverage } from '../backend-coverage.js';
 import type { TickData } from '../../shared/types.js';
 import { KrxApiError, KrxClient, readKrxConfig } from './krx-client.js';
@@ -440,7 +441,7 @@ async function backfillRankings(client: KrxClient) {
 const CLOSE_CHECK = process.env.KRX_CLOSE_CHECK === 'true';
 const CLOSE_CHECK_DAYS = 14;
 const CLOSE_CHECK_INDICES = new Map([['코스피', 'KOSPI'], ['코스피 200', 'KOSPI200']].map(([name, symbol]) => [normalizeIndexName(name!), symbol!]));
-const CLOSE_CHECK_STOCKS = new Map([['005930', 'SAMSUNG'], ['000660', 'SK_HYNIX'], ['005380', 'HYUNDAI']]);
+const CLOSE_CHECK_STOCKS = KRX_STOCK_BY_CODE; // 종목코드 표는 shared/symbols.ts 한 곳 (T-172)
 
 async function runCloseCheck(client: KrxClient) {
   console.warn('KRX_CLOSE_CHECK=true: logging official closes of 5 symbols for the last 2 weeks (verification only).');

@@ -1,8 +1,9 @@
 // 나중에 추가한 Yahoo 지표의 과거 일봉 테스트 (docs/Task_ORDER.md T-104 ③, D-67)
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { GAP_FILL_DAYS, missingWeekdays, needsDailyHistory, shouldRefreshClose, toDailyRows, usesOfficialDailyClose } from '../src/infrastructure/sink/daily-history.js';
-import { latestSessionEnd } from '../src/infrastructure/ingestion/market-hours.js';
+import { CLOSE_DAY_MAX_TRIES, closeFetchDone, GAP_FILL_DAYS, missingWeekdays, needsDailyHistory, rowDay, shouldRefreshClose, toDailyRows, usesOfficialDailyClose } from '../src/infrastructure/sink/daily-history.js';
+import { latestSessionEnd, sessionDate } from '../src/infrastructure/ingestion/market-hours.js';
+import { rateIssueDetail } from '../src/infrastructure/sink/data-quality.js';
 import { nextCollectDelay, RETRY_AFTER_ERROR_MS } from '../src/infrastructure/market-stats/collect-schedule.js';
 import { YAHOO_KEYS } from '../src/shared/symbols.js';
 import { setWallClockTimeout } from '../src/infrastructure/wall-clock-timer.js';
@@ -178,6 +179,29 @@ test('missingWeekdays: 집계·일봉 모두에 없는 평일만, 주말·최근
   assert.deepEqual(missingWeekdays(agg, daily, '2026-10-14', now), ['2026-10-20']);
   assert.deepEqual(missingWeekdays(agg, [], '2026-10-14', now), ['2026-10-20', '2026-10-23']);
   assert.deepEqual(missingWeekdays([], [], null, now), []); // 집계가 없으면 이음매 규칙이 맡음
+});
+
+test('sessionDate: 마감 시각이 속한 그 시장의 날짜, 24시간 시장은 null (T-171)', () => {
+  assert.equal(sessionDate('krx', Date.parse('2026-11-16T06:30:00Z')), '2026-11-16');
+  assert.equal(sessionDate('us_equity', Date.parse('2026-11-10T21:00:00Z')), '2026-11-10'); // 서울로는 11/11 06:00
+  assert.equal(sessionDate('taiwan', Date.parse('2026-11-16T05:30:00Z')), '2026-11-16');
+  assert.equal(sessionDate('global_24h', Date.parse('2026-11-16T06:30:00Z')), null);
+});
+
+test('closeFetchDone · rowDay: 그날 봉이 있으면 끝, 없으면 최대 횟수까지 다시 받는다 (T-171)', () => {
+  assert.equal(closeFetchDone(true, 1), true);
+  assert.equal(closeFetchDone(false, 1), false);
+  assert.equal(closeFetchDone(false, CLOSE_DAY_MAX_TRIES - 1), false);
+  assert.equal(closeFetchDone(false, CLOSE_DAY_MAX_TRIES), true); // 공휴일처럼 끝내 없는 날은 멈춘다
+  // 행 시각(15:30 KST)의 날짜가 거래일이고, 국내 봉(00:00 UTC)·미국 봉(14:30 UTC) 모두 그 장의 날짜와 맞는다
+  const rows = toDailyRows([bar('2026-11-16T00:00:00Z', 100)], Date.parse('2026-11-16T08:00:00Z'), Date.parse('2026-11-16T07:00:00Z'));
+  assert.deepEqual(rows.map(rowDay), [sessionDate('krx', Date.parse('2026-11-16T06:30:00Z'))]);
+  const us = toDailyRows([bar('2026-11-10T14:30:00Z', 100)], Date.parse('2026-11-10T22:00:00Z'), Date.parse('2026-11-10T21:30:00Z'));
+  assert.deepEqual(us.map(rowDay), [sessionDate('us_equity', Date.parse('2026-11-10T21:00:00Z'))]);
+});
+
+test('rateIssueDetail: 경고에 건수·최대 차이·최근 등락률을 함께 남긴다 (T-170)', () => {
+  assert.equal(rateIssueDetail({ symbol: 'BRENT', n: 12, max_diff: 0.4567, rate: 1.234, implied: 0.876 }), 'BRENT:n=12,max_diff=0.46%p,rate=1.23%,implied=0.88%');
 });
 
 test('같은 날짜가 두 번 오면 마지막 값을 쓰고, 날짜 순으로 정렬한다', () => {

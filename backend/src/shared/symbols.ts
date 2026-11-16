@@ -5,15 +5,30 @@ import { KRX_DAILY_KEYS } from './krx-indices.js';
 // 이전에는 yahoo-api.ts와 history.controller.ts에 따로 정의되어 있었다 (P-17).
 // 실시간 수집, 과거 데이터 채우기, History API가 모두 이 표를 쓴다.
 
+// 국내 대형주 종목코드 (docs/Task_ORDER.md T-172): Yahoo 심볼, KRX 공식 종가 대조(krx-collector 검증용),
+// 품질 검사의 종목 순위 대조(data-quality.ts)가 모두 이 표를 쓴다. 이전에는 세 곳에 따로 적혀 있었다
+export const KRX_STOCK_CODES = {
+  SAMSUNG: '005930', // 삼성전자
+  SK_HYNIX: '000660', // SK하이닉스
+  HYUNDAI: '005380', // 현대차
+} as const;
+
+export type KrxStockSymbol = keyof typeof KRX_STOCK_CODES;
+
+// 종목코드 → 내부 심볼
+export const KRX_STOCK_BY_CODE: ReadonlyMap<string, KrxStockSymbol> = new Map(
+  (Object.keys(KRX_STOCK_CODES) as KrxStockSymbol[]).map(symbol => [KRX_STOCK_CODES[symbol], symbol])
+);
+
 export const YAHOO_SYMBOLS = {
   // Domestic
   KOSPI: '^KS11',
   KOSDAQ: '^KQ11',
-  // 국내 전광판 확장 (D-67, T-103): 코스피 200과 대형주 3종(주가)
+  // 국내 전광판 확장 (D-67, T-103): 코스피 200과 대형주 3종(주가). 대형주는 종목코드 표에서 만든다 (T-172)
   KOSPI200: '^KS200',
-  SAMSUNG: '005930.KS', // 삼성전자
-  SK_HYNIX: '000660.KS', // SK하이닉스
-  HYUNDAI: '005380.KS', // 현대차
+  SAMSUNG: `${KRX_STOCK_CODES.SAMSUNG}.KS`,
+  SK_HYNIX: `${KRX_STOCK_CODES.SK_HYNIX}.KS`,
+  HYUNDAI: `${KRX_STOCK_CODES.HYUNDAI}.KS`,
   // Macro
   'USD/KRW': 'KRW=X',
   DXY: 'DX-Y.NYB',

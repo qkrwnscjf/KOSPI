@@ -8,8 +8,8 @@ import { YAHOO_CATEGORY, YAHOO_DAILY_HISTORY_KEYS, YAHOO_KEYS, YAHOO_SYMBOLS } f
 import type { YahooSymbolKey } from '../../shared/symbols.js';
 import type { YahooDailyMessage } from '../../shared/yahoo-daily.js';
 import { BAR_RESOLUTIONS, type YahooBarMessage } from '../../shared/yahoo-bars.js';
-import { latestSessionEnd, YAHOO_MARKET } from '../ingestion/market-hours.js';
-import { CLOSE_FIX_DAYS, CLOSE_FIX_MARGIN_MS, GAP_LOOKBACK_DAYS, missingWeekdays, needsDailyHistory, shouldRefreshClose, toDailyRows, usesOfficialDailyClose, type DailyRow } from './daily-history.js';
+import { latestSessionEnd, sessionDate, YAHOO_MARKET } from '../ingestion/market-hours.js';
+import { CLOSE_FIX_DAYS, CLOSE_FIX_MARGIN_MS, closeFetchDone, GAP_LOOKBACK_DAYS, missingWeekdays, needsDailyHistory, rowDay, shouldRefreshClose, toDailyRows, usesOfficialDailyClose, type DailyRow } from './daily-history.js';
 import { FILL_PLANS, fillDue, findGap, needsFill, toFillRows } from './intraday-fill.js';
 import { reportRun } from '../ingestion-report.js';
 
@@ -245,12 +245,15 @@ async function reportChartRun(producer: Producer, endpoint: string, startedAt: n
 // 아직 끝나지 않은 장의 봉은 넣지 않는다(toDailyRows). 집계(market_1d)는 다시 계산하지 않는다(저장 불변 조건).
 // 받지 못한 지표는 다음 확인(30분 뒤) 때 다시 시도한다.
 const lastCloseFixAt = new Map<YahooSymbolKey, number>();
+// 그날 봉이 아직 없어 다시 받는 중인 지표 (T-171): 어느 장을 몇 번 받았는지
+const closeRetries = new Map<YahooSymbolKey, { sessionEnd: number; attempts: number }>();
 
 export async function runOfficialCloseRefresh(producer: Producer) {
   const startedAt = Date.now();
   let calls = 0;
   let failed = 0;
   let sent = 0;
+  const waiting: string[] = [];
   for (const symbol of YAHOO_KEYS) {
     if (!usesOfficialDailyClose(symbol)) continue;
     const now = Date.now();
@@ -262,14 +265,27 @@ export async function runOfficialCloseRefresh(producer: Producer) {
       const rows = toDailyRows(await fetchBars(symbol, '1d', CLOSE_FIX_DAYS + 1), now, sessionEnd + CLOSE_FIX_MARGIN_MS);
       await sendDailyRows(producer, symbol, rows, true);
       sent += rows.length;
-      lastCloseFixAt.set(symbol, now);
       officialCloseLastSuccess.set({ symbol }, Math.floor(now / 1000));
+      // 그 장의 날짜 봉이 들어왔을 때만 "받음"으로 표시한다. 없으면 30분 뒤 다시 받는다(최대 CLOSE_DAY_MAX_TRIES번, T-171)
+      // 일봉을 하나도 주지 않는 지표(코스피 200: KRX 일봉을 씀)는 기다리지 않는다
+      const day = sessionDate(YAHOO_MARKET[symbol], sessionEnd);
+      const found = day === null || rows.length === 0 || rows.some(row => rowDay(row) === day);
+      const previous = closeRetries.get(symbol);
+      const attempts = (previous?.sessionEnd === sessionEnd ? previous.attempts : 0) + 1;
+      if (closeFetchDone(found, attempts)) {
+        lastCloseFixAt.set(symbol, now);
+        closeRetries.delete(symbol);
+        if (!found) console.warn(`Official close ${symbol}: no ${day} bar from the source after ${attempts} tries (holiday or not published); stopped until the next session`);
+      } else {
+        closeRetries.set(symbol, { sessionEnd, attempts });
+        waiting.push(symbol);
+      }
     } catch (error) {
       failed += 1;
       console.error(`Official close refresh ${symbol} failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
-  if (calls > 0) console.log(`Official close refresh: ${calls} symbols fetched, ${sent} daily rows sent (last ${CLOSE_FIX_DAYS} days) in ${Date.now() - startedAt}ms`);
+  if (calls > 0) console.log(`Official close refresh: ${calls} symbols fetched, ${sent} daily rows sent (last ${CLOSE_FIX_DAYS} days), ${waiting.length} waiting for the session bar${waiting.length > 0 ? ` (${waiting.join(', ')})` : ''}, in ${Date.now() - startedAt}ms`);
   await reportChartRun(producer, 'official_close', startedAt, calls, failed, sent);
 }
 
