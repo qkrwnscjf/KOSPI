@@ -12,6 +12,7 @@ export interface TickData {
   changeRate: number
   changePrice?: number
   timestamp: number // 소스 기준 시각 (ms)
+  collectedAt?: number // worker 수집 시각 (ms). Gateway가 tick과 함께 보낸다. 카드의 "n초 전 수신"에 쓴다 (T-168)
   volume?: number
   marketState?: MarketState // 소스의 장 상태 (T-56)
 }

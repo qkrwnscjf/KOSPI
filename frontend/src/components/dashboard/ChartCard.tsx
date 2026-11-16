@@ -4,11 +4,13 @@ import { AreaChart, Area, ResponsiveContainer, YAxis, Tooltip, XAxis, CartesianG
 import { TrendingUp, TrendingDown, Minus } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { formatAxisNumber, formatClock, formatDate, formatNumber } from '@/lib/format'
-import { isMarketOpen, marketBadge, type MarketId, type MarketState } from '@/lib/marketHours'
+import { isMarketOpen, marketBadge, type MarketId } from '@/lib/marketHours'
 import { useMarketData, useSpreadTick, type ChartStatus } from '@/hooks/useMarketData'
 import { periodDirection, type Direction } from '@/lib/chartPoints'
-import { combineLags, delayBadgeMinutes } from '@/lib/sourceLag'
+import { combineLags, delayBadgeMinutes, type SourceLag } from '@/lib/sourceLag'
+import { dataStatus, STALE_AFTER_MS } from '@/lib/dataStatus'
 import { useSourceLags } from '@/hooks/useSourceLags'
+import type { TickData } from '@/lib/marketSocket'
 import type { ChartCardConfig } from '@/constants/data'
 
 const TIME_RANGES = ['실시간', '1일', '1주', '1개월', '3개월', '1년']
@@ -16,17 +18,6 @@ const TIME_RANGES = ['실시간', '1일', '1주', '1개월', '3개월', '1년']
 const DAILY_RANGES = ['1주', '1개월', '3개월', '1년']
 // 계산 카드(T-107)는 서버가 집계끼리 계산하므로 실시간 그래프가 없다
 const SPREAD_RANGES = ['1일', '1주', '1개월', '3개월', '1년']
-
-// 데이터 신선도 표시 (docs/Task_ORDER.md T-27): 마지막 값의 소스 기준 시각이 지금으로부터 얼마나 지났는지.
-function formatAge(ms: number) {
-  const seconds = Math.max(0, Math.floor(ms / 1000))
-  if (seconds < 60) return `${seconds}초 전`
-  const minutes = Math.floor(seconds / 60)
-  if (minutes < 60) return `${minutes}분 전`
-  const hours = Math.floor(minutes / 60)
-  if (hours < 24) return `${hours}시간 전`
-  return `${Math.floor(hours / 24)}일 전`
-}
 
 // 차트 영역에 데이터 대신 보여 줄 안내 문구. 데이터가 있으면 null.
 function chartMessage(status: ChartStatus, points: number, isRealtime: boolean) {
@@ -61,23 +52,66 @@ function useNow(intervalMs: number) {
   return now
 }
 
-// 1초마다 바뀌는 부분만 따로 그린다 (T-34). 이전에는 카드 전체(차트 포함)가 1초마다 다시 그려졌다.
-function Freshness({ timestamp }: { timestamp: number }) {
-  const now = useNow(1000)
-  return <span title={new Date(timestamp).toLocaleString('ko-KR')}>기준 {formatAge(now - timestamp)}</span>
+const dateTime = (ms: number) => new Date(ms).toLocaleString('ko-KR')
+
+interface PriceAndStatusProps {
+  ready: boolean
+  latest: TickData | null
+  decimals: number
+  prefix?: string | undefined
+  suffix?: string | undefined
+  market?: MarketId | undefined
+  daily?: boolean | undefined
+  lag: SourceLag | undefined
 }
 
-const badgeClass = 'inline-flex items-center gap-1 rounded-full border px-1.5 py-px text-[10px] font-medium leading-4'
+// 현재가와 데이터 상태 한 줄 (T-168, B-70). 1초마다 바뀌는 이 부분만 따로 그린다 (T-34: 차트는 다시 그리지 않음).
+// 한 줄: ● 장 상태(T-42, 공휴일은 소스 장 상태 T-56) · 소스 지연(T-162 실측) · 마지막 수신(worker 수집 시각).
+// 장이 열려 있는데 오래 새 값이 없으면 "갱신 지연"을 붙이고 가격을 흐리게 한다
+function PriceAndStatus({ ready, latest, decimals, prefix, suffix, market, daily, lag }: PriceAndStatusProps) {
+  const now = useNow(1000)
+  const delayMinutes = daily ? null : delayBadgeMinutes(lag)
+  const badge = ready && market && !daily ? marketBadge(isMarketOpen(market, new Date(now)), latest?.marketState) : null
+  const status = ready && !daily
+    ? dataStatus({ marketLabel: badge?.label ?? null, marketOpen: badge?.open ?? false, delayMinutes, sourceTime: latest?.timestamp ?? null, receivedAt: latest?.collectedAt ?? null, now })
+    : null
+  const details = [
+    delayMinutes !== null && lag ? `소스가 약 ${delayMinutes}분 늦은 시세를 제공합니다 (장중 실측, ${formatDate(lag.measuredAt)} ${formatClock(lag.measuredAt, false)} 기준)` : null,
+    latest && !daily ? `소스 시각 ${dateTime(latest.timestamp)}` : null,
+    latest?.collectedAt !== undefined && !daily ? `수신 ${dateTime(latest.collectedAt)}` : null,
+    status?.stale ? `장중인데 ${STALE_AFTER_MS / 60_000}분 넘게 새 값을 받지 못했습니다` : null,
+    daily ? 'KRX Open API 일별 시세입니다. 장 마감 후 하루 1번 갱신됩니다' : null,
+  ].filter(Boolean).join('\n')
 
-// 장 상태 (T-42). 시간표는 1분마다 다시 판단하고, 공휴일은 tick의 소스 장 상태로 판단한다 (T-56).
-function MarketBadge({ market, state }: { market: MarketId; state: MarketState | undefined }) {
-  const now = useNow(60_000)
-  const { label, open } = marketBadge(isMarketOpen(market, new Date(now)), state)
   return (
-    <span className={cn(badgeClass, open ? 'border-fg/30 text-fg' : 'border-line text-fg-muted')}>
-      <span className={cn('h-1.5 w-1.5 rounded-full', open ? 'bg-fg' : 'bg-fg-muted/50')} />
-      {label}
-    </span>
+    <>
+      <div className={cn('flex items-baseline gap-1 text-2xl font-semibold tracking-tight text-fg tabular-nums transition-opacity', status?.stale && 'opacity-50')}>
+        {latest ? (
+          <>
+            {prefix && <span className="text-base font-medium text-fg-muted">{prefix}</span>}
+            {formatNumber(latest.price, decimals)}
+            {suffix && <span className="text-xs font-medium text-fg-muted">{suffix}</span>}
+          </>
+        ) : (
+          <span className="text-fg-muted">—</span>
+        )}
+      </div>
+      {/* 상태 한 줄을 하나의 블록(둥근 테두리)으로 감싼다. 갱신 지연이면 테두리·글자를 진하게 */}
+      <div className="mt-1 flex h-5 items-center">
+        {((ready && daily) || (status && status.parts.length > 0)) && (
+          <span
+            className={cn('inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-full border px-2 py-px text-[11px] leading-4 tabular-nums',
+              status?.stale ? 'border-fg/50 font-medium text-fg' : badge?.open ? 'border-fg/25 text-fg-muted' : 'border-line text-fg-muted')}
+            title={details || undefined}
+          >
+            {badge && <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', badge.open ? 'bg-fg' : 'bg-fg-muted/50')} aria-hidden />}
+            <span className="truncate">
+              {ready && daily ? `일별 시세${latest ? ` · 기준일 ${formatDate(latest.timestamp, true)}` : ''}` : status?.parts.join(' · ')}
+            </span>
+          </span>
+        )}
+      </div>
+    </>
   )
 }
 
@@ -111,10 +145,9 @@ export function ChartCard({ title, symbol, ready, decimals, prefix, suffix, mark
   // 1일 ~ 1년은 그래프에 보이는 기간의 등락을 따른다.
   const chartDirection = activeRange === '실시간' ? direction : periodDirection(chartData)
   const chartColor = chartDirection ? CHART_COLOR[chartDirection] : 'text-fg'
-  // 지연 배지 (T-162): 고정값 대신 backend가 장중에 측정한 값. 계산 카드는 두 지표 중 늦은 쪽, 일별 지표는 해당 없음
+  // 소스 지연 (T-162): 고정값 대신 backend가 장중에 측정한 값. 계산 카드는 두 지표 중 늦은 쪽, 일별 지표는 해당 없음
   const sourceLags = useSourceLags()
   const lag = daily ? undefined : spread ? combineLags(sourceLags[spread.long], sourceLags[spread.short]) : sourceLags[symbol]
-  const delayMinutes = delayBadgeMinutes(lag)
 
   return (
     <motion.div
@@ -127,38 +160,8 @@ export function ChartCard({ title, symbol, ready, decimals, prefix, suffix, mark
       <div className="flex h-full flex-col p-5">
         <div className="mb-2 flex items-start justify-between gap-3">
           <div className="min-w-0">
-            <div className="mb-1 flex flex-wrap items-center gap-1.5">
-              <h3 className="text-[13px] font-medium text-fg-muted">{title}</h3>
-              {ready && market && <MarketBadge market={market} state={latest?.marketState} />}
-              {ready && lag && delayMinutes !== null && (
-                <span
-                  className={cn(badgeClass, 'border-line text-fg-muted')}
-                  title={`소스가 약 ${delayMinutes}분 늦은 시세를 제공합니다 (장중 실측, ${formatDate(lag.measuredAt)} ${formatClock(lag.measuredAt, false)} 기준)`}
-                >
-                  지연 {delayMinutes}분
-                </span>
-              )}
-              {ready && daily && (
-                <span className={cn(badgeClass, 'border-line text-fg-muted')} title="KRX Open API 일별 시세입니다. 장 마감 후 하루 1번 갱신됩니다">
-                  일별 시세
-                </span>
-              )}
-            </div>
-            <div className="flex items-baseline gap-1 text-2xl font-semibold tracking-tight text-fg tabular-nums">
-              {latest ? (
-                <>
-                  {prefix && <span className="text-base font-medium text-fg-muted">{prefix}</span>}
-                  {formatNumber(latest.price, decimals)}
-                  {suffix && <span className="text-xs font-medium text-fg-muted">{suffix}</span>}
-                </>
-              ) : (
-                <span className="text-fg-muted">—</span>
-              )}
-            </div>
-            <div className="mt-0.5 h-4 text-[11px] text-fg-muted tabular-nums">
-              {/* 일별 시세는 "n초 전" 대신 기준일을 보여 준다 */}
-              {latest && (daily ? <span>기준일 {formatDate(latest.timestamp, true)}</span> : <Freshness timestamp={latest.timestamp} />)}
-            </div>
+            <h3 className="mb-1 text-[13px] font-medium text-fg-muted">{title}</h3>
+            <PriceAndStatus ready={ready} latest={latest} decimals={decimals} prefix={prefix} suffix={suffix} market={market} daily={daily} lag={lag} />
           </div>
           {latest && change !== undefined && direction && DirectionIcon && (
             <div className={cn('flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-xs font-semibold tabular-nums', DIRECTION_STYLE[direction])}>

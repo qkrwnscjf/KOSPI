@@ -50,6 +50,8 @@ export function useSpreadTick(symbol: string, spread: { long: string; short: str
   const tick: TickData = { symbol, category: long.category, changeRate: 0, price: value.price, timestamp: value.timestamp }
   if (value.changePrice !== undefined) tick.changePrice = value.changePrice
   if (long.marketState !== undefined) tick.marketState = long.marketState
+  // 두 지표 중 먼저 받은(더 오래된) 수집 시각을 쓴다 (T-168)
+  if (long.collectedAt !== undefined && short.collectedAt !== undefined) tick.collectedAt = Math.min(long.collectedAt, short.collectedAt)
   return tick
 }
 
