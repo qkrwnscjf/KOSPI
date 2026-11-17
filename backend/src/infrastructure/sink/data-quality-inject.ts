@@ -91,21 +91,5 @@ export async function runDqInjection(pool: Pool) {
   }
   const rowsAfter = await count();
   console.log(`[dq-inject] ${JSON.stringify({ injected: applied.length, detected: hits.length, misses, failed, rowsBefore, rowsAfter })}`);
-
-  // index_daily 분리 확인 (B-62 기준 2): 옛 표의 모든 행이 뷰에 있는지, 값이 다른 행은 어느 지표·날짜인지. 시세는 공개 값이다
-  const { rows: [split] } = await pool.query(
-    `SELECT (SELECT count(*)::int FROM index_daily_legacy) AS legacy,
-            (SELECT count(*)::int FROM index_daily_legacy WHERE source = 'krx') AS legacy_krx,
-            (SELECT count(*)::int FROM index_daily_legacy WHERE source = 'yahoo') AS legacy_yahoo,
-            (SELECT count(*)::int FROM index_daily_krx WHERE ingested_at IS NULL) AS moved_krx,
-            (SELECT count(*)::int FROM index_daily_yahoo WHERE ingested_at IS NULL) AS moved_yahoo,
-            (SELECT count(*)::int FROM index_daily_legacy l WHERE NOT EXISTS (SELECT 1 FROM index_daily v WHERE v.symbol = l.symbol AND v.time = l.time)) AS missing,
-            (SELECT count(*)::int FROM (SELECT symbol, time FROM index_daily GROUP BY symbol, time HAVING count(*) > 1) d) AS duplicated`
-  );
-  const { rows: changed } = await pool.query(
-    `SELECT l.symbol, to_char(l.time AT TIME ZONE 'Asia/Seoul', 'YYYY-MM-DD') AS day, l.close AS old_close, v.close AS new_close, v.source
-     FROM index_daily_legacy l JOIN index_daily v ON v.symbol = l.symbol AND v.time = l.time
-     WHERE abs(l.close - v.close) > 0.000001 ORDER BY day DESC LIMIT 20`
-  );
-  console.log(`[split-check] ${JSON.stringify({ ...split, changedSample: changed })}`);
+  // 옛 일별 표와 뷰를 비교하던 [split-check](B-62 기준 2)는 옛 표를 지우면서 뺐다 (T-173, 마이그레이션 16이 지우기 전에 같은 확인을 한다)
 }

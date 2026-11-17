@@ -91,14 +91,16 @@ services:
       - KAFKA_BROKERS=kafka:29092
       # 파이프라인 상태(T-112)를 묻는 Prometheus 내부 주소. Docker 내부 네트워크만 쓰고, 정해진 쿼리만 보낸다.
       - PROMETHEUS_URL=http://prometheus:9090
-    # /api/health는 DB 스키마 생성(initDB) 후에 응답하므로, worker는 이 healthcheck를 기다린다 (T-29)
+    # 실제 상태 점검 (T-152): 내부 전용 메트릭 포트(9464, 호스트에 공개하지 않음)의 /health가 DB 응답과 Gateway Kafka 컨슈머를 확인한다.
+    # 메트릭 서버는 DB 스키마 생성(initDB)과 API 대기 뒤에 뜨므로, db-sink·수집기는 이 healthcheck를 기다린다 (T-29).
+    # 공개 포트의 /api/health는 프로세스 생존 확인용으로 그대로 둔다.
     # localhost는 Alpine wget에서 IPv6(::1)로 해석되는데 서버는 IPv4(0.0.0.0)에서만 대기하므로 127.0.0.1을 쓴다.
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3001/api/health || exit 1"]
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9464/health || exit 1"]
       interval: 5s
       timeout: 3s
-      retries: 20
-      start_period: 10s
+      retries: 3
+      start_period: 90s
     depends_on:
       kafka:
         condition: service_healthy
@@ -121,6 +123,13 @@ services:
       - POLLING_INTERVAL_MS=5000
       # 다시 시작할 때 마지막 전송 시각을 묻는 내부 주소 (T-133). Docker 내부 네트워크만 쓴다. 닿지 못하면 예전처럼 모두 보낸다
       - BACKEND_URL=http://backend:3001
+    # 실제 상태 점검 (T-152): Kafka 전송 결과와 수집 루프가 멈추지 않았는지. 내부 전용 포트(9464)
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9464/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
     depends_on:
       kafka:
         condition: service_healthy
@@ -140,6 +149,13 @@ services:
       - DB_PASSWORD=password
       - DB_NAME=kospi
       - KAFKA_BROKERS=kafka:29092
+    # 실제 상태 점검 (T-152): Kafka 컨슈머 활동, DLQ·일봉 전송 결과, DB 응답. 내부 전용 포트(9464)
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9464/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
     # backend가 healthy해야 DB 스키마(initDB)가 만들어진 상태다
     depends_on:
       kafka:
@@ -164,6 +180,13 @@ services:
       - KRX_API_KEY=${KRX_API_KEY:-}
       # 이미 저장된 기간을 묻는 내부 주소 (SEC-014). Docker 내부 네트워크만 쓰고 키는 보내지 않는다.
       - BACKEND_URL=http://backend:3001
+    # 실제 상태 점검 (T-152): 키가 있을 때 Kafka 전송 결과. 키가 없으면 의도한 대기라 정상. 내부 전용 포트(9464)
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9464/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
     # Gateway(backend)가 먼저 떠 있어야 과거 채우기 직후의 최신값이 화면 캐시에 들어간다
     depends_on:
       kafka:
@@ -186,6 +209,13 @@ services:
       - DART_API_KEY=${DART_API_KEY:-}
       # 이미 저장된 기간을 묻는 내부 주소 (SEC-014). Docker 내부 네트워크만 쓰고 키는 보내지 않는다.
       - BACKEND_URL=http://backend:3001
+    # 실제 상태 점검 (T-152): 키가 있을 때 Kafka 전송 결과. 키가 없으면 의도한 대기라 정상. 내부 전용 포트(9464)
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9464/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
     depends_on:
       kafka:
         condition: service_healthy
@@ -206,6 +236,13 @@ services:
       - KAFKA_BROKERS=kafka:29092
       # 키는 프로젝트 루트의 .env에서 변수 치환으로만 받는다 (D-51). 키가 요청 주소에 들어가므로 주소는 로그에 남기지 않는다.
       - DATA_GO_KR_SERVICE_KEY=${DATA_GO_KR_SERVICE_KEY:-}
+    # 실제 상태 점검 (T-152): 키가 있을 때 Kafka 전송 결과. 키가 없으면 의도한 대기라 정상. 내부 전용 포트(9464)
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9464/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
     depends_on:
       kafka:
         condition: service_healthy

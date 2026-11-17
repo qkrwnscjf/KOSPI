@@ -6,7 +6,8 @@ import { fetchLatestTickTimes } from '../backend-coverage.js';
 import { YAHOO_KEYS, isYahooSymbolKey } from '../../shared/symbols.js';
 import type { YahooSymbolKey } from '../../shared/symbols.js';
 import type { MarketState } from '../../shared/market-state.js';
-import { producer, TOPICS, ensureTopics } from '../kafka.js';
+import { producer, TOPICS, ensureTopics, probeBroker } from '../kafka.js';
+import { registerHeartbeat, trackProducer } from '../health.js';
 import { reportRun } from '../ingestion-report.js';
 import { TimeoutError, withAbortTimeout } from '../abort-timeout.js';
 import { Counter, Gauge, Latency, metricsConfig, startMetricsLog, startMetricsServer } from '../metrics.js';
@@ -272,6 +273,10 @@ async function runCycle(): Promise<FetchResult> {
   return yahoo.result;
 }
 
+// 수집 루프가 멈추지 않았는지 (T-152): 가장 긴 대기(유휴·휴장 주기, 백오프 상한 중 큰 값) + 요청 제한 시간의 2배 안에 주기가 끝나야 정상
+const POLL_LOOP_MAX_AGE_MS = 2 * (Math.max(POLLING_INTERVAL_MS, IDLE_POLLING_INTERVAL_MS, HOLIDAY_POLLING_INTERVAL_MS, MAX_BACKOFF_MS) + FETCH_TIMEOUT_MS);
+let pollLoopHealth: { beat: () => void } | undefined;
+
 // 수집 루프 (docs/Task_ORDER.md T-04)
 // - 이전 수집이 끝난 뒤에만 다음 수집을 예약하므로 겹쳐서 실행되지 않는다.
 // - 정상일 때는 수집 시작 시각 기준으로 POLLING_INTERVAL_MS 간격을 유지한다.
@@ -349,6 +354,7 @@ async function pollOnce() {
     console.warn(`Yahoo fetch ${yahooResult}: backing off, next poll in ${targetDelay}ms (consecutive failures: ${consecutiveFailures})`);
   }
   pollDelay.set({}, targetDelay / 1000);
+  pollLoopHealth?.beat();
 
   if (!stopping) {
     nextPollTimer = setTimeout(pollLoop, Math.max(0, targetDelay - (Date.now() - cycleStartedAt)));
@@ -398,6 +404,10 @@ async function runIngestionWorker() {
   if (FETCH_TIMEOUT_MS >= POLLING_INTERVAL_MS) {
     console.warn('FETCH_TIMEOUT_MS is not shorter than POLLING_INTERVAL_MS: cycles may start later than the configured interval.');
   }
+
+  // 상태 점검 (T-152): Kafka 전송과 수집 루프
+  trackProducer('kafka_producer', producer, probeBroker);
+  pollLoopHealth = registerHeartbeat('poll_loop', POLL_LOOP_MAX_AGE_MS);
 
   await producer.connect();
   console.log('Connected to Kafka producer.');

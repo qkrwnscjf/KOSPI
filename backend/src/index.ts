@@ -12,6 +12,7 @@ import { dbPool, initDB } from './infrastructure/db.js';
 import { redis } from './infrastructure/redis.js';
 import { metricsConfig, startMetricsLog, startMetricsServer } from './infrastructure/metrics.js';
 import { registerShutdown } from './infrastructure/shutdown.js';
+import { registerHealthCheck } from './infrastructure/health.js';
 
 const fastify = Fastify({ logger: true });
 
@@ -35,7 +36,12 @@ fastify.register(flowsController);
 fastify.register(disclosuresController);
 fastify.register(pipelineController);
 
-// Health check
+// Health check: 프로세스가 요청에 응답하는지만 본다(공개 포트, 생존 확인용).
+// 의존성(DB·Kafka 컨슈머)까지 보는 점검은 내부 전용 포트의 /health다 (T-152). Redis는 끊겨도 REST·실시간이 동작하도록 만들어 점검에 넣지 않는다(T-23, T-149)
+registerHealthCheck('db', async () => {
+  await dbPool.query('SELECT 1');
+  return true;
+});
 fastify.get('/api/health', async (request, reply) => {
   return { status: 'ok', message: 'Kospi Dashboard API is running.' };
 });

@@ -92,6 +92,17 @@ export async function ensureTopics() {
   }
 }
 
+// 브로커가 응답하는지 확인한다 (T-152). 프로듀서 전송이 실패한 상태에서만 health check가 부른다(평소에는 요청 없음)
+export async function probeBroker() {
+  const admin = kafka.admin({ retry: { retries: 0 } });
+  await admin.connect();
+  try {
+    await admin.describeCluster();
+  } finally {
+    await admin.disconnect().catch(() => undefined);
+  }
+}
+
 // 잘못된 메시지를 원본 그대로 DLQ에 보낸다 (docs/Task_ORDER.md T-13, D-19).
 // 실패해도 예외를 던지지 않는다. 컨슈머가 같은 메시지에서 멈추지 않게 하기 위함.
 // 원래 토픽에 맞는 DLQ로 보낸다 (market-ticks → market-ticks.dlq, index-daily → index-daily.dlq 등)

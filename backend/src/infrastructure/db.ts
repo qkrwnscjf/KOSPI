@@ -449,6 +449,33 @@ const MIGRATIONS: Migration[] = [
       $$`,
     ],
   },
+  {
+    version: 16,
+    name: 'T-173 drop index_daily_legacy (pre-split daily table, replaced by index_daily_krx / index_daily_yahoo in migration 12)',
+    statements: [
+      // 2026-11-17 사용자 승인("index_daily_legacy 삭제"). 마이그레이션 12 뒤로 이 표에는 아무도 쓰지 않았고, 읽는 쪽은 뷰 index_daily를 쓴다.
+      // 지우기 전에 보관 기간(1년) 안의 모든 행이 출처별 새 표에 같은 (symbol, time)으로 있는지 확인한다. 값은 보지 않는다(공식 종가 보정·KRX 정정으로 바뀔 수 있음).
+      // 1년보다 오래된 행은 표마다 보관 작업 시각이 달라 한쪽에만 남아 있을 수 있어 보지 않는다.
+      // 빠진 행이 있으면 오류로 멈춘다: 이 마이그레이션은 기록되지 않고 표도 그대로 남아(데이터 손실 없음) backend 기동 로그에 건수가 나온다.
+      `DO $$
+      DECLARE missing bigint;
+      BEGIN
+        IF to_regclass('public.index_daily_legacy') IS NOT NULL THEN
+          SELECT count(*) INTO missing FROM index_daily_legacy l
+          WHERE l.time >= now() - INTERVAL '1 year'
+            AND NOT (
+              (l.source = 'krx' AND EXISTS (SELECT 1 FROM index_daily_krx k WHERE k.symbol = l.symbol AND k.time = l.time))
+              OR (l.source = 'yahoo' AND EXISTS (SELECT 1 FROM index_daily_yahoo y WHERE y.symbol = l.symbol AND y.time = l.time))
+            );
+          IF missing > 0 THEN
+            RAISE EXCEPTION 'index_daily_legacy not dropped: % rows within 1 year are missing from the split tables', missing;
+          END IF;
+          DROP TABLE index_daily_legacy;
+        END IF;
+      END
+      $$`,
+    ],
+  },
 ];
 
 // 집계의 실제 저장 테이블(materialization hypertable)을 찾아 청크 간격을 바꾼다 (T-31).

@@ -219,11 +219,25 @@ export class Latency implements Metric {
 
 export const renderMetrics = () => `${registry.map(metric => metric.render()).join('\n')}\n`;
 
+// /health 결과를 만드는 함수 (T-152). health.ts가 불러와지면 자기 평가 함수로 바꾼다(서로 import하지 않도록 이쪽은 받기만 함).
+// 점검이 등록되지 않은 프로세스는 응답한다는 것만으로 정상이다
+type HealthEvaluator = () => Promise<{ ok: boolean; checks: Record<string, boolean> }>;
+let healthEvaluator: HealthEvaluator = async () => ({ ok: true, checks: {} });
+export const setHealthEvaluator = (evaluator: HealthEvaluator) => { healthEvaluator = evaluator; };
+
 export const startMetricsServer = (port: number) => {
   const server = createServer((request, response) => {
     if (request.method === 'GET' && request.url === '/metrics') {
       response.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' });
       response.end(renderMetrics());
+      return;
+    }
+    // 서비스별 실제 상태 (T-152). 점검 이름과 참/거짓만 돌려준다. 내부 전용 포트라 호스트에 공개되지 않는다
+    if (request.method === 'GET' && request.url === '/health') {
+      void healthEvaluator().then(report => {
+        response.writeHead(report.ok ? 200 : 503, { 'Content-Type': 'application/json; charset=utf-8' });
+        response.end(JSON.stringify({ status: report.ok ? 'ok' : 'fail', checks: report.checks }));
+      });
       return;
     }
     response.writeHead(404);

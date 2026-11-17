@@ -1,4 +1,5 @@
-import { kafka, TOPICS, ensureTopics, sendToDlq } from '../kafka.js';
+import { kafka, TOPICS, ensureTopics, sendToDlq, probeBroker } from '../kafka.js';
+import { registerHealthCheck, trackConsumer, trackProducer } from '../health.js';
 import { dbPool } from '../db.js';
 import { Counter, Gauge, Latency, metricsConfig, startMetricsLog, startMetricsServer } from '../metrics.js';
 import { parseTick } from '../../shared/tick-validation.js';
@@ -651,7 +652,6 @@ async function recordDbSize() {
     const counts = await dbPool.query<{ relation: string; rows: string }>(`
       SELECT 'index_daily_krx' AS relation, count(*)::text AS rows FROM index_daily_krx
       UNION ALL SELECT 'index_daily_yahoo', count(*)::text FROM index_daily_yahoo
-      UNION ALL SELECT 'index_daily_legacy', count(*)::text FROM index_daily_legacy
       UNION ALL SELECT 'disclosures', count(*)::text FROM disclosures
       UNION ALL SELECT 'market_breadth', count(*)::text FROM market_breadth
       UNION ALL SELECT 'stock_rankings', count(*)::text FROM stock_rankings
@@ -740,6 +740,13 @@ async function logJobErrors() {
 
 async function run() {
   console.log('DB sink starting...');
+  // 상태 점검 (T-152): Kafka 컨슈머 활동, DLQ·일봉 전송, DB 응답
+  trackConsumer('kafka_consumer', consumer);
+  trackProducer('kafka_producer', dlqProducer, probeBroker);
+  registerHealthCheck('db', async () => {
+    await dbPool.query('SELECT 1');
+    return true;
+  });
   await dlqProducer.connect();
   await ensureTopics();
   await consumer.connect();

@@ -4,6 +4,7 @@ import { DISCLOSURE_ROOM, isTargetStock, parseDisclosure } from '../../shared/di
 import { isKrxDailySymbol, isKrxHistorySymbol } from '../../shared/krx-indices.js';
 import { kafka, TOPICS, ensureTopics } from '../../infrastructure/kafka.js';
 import { Counter, Gauge, Latency } from '../../infrastructure/metrics.js';
+import { trackConsumer } from '../../infrastructure/health.js';
 import { marketService } from './market.service.js';
 import { parseTick } from '../../shared/tick-validation.js';
 import { isSubscribableSymbol, isYahooSymbolKey } from '../../shared/symbols.js';
@@ -190,6 +191,8 @@ let shuttingDown = false;
 async function startConsumer(io: Server) {
   const consumer = kafka.consumer({ groupId: 'market-group' });
   activeConsumer = consumer;
+  // 상태 점검 (T-152): 시도마다 새 컨슈머를 만들므로 점검도 새 컨슈머 기준으로 바꾼다(같은 이름이면 덮어씀)
+  trackConsumer('kafka_consumer', consumer);
   try {
     await ensureTopics();
     await consumer.connect();

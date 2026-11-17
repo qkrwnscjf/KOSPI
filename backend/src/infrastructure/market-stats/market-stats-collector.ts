@@ -1,4 +1,5 @@
-import { producer, TOPICS, ensureTopics } from '../kafka.js';
+import { producer, TOPICS, ensureTopics, probeBroker } from '../kafka.js';
+import { trackProducer } from '../health.js';
 import { fetchJson, HttpJsonError, safeLogList, safeLogText } from '../http-json.js';
 import { Counter, Gauge, metricsConfig, startMetricsLog, startMetricsServer } from '../metrics.js';
 import { registerShutdown } from '../shutdown.js';
@@ -163,6 +164,8 @@ async function main() {
     return;
   }
 
+  // 상태 점검 (T-152): 키가 있을 때만 Kafka 전송을 본다. 키가 없으면 의도한 대기 상태라 점검 없이 정상
+  trackProducer('kafka_producer', producer, probeBroker);
   await producer.connect();
   await ensureTopics();
   registerShutdown('market-stats-collector', [
