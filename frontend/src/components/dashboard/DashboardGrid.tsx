@@ -77,7 +77,7 @@ export function DashboardGrid({ categoryId }: DashboardGridProps) {
       <header className="mb-10 mt-8 flex w-full flex-col items-start lg:mt-12">
         <div className="mb-4 flex items-center gap-2.5">
           <span className="h-1.5 w-1.5 rounded-full bg-neon shadow-[0_0_8px_rgb(var(--color-neon))]" />
-          <span className="text-[11px] font-semibold tracking-[0.25em] text-fg-muted">MARKET OVERVIEW</span>
+          <span className="text-[11px] font-semibold tracking-[0.25em] text-fg-muted">시장 개요</span>
         </div>
 
         <AnimatePresence mode="wait">
@@ -92,9 +92,9 @@ export function DashboardGrid({ categoryId }: DashboardGridProps) {
             <h2 className="mb-3 text-3xl font-bold tracking-tight text-fg md:text-4xl">
               {tab?.name}
             </h2>
+            {/* 탭마다 자기 설명만 쓴다 (plan.md FQA-15, T-204). 예전에는 일별·캘린더·순위 탭에도 "실시간 시장 데이터…" 고정 문장이 붙었다 */}
             <p className="max-w-2xl text-xs leading-relaxed text-fg-muted md:text-sm">
-              실시간 시장 데이터를 기반으로 한 종합 모니터링 대시보드입니다.
-              {tab ? ` ${tab.description}` : ' 주요 지표의 추세와 변동성을 정밀하게 분석합니다.'}
+              {tab?.description}
             </p>
           </motion.div>
         </AnimatePresence>

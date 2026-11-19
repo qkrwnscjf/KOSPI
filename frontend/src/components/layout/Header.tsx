@@ -155,7 +155,7 @@ export function Sidebar({ activeCategory, onCategoryChange }: SidebarProps) {
 
         {/* 카테고리: 선택된 항목은 강조색 면 + 왼쪽 빛 막대 (D-54) */}
         <nav aria-label="카테고리" className="no-scrollbar -mx-4 overflow-x-auto px-4 lg:mx-0 lg:overflow-visible lg:px-0">
-          <span className={cn('mb-2 hidden px-3 text-[10px] font-semibold tracking-[0.2em] text-fg-muted', !collapsed && 'lg:block')}>CATEGORIES</span>
+          <span className={cn('mb-2 hidden px-3 text-[10px] font-semibold tracking-[0.2em] text-fg-muted', !collapsed && 'lg:block')}>메뉴</span>
           <ul className="flex gap-1 lg:flex-col">
             {CATEGORIES.map(item => {
               const Icon = item.icon
