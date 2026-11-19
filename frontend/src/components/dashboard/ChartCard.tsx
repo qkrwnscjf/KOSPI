@@ -152,7 +152,8 @@ export function ChartCard({ title, symbol, ready, decimals, prefix, suffix, mark
   return (
     // 등장 효과는 DashboardGrid의 감싸는 요소가 맡는다 (plan.md FQA-04, T-195: 예전에는 카드 안에서 한 번 더 움직였다)
     // 마우스를 올리면 테두리가 강조색으로 은은하게 빛난다 (T-69). 그래프 색은 등락 색 그대로다
-    <div className="card-neon relative h-[340px] rounded-xl border border-line bg-surface">
+    // 모바일(md 미만, 1열)은 카드를 280px로 낮춰 스크롤을 줄인다 (plan.md FQA-10, T-206). 국내 탭 10장 기준 약 3,400 → 2,800px
+    <div className="card-neon relative h-[280px] rounded-xl border border-line bg-surface md:h-[340px]">
       <div className="flex h-full flex-col p-5">
         <div className="mb-2 flex items-start justify-between gap-3">
           <div className="min-w-0">

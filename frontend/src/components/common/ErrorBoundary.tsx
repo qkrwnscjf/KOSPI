@@ -32,7 +32,7 @@ export class ErrorBoundary extends Component<Props, State> {
     const isCard = this.props.scope === 'card'
     return (
       <div role="alert" className={isCard
-        ? 'flex h-[340px] flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-line bg-surface px-4 text-center text-xs text-fg-muted'
+        ? 'flex h-[280px] md:h-[340px] flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-line bg-surface px-4 text-center text-xs text-fg-muted'
         : 'flex w-full flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-line px-4 py-16 text-center text-xs text-fg-muted'}>
         <p>{fallbackText(this.props.scope, this.props.label)}</p>
         <button type="button" onClick={() => this.setState({ failed: false })}
