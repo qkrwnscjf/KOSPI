@@ -8,6 +8,7 @@ import { cn } from '@/lib/utils'
 import { formatDate } from '@/lib/format'
 import { formatReturn, rankSectors, returnDirection, returnIntensity, SECTOR_LABELS } from '@/lib/sectors'
 import { useSectorReturns } from '@/hooks/useSectorReturns'
+import { SegmentedControl, segmentsOf } from '@/components/common/SegmentedControl'
 
 // 섹터 수익률 노드 (docs/Task_ORDER.md D-66)
 // 국내 섹터 모멘텀 탭 위쪽에 섹터를 노드로 놓고 기간 수익률을 보여 준다. 수익률 높은 순으로 정렬한다.
@@ -92,15 +93,7 @@ export function SectorNodes() {
         <h3 className="text-[13px] font-medium text-fg-muted">
           섹터 수익률 <span className="text-[11px]">(기간 첫 거래일 종가 대비, 높은 순{baseTime > 0 ? ` · 기준일 ${formatDate(baseTime, true)}` : ''})</span>
         </h3>
-        <div className="flex gap-1" role="group" aria-label="섹터 수익률 기간 선택">
-          {RANGES.map(item => (
-            <button key={item} type="button" aria-pressed={range === item} onClick={() => setRange(item)}
-              className={cn('rounded-md px-2 py-1 text-[11px] transition-colors duration-150',
-                range === item ? 'bg-fg font-medium text-page' : 'text-fg-muted hover:bg-fg/5 hover:text-fg')}>
-              {item}
-            </button>
-          ))}
-        </div>
+        <SegmentedControl label="섹터 수익률 기간 선택" options={segmentsOf(RANGES)} value={range} onChange={setRange} />
       </div>
 
       {status !== 'loaded' || ranked.length === 0 ? (

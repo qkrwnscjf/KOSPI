@@ -4,6 +4,7 @@ import { cn } from '@/lib/utils'
 import { formatNumber } from '@/lib/format'
 import { formatWonShort, RANKING_MARKETS, RANKING_VIEWS, type RankingItem, type RankingView } from '@/lib/rankings'
 import { useRankings } from '@/hooks/useAnalytics'
+import { SegmentedControl } from '@/components/common/SegmentedControl'
 
 // 종목 순위 탭 (docs/Task_ORDER.md 15단계 T-113, D-72)
 // KRX 종목별 일별매매정보에서 시장·날짜마다 상승률·하락률·거래대금·시가총액 상위 100개를 보여 준다(장 마감 후 하루 1번).
@@ -67,24 +68,9 @@ export function RankingsDashboard() {
     >
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-3">
-          <div className="flex gap-1" role="group" aria-label="시장 선택">
-            {RANKING_MARKETS.map(item => (
-              <button key={item.key} type="button" aria-pressed={market === item.key} onClick={() => setMarket(item.key)}
-                className={cn('rounded-md px-2 py-1 text-[11px] transition-colors duration-150',
-                  market === item.key ? 'bg-fg font-medium text-page' : 'text-fg-muted hover:bg-fg/5 hover:text-fg')}>
-                {item.label}
-              </button>
-            ))}
-          </div>
-          <div className="flex flex-wrap gap-1" role="group" aria-label="순위 기준 선택">
-            {RANKING_VIEWS.map(item => (
-              <button key={item.key} type="button" aria-pressed={view === item.key} onClick={() => setView(item.key)}
-                className={cn('rounded-md px-2 py-1 text-[11px] transition-colors duration-150',
-                  view === item.key ? 'bg-fg/10 font-medium text-fg' : 'text-fg-muted hover:bg-fg/5 hover:text-fg')}>
-                {item.label}
-              </button>
-            ))}
-          </div>
+          <SegmentedControl label="시장 선택" options={RANKING_MARKETS} value={market} onChange={setMarket} />
+          {/* 한 화면에 선택 묶음이 둘이라 두 번째(기준)는 옅게 구분한다(예전과 같은 모양) */}
+          <SegmentedControl wrap tone="soft" label="순위 기준 선택" options={RANKING_VIEWS} value={view} onChange={setView} />
         </div>
         <label className="flex items-center gap-2 text-[11px] text-fg-muted">
           기준일

@@ -7,6 +7,7 @@ import { useTokenColors } from '@/lib/theme'
 import { dartViewerUrl, formatKrw, GROUPS, groupLabel, kindLabel, seoulToday, toEokWon, type DisclosureItem } from '@/lib/disclosures'
 import { useCapitalEvents, useRecentDisclosures, type CapitalBucket, type DisclosureScope } from '@/hooks/useDisclosures'
 import type { ChartStatus } from '@/hooks/useMarketData'
+import { SegmentedControl, segmentsOf } from '@/components/common/SegmentedControl'
 
 // 공시·자본 이벤트 탭 (docs/Task_ORDER.md 12단계 T-78, D-59)
 // ① 공시 속보: 최근 공시 목록(새 공시는 실시간으로 위에 추가)
@@ -95,15 +96,7 @@ function DisclosureFeed({ group, setGroup }: { group: string; setGroup: (group: 
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
         <h3 className="text-[13px] font-medium text-fg-muted">공시 속보 <span className="text-[11px]">(최근 100건, 새 공시는 자동 추가)</span></h3>
       </div>
-      <div className="no-scrollbar -mx-1 mb-2 flex gap-1 overflow-x-auto px-1" role="group" aria-label="공시 분류">
-        {GROUPS.map(item => (
-          <button key={item.key} type="button" aria-pressed={group === item.key} onClick={() => setGroup(item.key)}
-            className={cn('shrink-0 rounded-md px-2 py-1 text-[11px] transition-colors duration-150',
-              group === item.key ? 'bg-fg font-medium text-page' : 'text-fg-muted hover:bg-fg/5 hover:text-fg')}>
-            {item.label}
-          </button>
-        ))}
-      </div>
+      <SegmentedControl className="mb-2" scroll label="공시 분류" options={GROUPS} value={group} onChange={setGroup} />
       <div className="relative min-h-[200px] flex-1">
         {message ? (
           <div className="flex h-[200px] items-center justify-center text-xs text-fg-muted">{message}</div>
@@ -146,15 +139,7 @@ function CapitalEventsCard({ range, setRange, buckets, top, since, status, weekl
           자본 이벤트 금액 <span className="text-[11px]">(억원, {weekly ? '주별' : '일별'} 합계 · 정정은 최종본 기준으로 한 번)</span>
         </h3>
       </div>
-      <div className="mb-2 flex gap-1" role="group" aria-label="자본 이벤트 기간 선택">
-        {RANGES.map(item => (
-          <button key={item} type="button" aria-pressed={range === item} onClick={() => setRange(item)}
-            className={cn('rounded-md px-2 py-1 text-[11px] transition-colors duration-150',
-              range === item ? 'bg-fg font-medium text-page' : 'text-fg-muted hover:bg-fg/5 hover:text-fg')}>
-            {item}
-          </button>
-        ))}
-      </div>
+      <SegmentedControl className="mb-2" label="자본 이벤트 기간 선택" options={segmentsOf(RANGES)} value={range} onChange={setRange} />
       {/* 범례: 색과 이름을 함께 */}
       <div className="mb-2 flex flex-wrap gap-x-3 gap-y-1 text-[10px] text-fg-muted">
         {SERIES.map(series => (

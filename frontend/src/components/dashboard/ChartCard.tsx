@@ -12,6 +12,7 @@ import { useSourceLags } from '@/hooks/useSourceLags'
 import type { TickData } from '@/lib/marketSocket'
 import type { ChartCardConfig } from '@/constants/data'
 import { createClock } from '@/lib/sharedSource'
+import { SegmentedControl, segmentsOf } from '@/components/common/SegmentedControl'
 import { chartSummary } from '@/lib/chartSummary'
 
 const TIME_RANGES = ['실시간', '1일', '1주', '1개월', '3개월', '1년']
@@ -168,22 +169,7 @@ export function ChartCard({ title, symbol, ready, decimals, prefix, suffix, mark
         </div>
 
         {/* Time Range Selector: 선택된 항목은 흑백 반전 (D-35) */}
-        <div className="mb-3 flex gap-1" role="group" aria-label={`${title} 기간 선택`}>
-          {ranges.map(range => (
-            <button
-              key={range}
-              type="button"
-              aria-pressed={activeRange === range}
-              onClick={() => setActiveRange(range)}
-              className={cn(
-                'rounded-md px-2 py-1 text-[11px] transition-colors duration-150',
-                activeRange === range ? 'bg-fg font-medium text-page' : 'text-fg-muted hover:bg-fg/5 hover:text-fg'
-              )}
-            >
-              {range}
-            </button>
-          ))}
-        </div>
+        <SegmentedControl className="mb-3" label={`${title} 기간 선택`} options={segmentsOf(ranges)} value={activeRange} onChange={setActiveRange} />
 
         {/* 격자·축·커서는 currentColor(본문색), 선·채우기는 등락 색 클래스를 따로 받는다. 모두 라이트·다크에 맞게 바뀐다 */}
         {/* 그래프의 글 대안 (plan.md FQA-11, T-197): 화면 읽기 프로그램은 그림 대신 시작·마지막 값과 기간 등락을 읽는다 */}
