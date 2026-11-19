@@ -1,6 +1,7 @@
 import { cn } from '@/lib/utils'
 import { useEffect, useState } from 'react'
-import { LayoutDashboard, Globe, TrendingUp, Activity, Terminal, Sun, Moon, ArrowLeftRight, FileText, Network, CalendarDays, ListOrdered, Settings, PanelLeftClose, PanelLeftOpen } from 'lucide-react'
+import { Terminal, Sun, Moon, Settings, PanelLeftClose, PanelLeftOpen } from 'lucide-react'
+import { TABS } from '@/constants/tabs'
 import { readCollapsed, writeCollapsed } from '@/lib/sidebarState'
 import { motion } from 'framer-motion'
 import { SettingsPanel } from '@/components/settings/SettingsPanel'
@@ -14,17 +15,8 @@ import type { TickData } from '@/lib/marketSocket'
 // 모바일: 위쪽 막대(로고 · 연결 상태 · 테마 전환) + 가로로 스크롤되는 카테고리 탭
 // 이전에는 가운데 로고 아래의 가로 탭(알약)이었다.
 
-const CATEGORIES = [
-  { id: 'category1', name: '국내 전광판', icon: LayoutDashboard },
-  { id: 'category2', name: '매크로 및 환율', icon: Globe },
-  { id: 'category3', name: '글로벌 연동', icon: TrendingUp },
-  { id: 'category4', name: '국내 섹터 모멘텀', icon: Activity },
-  { id: 'category5', name: '증시 자금 흐름', icon: ArrowLeftRight }, // 11단계 B′ (금융투자협회 일별 통계 1개월, D-77)
-  { id: 'category6', name: '공시·자본 이벤트', icon: FileText }, // 12단계 (DART)
-  { id: 'category8', name: '실적·배당 캘린더', icon: CalendarDays }, // 15단계 T-111 (공시 탭 바로 아래)
-  { id: 'category9', name: '종목 순위', icon: ListOrdered }, // 15단계 T-113
-  { id: 'category7', name: '시장 연관성·리스크', icon: Network }, // 15단계 T-110 (일봉으로 계산)
-]
+// 탭 이름·순서·아이콘은 constants/tabs.tsx 한 곳에서 정한다 (plan.md FQA-06, T-202)
+const CATEGORIES = TABS
 
 interface SidebarProps {
   activeCategory: string
