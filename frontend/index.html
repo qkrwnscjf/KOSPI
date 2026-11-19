@@ -7,13 +7,16 @@
     <meta name="color-scheme" content="light dark" />
     <title>KOSPI Insight</title>
     <!--
-      저장된 테마를 화면을 그리기 전에 적용해서, 다크 모드 사용자에게 흰 화면이 잠깐 보이지 않게 한다 (T-54).
-      기본은 라이트이고, 저장소를 쓸 수 없으면 라이트로 시작한다.
+      테마를 화면을 그리기 전에 적용해서, 다크 모드 사용자에게 흰 화면이 잠깐 보이지 않게 한다 (T-54).
+      저장된 선택이 있으면 그것, 없으면 운영체제의 다크 모드 설정을 따른다 (plan.md FQA-12, T-203, src/lib/themeChoice.ts와 같은 규칙).
+      저장소를 쓸 수 없으면 운영체제 설정만 본다.
     -->
     <script>
-      try {
-        if (localStorage.getItem('kospi-theme') === 'dark') document.documentElement.classList.add('dark')
-      } catch (e) {}
+      var stored = null
+      try { stored = localStorage.getItem('kospi-theme') } catch (e) {}
+      var prefersDark = false
+      try { prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches } catch (e) {}
+      if (stored === 'dark' || (stored !== 'light' && prefersDark)) document.documentElement.classList.add('dark')
     </script>
   </head>
   <body>
