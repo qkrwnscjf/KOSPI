@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState, useSyncExternalStore } from 'react'
-import { getConnectionStatus, getLastReceivedAt, subscribeStatus, subscribeTicks, type TickData } from '@/lib/marketSocket'
+import { getConnectionStatus, getLastReceivedAt, subscribeReceived, subscribeStatus, subscribeTicks, type TickData } from '@/lib/marketSocket'
 import { appendPoint, mergePoints, type ChartPoint } from '@/lib/chartPoints'
 import { spreadValue } from '@/lib/spread'
 import { requestStatus, type RequestStatus } from '@/lib/api'
-import { parseHistory } from '@/lib/parsers'
+import { parseHistory, type HistoryResult } from '@/lib/parsers'
+import { queryClient } from '@/lib/queryClient'
 import { useApiQuery } from '@/hooks/useApiQuery'
 import { recentKey, trackRealtime } from '@/hooks/realtimeCache'
 
@@ -11,7 +12,8 @@ export type { ChartPoint }
 
 // 실시간 연결 상태와 마지막 데이터 수신 시각 (T-33). 공유 소켓 1개의 상태다.
 export const useConnectionStatus = () => useSyncExternalStore(subscribeStatus, getConnectionStatus)
-export const useLastReceivedAt = () => useSyncExternalStore(subscribeStatus, getLastReceivedAt)
+// 마지막 수신 시각은 연결 상태와 따로, 1초에 한 번만 알린다 (FQA-01, T-192)
+export const useLastReceivedAt = () => useSyncExternalStore(subscribeReceived, getLastReceivedAt)
 
 // 화면 상태. 공통 정의는 lib/api.ts (T-165). 기존 import 경로를 위해 이름을 그대로 둔다
 export type ChartStatus = RequestStatus
@@ -76,19 +78,27 @@ export function useMarketData(symbol: string, timeframe: string, ready: boolean,
     if (ready && seeded) trackRealtime(symbol)
   }, [ready, seeded, symbol])
 
-  // 첫 응답보다 먼저 온 tick도 화면에 보이도록 카드가 열려 있는 동안 따로 모아 합친다(같은 시각은 하나로)
+  // 첫 응답보다 먼저 온 tick도 화면에 보이도록, 첫 화면을 받기 전까지만 따로 모아 합친다(같은 시각은 하나로).
+  // 첫 화면을 받은 뒤에는 캐시(realtimeCache가 tick을 붙임) 한 경로만 쓴다 (plan.md FQA-03, T-194).
+  // 예전에는 받은 뒤에도 같은 tick을 캐시와 로컬 두 곳에 붙여 tick마다 상태를 두 번 바꾸고 합치기(정렬)를 다시 했다
   const [livePoints, setLivePoints] = useState<ChartPoint[]>([])
   useEffect(() => {
+    if (!ready || !isRealtime || seeded) return
     setLivePoints([])
-    if (!ready || !isRealtime) return
     return subscribeTicks(symbol, tick => setLivePoints(previous => appendPoint(previous, { time: tick.timestamp, value: tick.price })))
-  }, [symbol, isRealtime, ready])
+  }, [symbol, isRealtime, ready, seeded])
+  // 첫 화면을 받으면 그 전에 모아 둔 tick을 캐시에 한 번 합치고 로컬 목록은 비운다(받는 사이 온 값이 빠지지 않게)
+  useEffect(() => {
+    if (!seeded || livePoints.length === 0) return
+    queryClient.setQueryData<HistoryResult>(recentKey(symbol), previous => (previous ? { ...previous, points: mergePoints(previous.points, livePoints) } : previous))
+    setLivePoints([])
+  }, [seeded, livePoints, symbol])
 
   const fetched = query.data?.points
   const chartData = useMemo(() => {
     if (!ready) return []
-    return isRealtime ? mergePoints(fetched ?? [], livePoints) : fetched ?? []
-  }, [ready, isRealtime, fetched, livePoints])
+    return isRealtime && !seeded ? mergePoints(fetched ?? [], livePoints) : fetched ?? []
+  }, [ready, isRealtime, seeded, fetched, livePoints])
 
   const status: ChartStatus = ready ? requestStatus(query, query.data?.notReady ?? false) : 'not_ready'
   return { latest, chartData, status }

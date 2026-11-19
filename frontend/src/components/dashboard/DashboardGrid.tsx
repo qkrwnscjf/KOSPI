@@ -155,8 +155,8 @@ export function DashboardGrid({ categoryId }: DashboardGridProps) {
                 <span className="text-[11px] font-normal">{group.charts.length}</span>
               </h3>
             )}
-            <motion.div
-              layout
+            {/* 그리드 묶음 자체의 layout 측정은 뺐다 (plan.md FQA-04, T-195). 카드 위치 애니메이션은 아래 항목의 layout이 맡는다 */}
+            <div
               className={cn(
                 'grid w-full gap-5',
                 categoryId === 'category4'
@@ -184,7 +184,7 @@ export function DashboardGrid({ categoryId }: DashboardGridProps) {
                   </motion.div>
                 ))}
               </AnimatePresence>
-            </motion.div>
+            </div>
           </section>
         ))}
         {/* 국내 전광판: 아래쪽에 시장 폭·거래대금 (T-106) */}

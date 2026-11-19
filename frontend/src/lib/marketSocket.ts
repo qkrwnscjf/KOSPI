@@ -1,5 +1,6 @@
 import { io, Socket } from 'socket.io-client'
 import type { MarketState } from '@/lib/marketHours'
+import { createThrottledNotifier } from '@/lib/sharedSource'
 
 // 앱 전체가 함께 쓰는 WebSocket 연결 1개 (docs/Task_ORDER.md T-24, P-12)
 // 이전에는 차트 카드마다 소켓을 따로 열어서, 브라우저 1개가 카드 수만큼 연결을 만들었다.
@@ -51,6 +52,10 @@ let connectionStatus: ConnectionStatus = 'connecting'
 let lastReceivedAt: number | null = null
 const statusListeners = new Set<() => void>()
 const notifyStatus = () => statusListeners.forEach(listener => listener())
+// 마지막 수신 시각은 연결 상태와 따로 알린다 (plan.md FQA-01, T-192). 예전에는 tick마다 연결 상태 구독자(사이드바 표시 2개·하단·재연결 감시)
+// 전체에 알려 장중 1초에 여러 번 다시 그렸다. 연결 상태는 연결이 바뀔 때만, 수신 시각은 1초에 한 번만(화면 표시가 초 단위) 알린다
+const receivedListeners = new Set<() => void>()
+const notifyReceived = createThrottledNotifier(() => receivedListeners.forEach(listener => listener()), 1000)
 
 function getSocket() {
   if (socket) return socket
@@ -80,13 +85,13 @@ function getSocket() {
     if (previous && tick.timestamp < previous.timestamp) return
     latestTicks.set(tick.symbol, tick)
     lastReceivedAt = Date.now()
-    notifyStatus()
+    notifyReceived()
     listeners.get(tick.symbol)?.forEach(listener => listener(tick))
   })
 
   created.on('disclosure', (disclosure: DisclosureData) => {
     lastReceivedAt = Date.now()
-    notifyStatus()
+    notifyReceived()
     disclosureListeners.forEach(listener => listener(disclosure))
   })
 
@@ -110,6 +115,14 @@ export function subscribeStatus(listener: () => void) {
   statusListeners.add(listener)
   return () => {
     statusListeners.delete(listener)
+  }
+}
+
+export function subscribeReceived(listener: () => void) {
+  getSocket()
+  receivedListeners.add(listener)
+  return () => {
+    receivedListeners.delete(listener)
   }
 }
 

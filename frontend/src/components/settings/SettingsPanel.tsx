@@ -4,6 +4,7 @@ import { cn } from '@/lib/utils'
 import { formatClock } from '@/lib/format'
 import { DATASET_LABELS, formatAge, formatBytes, jobState, SERVICE_LABELS } from '@/lib/pipeline'
 import { usePipelineStatus } from '@/hooks/useAnalytics'
+import { FOCUSABLE_SELECTOR, nextFocusIndex } from '@/lib/focusTrap'
 
 // 설정 창 (docs/Task_ORDER.md 15단계 T-112, D-72)
 // 사이드바 아래 톱니바퀴 버튼으로 연다. "파이프라인 상태"(서비스·데이터 신선도·Kafka·수집기·DB)를 보여 준다(테마 전환은 사이드바 버튼).
@@ -98,13 +99,34 @@ function PipelineStatusView() {
 export function SettingsPanel({ onClose }: { onClose: () => void }) {
   const panelRef = useRef<HTMLDivElement>(null)
 
-  // Esc로 닫기, 열릴 때 창으로 포커스 이동
+  // Esc로 닫기, 열릴 때 창으로 포커스 이동.
+  // Tab은 창 안에서만 돌고, 닫으면 창을 연 버튼으로 포커스를 돌려준다 (plan.md FQA-11, T-197).
+  // onClose는 사이드바가 그릴 때마다(현재가 tick마다) 새로 만들어져서, 이전에는 그때마다 이 효과가 다시 돌며 포커스가 창으로 되돌아갔다.
+  // 그래서 최신 onClose는 ref로 읽고 효과는 열릴 때 한 번만 실행한다
+  const onCloseRef = useRef(onClose)
+  onCloseRef.current = onClose
   useEffect(() => {
+    const onClose = () => onCloseRef.current()
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null
     panelRef.current?.focus()
-    const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose() }
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        onClose()
+        return
+      }
+      if (event.key !== 'Tab' || !panelRef.current) return
+      const focusables = [...panelRef.current.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)]
+      const next = nextFocusIndex(focusables.indexOf(document.activeElement as HTMLElement), focusables.length, event.shiftKey)
+      if (next === null) return
+      event.preventDefault()
+      focusables[next]?.focus()
+    }
     window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onClose])
+    return () => {
+      window.removeEventListener('keydown', onKey)
+      opener?.focus()
+    }
+  }, [])
 
   return (
     <div className="fixed inset-0 z-50 flex justify-end bg-page/60 backdrop-blur-[2px]" onClick={onClose}>

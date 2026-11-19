@@ -1,5 +1,4 @@
-import { useEffect, useState } from 'react'
-import { motion } from 'framer-motion'
+import { useState, useSyncExternalStore } from 'react'
 import { AreaChart, Area, ResponsiveContainer, YAxis, Tooltip, XAxis, CartesianGrid } from 'recharts'
 import { TrendingUp, TrendingDown, Minus } from 'lucide-react'
 import { cn } from '@/lib/utils'
@@ -12,6 +11,8 @@ import { dataStatus, STALE_AFTER_MS } from '@/lib/dataStatus'
 import { useSourceLags } from '@/hooks/useSourceLags'
 import type { TickData } from '@/lib/marketSocket'
 import type { ChartCardConfig } from '@/constants/data'
+import { createClock } from '@/lib/sharedSource'
+import { chartSummary } from '@/lib/chartSummary'
 
 const TIME_RANGES = ['실시간', '1일', '1주', '1개월', '3개월', '1년']
 // 일별 시세 지표(T-67)는 하루 1개 값이라 실시간·1일 그래프가 없다
@@ -43,14 +44,9 @@ function formatTooltipTime(time: number, range: string) {
   return formatDate(time, true)
 }
 
-function useNow(intervalMs: number) {
-  const [now, setNow] = useState(() => Date.now())
-  useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), intervalMs)
-    return () => clearInterval(timer)
-  }, [intervalMs])
-  return now
-}
+// 앱 전체가 함께 쓰는 1초 시계 (plan.md FQA-02, T-193). 예전에는 카드마다 타이머가 따로 돌았다(섹터 탭 17개)
+const secondClock = createClock(1000)
+const useNow = () => useSyncExternalStore(secondClock.subscribe, secondClock.getSnapshot)
 
 const dateTime = (ms: number) => new Date(ms).toLocaleString('ko-KR')
 
@@ -69,7 +65,7 @@ interface PriceAndStatusProps {
 // 한 줄: ● 장 상태(T-42, 공휴일은 소스 장 상태 T-56) · 소스 지연(T-162 실측) · 마지막 수신(worker 수집 시각).
 // 장이 열려 있는데 오래 새 값이 없으면 "갱신 지연"을 붙이고 가격을 흐리게 한다
 function PriceAndStatus({ ready, latest, decimals, prefix, suffix, market, daily, lag }: PriceAndStatusProps) {
-  const now = useNow(1000)
+  const now = useNow()
   const delayMinutes = daily ? null : delayBadgeMinutes(lag)
   // 특수 거래일의 늘어난 시간에는 소스 PRE·POST를 장중으로 본다 (QA-44 / P4-3, T-180)
   const badge = ready && market && !daily
@@ -153,13 +149,9 @@ export function ChartCard({ title, symbol, ready, decimals, prefix, suffix, mark
   const lag = daily ? undefined : spread ? combineLags(sourceLags[spread.long], sourceLags[spread.short]) : sourceLags[symbol]
 
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 12 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
-      // 마우스를 올리면 테두리가 강조색으로 은은하게 빛난다 (T-69). 그래프 색은 등락 색 그대로다
-      className="card-neon relative h-[340px] rounded-xl border border-line bg-surface"
-    >
+    // 등장 효과는 DashboardGrid의 감싸는 요소가 맡는다 (plan.md FQA-04, T-195: 예전에는 카드 안에서 한 번 더 움직였다)
+    // 마우스를 올리면 테두리가 강조색으로 은은하게 빛난다 (T-69). 그래프 색은 등락 색 그대로다
+    <div className="card-neon relative h-[340px] rounded-xl border border-line bg-surface">
       <div className="flex h-full flex-col p-5">
         <div className="mb-2 flex items-start justify-between gap-3">
           <div className="min-w-0">
@@ -194,7 +186,8 @@ export function ChartCard({ title, symbol, ready, decimals, prefix, suffix, mark
         </div>
 
         {/* 격자·축·커서는 currentColor(본문색), 선·채우기는 등락 색 클래스를 따로 받는다. 모두 라이트·다크에 맞게 바뀐다 */}
-        <div className="relative -mx-2 flex-1 text-fg">
+        {/* 그래프의 글 대안 (plan.md FQA-11, T-197): 화면 읽기 프로그램은 그림 대신 시작·마지막 값과 기간 등락을 읽는다 */}
+        <div className="relative -mx-2 flex-1 text-fg" role="img" aria-label={chartSummary(title, activeRange, chartData, value => `${prefix ?? ''}${formatNumber(value, decimals)}${suffix ? ` ${suffix}` : ''}`)}>
           {message && (
             <div className="absolute inset-0 z-10 flex items-center justify-center text-xs text-fg-muted">
               {message}
@@ -247,14 +240,15 @@ export function ChartCard({ title, symbol, ready, decimals, prefix, suffix, mark
                 stroke="currentColor"
                 strokeWidth={1.5}
                 fill={`url(#${gradientId})`}
-                isAnimationActive={true}
-                /* 1초 애니메이션 동안 새 값이 늦게 그려져서 300ms로 줄였다 (T-27) */
+                /* 실시간은 tick마다 점이 붙어 300ms 선 애니메이션이 매번 처음부터 다시 돌았다 → 끈다 (plan.md FQA-03, T-194).
+                   1일 ~ 1년은 기간을 바꿀 때만 그려서 그대로 둔다(1초 애니메이션 동안 새 값이 늦게 그려져 300ms로 줄임, T-27) */
+                isAnimationActive={activeRange !== '실시간'}
                 animationDuration={300}
               />
             </AreaChart>
           </ResponsiveContainer>
         </div>
       </div>
-    </motion.div>
+    </div>
   )
 }
