@@ -1,7 +1,8 @@
 // Kafka 메시지 검증 테스트 (docs/Task_ORDER.md T-45, T-13, SEC-002)
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseTick } from '../src/shared/tick-validation.js';
+import { parseTick, validateTickRecord } from '../src/shared/tick-validation.js';
+import { isPlausibleTickTime, TICK_MAX_FUTURE_MS } from '../src/shared/event-time.js';
 
 const VALID = { symbol: 'KOSPI', category: 'domestic', price: 2650.12, changeRate: 0.45, changePrice: 11.8, timestamp: 1791961773000 };
 const message = (value: unknown) => Buffer.from(typeof value === 'string' ? value : JSON.stringify(value));
@@ -65,6 +66,22 @@ test('장 상태는 정해진 값만 받는다 (T-56)', () => {
   if (result.ok) assert.equal(result.tick.marketState, 'CLOSED');
   assert.equal(reasonOf({ ...VALID, marketState: 'HOLIDAY' }), 'market_state');
   assert.equal(reasonOf({ ...VALID, marketState: '<b>REGULAR</b>' }), 'market_state');
+});
+
+// 보내는 쪽과 받는 쪽 같은 기준 (plan.md QA-14 · 15 / P2-4, T-187)
+test('validateTickRecord는 parseTick과 같은 결과를 낸다 (보내는 쪽 검증)', () => {
+  for (const value of [VALID, { ...VALID, volume: 1.5 }, { ...VALID, price: 0 }, { ...VALID, marketState: 'HOLIDAY' }]) {
+    const fromMessage = parseTick(message(value));
+    const fromRecord = validateTickRecord(value as Record<string, unknown>);
+    assert.deepEqual(fromRecord, fromMessage, JSON.stringify(value));
+  }
+});
+
+test('장중 tick의 미래 시각은 5분까지만 허용한다 (일별 값의 36시간과 다름)', () => {
+  const now = Date.parse('2026-11-19T06:00:00Z');
+  assert.equal(isPlausibleTickTime(now - 20 * 60_000, now), true, '20분 지연된 소스 시각');
+  assert.equal(isPlausibleTickTime(now + TICK_MAX_FUTURE_MS, now), true, '시계 차이 5분');
+  assert.equal(isPlausibleTickTime(now + 9 * 3600_000, now), false, '시간대 실수(+9시간)');
 });
 
 test('검증을 통과한 tick에는 알려진 필드만 남는다 (임의 필드가 브라우저까지 전달되지 않음)', () => {

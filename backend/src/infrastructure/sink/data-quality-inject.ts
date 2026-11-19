@@ -70,7 +70,8 @@ export async function runDqInjection(pool: Pool) {
   try {
     await client.query('BEGIN');
     await client.query(`SET LOCAL lock_timeout = '5s'`);
-    const before = await runChecks(query);
+    // 보관 초과는 기다리지 않고 바로 검출한다 (T-184: 실제 검사는 보관 작업 한 번을 기다린 뒤 경고)
+    const before = await runChecks(query, Date.now(), { retentionGrace: false });
     for (const { target, sql } of INJECTIONS) {
       try {
         await client.query('SAVEPOINT inject');
@@ -82,7 +83,7 @@ export async function runDqInjection(pool: Pool) {
         failed.push(`${target}:${safeLogText(error instanceof Error ? error.message : 'unexpected_error', 80)}`);
       }
     }
-    const after = await runChecks(query);
+    const after = await runChecks(query, Date.now(), { retentionGrace: false });
     hits = applied.filter(target => detected(before, after, target));
     misses = applied.filter(target => !hits.includes(target));
   } finally {

@@ -2,7 +2,7 @@
 // backend/test/market-hours.test.ts와 같은 사례다. 화면용 복사본(lib/marketHours.ts)이 백엔드 규칙과 어긋나면 실패한다.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { isMarketOpen, marketBadge, type MarketId } from '../src/lib/marketHours.ts'
+import { isKrxExtendedHour, isMarketOpen, marketBadge, type MarketId } from '../src/lib/marketHours.ts'
 
 // [시장, UTC 시각, 기대값, 설명]. 2026-10-16은 금요일, 미국은 서머타임(EDT, UTC-4) 기간이다.
 const CASES: [MarketId, string, boolean, string][] = [
@@ -64,4 +64,26 @@ test('marketBadge: 장 시간인데 소스가 닫혀 있으면 휴장, PRE/POST�
   assert.deepEqual(marketBadge(true, 'CLOSED'), { label: '휴장', open: false })
   assert.deepEqual(marketBadge(true, 'PRE'), { label: '장 시작 전', open: false })
   assert.deepEqual(marketBadge(true, 'POST'), { label: '장 마감', open: false })
+})
+
+// 특수 거래일의 늘어난 시간 (plan.md QA-44 / P4-3, T-180). backend/test/market-hours.test.ts와 같은 사례
+const krxBadge = (iso: string, state: Parameters<typeof marketBadge>[1]) => {
+  const now = new Date(iso)
+  return marketBadge(isMarketOpen('krx', now), state, isKrxExtendedHour(now))
+}
+
+test('수능일 16:00 KST + 소스 POST → 장중', () => {
+  assert.deepEqual(krxBadge('2026-11-19T07:00:00Z', 'POST'), { label: '장중', open: true })
+})
+
+test('수능일 16:40 KST + 소스 POST → 장 마감', () => {
+  assert.deepEqual(krxBadge('2026-11-19T07:40:00Z', 'POST'), { label: '장 마감', open: false })
+})
+
+test('평소 날 15:40 KST + 소스 POST → 장 마감', () => {
+  assert.deepEqual(krxBadge('2026-11-18T06:40:00Z', 'POST'), { label: '장 마감', open: false })
+})
+
+test('수능일 16:00 KST + 소스 CLOSED → 휴장', () => {
+  assert.deepEqual(krxBadge('2026-11-19T07:00:00Z', 'CLOSED'), { label: '휴장', open: false })
 })

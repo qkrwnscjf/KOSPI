@@ -47,10 +47,13 @@ export type MarketStatus = 'open' | 'holiday' | 'closed';
 // - 장 시간 밖이면 소스와 상관없이 closed
 // - 장 시간인데 그 시장의 지표 중 하나라도 REGULAR이거나, 소스 장 상태를 하나도 모르면 open (이전 동작과 같음)
 // - 장 시간인데 소스가 모두 REGULAR가 아니면 holiday
-export function decideMarketStatus(timeOpen: boolean, sourceStates: (MarketState | undefined)[]): MarketStatus {
+// - 예외 (plan.md QA-44 / P4-3, T-180): 거래소가 마감을 늦춘 특수 거래일의 늘어난 시간(extendedHour)에는
+//   소스가 평소 일정대로 PRE·POST를 보내므로(2026-11-19 측정, B-69) 그 값으로 휴장 판단을 하지 않는다. 소스가 CLOSED면 그대로 holiday
+export function decideMarketStatus(timeOpen: boolean, sourceStates: (MarketState | undefined)[], extendedHour = false): MarketStatus {
   if (!timeOpen) return 'closed';
   const known = sourceStates.filter((state): state is MarketState => state !== undefined);
   if (known.length === 0 || known.includes('REGULAR')) return 'open';
+  if (extendedHour && !known.includes('CLOSED')) return 'open';
   return 'holiday';
 }
 
@@ -96,6 +99,25 @@ export const KRX_SPECIAL_SESSIONS: Readonly<Record<string, { open: number; close
 };
 const KRX_REGULAR_SESSION = { open: hm(9), close: hm(15, 30) };
 export const krxSession = (seoulDate: string) => KRX_SPECIAL_SESSIONS[seoulDate] ?? KRX_REGULAR_SESSION;
+
+// 특수 거래일에 평소 마감 뒤로 늘어난 시간인지 (QA-44 / P4-3, T-180). 수능일 15:30 ~ 16:30이 해당한다.
+// 늦게 여는 시간(새해 첫 거래일 09:00 ~ 10:00)은 시간표가 닫힘이라 소스와 상관없이 closed라 따로 볼 필요가 없다
+export function isKrxExtendedHour(now: Date): boolean {
+  const { day, minutes, date } = zonedClock(now, 'Asia/Seoul');
+  const special = KRX_SPECIAL_SESSIONS[date];
+  return special !== undefined && isWeekday(day) && minutes >= KRX_REGULAR_SESSION.close && minutes < special.close;
+}
+
+// 특수 거래일 표가 끝나 가는지 (QA-31 / P5-3, T-181). 표는 거래소 공지로 확인한 날짜만 손으로 넣으므로,
+// 마지막 날짜가 다가오거나 지나면 다음 해 날짜(수능일·새해 첫 거래일)를 넣어야 한다는 신호를 남긴다
+export const SPECIAL_SESSION_WARN_DAYS = 30;
+export function specialSessionHorizon(nowMs: number): { lastDate: string | null; daysLeft: number | null; warn: boolean } {
+  const lastDate = Object.keys(KRX_SPECIAL_SESSIONS).sort().at(-1) ?? null;
+  if (lastDate === null) return { lastDate, daysLeft: null, warn: true };
+  const today = zonedClock(new Date(nowMs), 'Asia/Seoul').date;
+  const daysLeft = Math.round((Date.parse(`${lastDate}T00:00:00Z`) - Date.parse(`${today}T00:00:00Z`)) / 86_400_000);
+  return { lastDate, daysLeft, warn: daysLeft <= SPECIAL_SESSION_WARN_DAYS };
+}
 
 // 정규 장 마감 시각 (T-145). 24시간 시장은 하루 종가의 기준이 없어 넣지 않는다. 국내는 특수 거래일이면 그날 마감 시각을 쓴다(T-166)
 const SESSION_CLOSE: Partial<Record<MarketId, { timeZone: string; close: number }>> = {

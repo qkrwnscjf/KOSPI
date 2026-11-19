@@ -15,9 +15,12 @@ export type MarketBadgeLabel = '장중' | '휴장' | '장 시작 전' | '장 마
 // - 장 시간 + 소스 REGULAR 또는 소스 정보 없음: 장중
 // - 장 시간 + 소스 CLOSED: 휴장(공휴일 등)
 // - 장 시간 + 소스 PRE / POST: 장 시작 전 / 장 마감(조기 폐장 등)
-export function marketBadge(timeOpen: boolean, state: MarketState | undefined): { label: MarketBadgeLabel; open: boolean } {
+// - 예외 (plan.md QA-44 / P4-3, T-180): 특수 거래일에 늘어난 시간(extendedHour)에는 소스가 평소 일정대로 PRE·POST를 보내므로 장중으로 본다.
+//   소스가 CLOSED면 그대로 휴장
+export function marketBadge(timeOpen: boolean, state: MarketState | undefined, extendedHour = false): { label: MarketBadgeLabel; open: boolean } {
   if (!timeOpen) return { label: '장 마감', open: false }
   if (state === undefined || state === 'REGULAR') return { label: '장중', open: true }
+  if (extendedHour && state !== 'CLOSED') return { label: '장중', open: true }
   if (state === 'CLOSED') return { label: '휴장', open: false }
   if (state === 'PRE' || state === 'PREPRE') return { label: '장 시작 전', open: false }
   return { label: '장 마감', open: false }
@@ -53,6 +56,13 @@ const KRX_SPECIAL_SESSIONS: Readonly<Record<string, { open: number; close: numbe
   '2027-01-04': { open: hm(10), close: hm(15, 30) }, // 새해 첫 거래일
 }
 const KRX_REGULAR_SESSION = { open: hm(9), close: hm(15, 30) }
+
+// 특수 거래일에 평소 마감 뒤로 늘어난 시간인지 (T-180). backend market-hours.ts의 isKrxExtendedHour와 같은 규칙
+export function isKrxExtendedHour(now: Date): boolean {
+  const { day, minutes, date } = zonedClock(now, 'Asia/Seoul')
+  const special = KRX_SPECIAL_SESSIONS[date]
+  return special !== undefined && isWeekday(day) && minutes >= KRX_REGULAR_SESSION.close && minutes < special.close
+}
 
 export function isMarketOpen(market: MarketId, now: Date): boolean {
   if (market === 'krx') {

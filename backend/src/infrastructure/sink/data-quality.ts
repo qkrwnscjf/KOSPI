@@ -96,6 +96,37 @@ export const RETENTION_LIMITS: Record<string, { column: string; limitMs: number 
 export const evalRetention = (ages: readonly { name: string; age_ms: number | null }[]) =>
   ages.filter(row => row.age_ms !== null && row.age_ms > (RETENTION_LIMITS[row.name]?.limitMs ?? Infinity)).map(row => row.name);
 
+// 보관 한계를 넘은 표를 바로 경고하지 않고, 처음 본 뒤 보관 작업이 한 번 더 돌았는데도 남아 있을 때만 경고한다 (plan.md QA-24 / P3-3, T-184).
+// 원인(T-174): 스택이 꺼진 동안 마감한 시장의 마지막 tick(몇 시간 전 시각)이 기동 직후 늦게 저장되어 직전 보관 실행에서 지워지지 않고,
+// 다음 보관 실행(원본은 최대 1시간 뒤)에 지워진다. 그 사이 기동마다 최대 1시간 거짓 경고가 났다.
+// - firstSeen: 표마다 한계를 넘은 것을 처음 본 시각(db-sink 메모리, 재시작하면 다시 기다림)
+// - lastRetentionStart: 그 표의 보관 작업이 마지막으로 시작한 시각. 없으면(작업이 없음) 바로 경고한다
+// 보관 작업이 아예 돌지 않는 경우는 `db/jobs` 검사(주기의 3배)가 따로 잡는다.
+export function evalRetentionWithGrace(
+  overdue: readonly string[],
+  lastRetentionStart: ReadonlyMap<string, number>,
+  firstSeen: Map<string, number>,
+  nowMs: number,
+): { warn: string[]; waiting: string[] } {
+  for (const name of [...firstSeen.keys()]) if (!overdue.includes(name)) firstSeen.delete(name);
+  const warn: string[] = [];
+  const waiting: string[] = [];
+  for (const name of overdue) {
+    const seenAt = firstSeen.get(name) ?? nowMs;
+    firstSeen.set(name, seenAt);
+    const lastRun = lastRetentionStart.get(name);
+    if (lastRun === undefined || lastRun > seenAt) warn.push(name);
+    else waiting.push(name);
+  }
+  return { warn, waiting };
+}
+const retentionFirstSeen = new Map<string, number>();
+
+export interface CheckOptions {
+  // 결함 주입 시험(data-quality-inject.ts)은 같은 트랜잭션 안에서 바로 검출해야 하므로 기다리지 않는다
+  retentionGrace?: boolean;
+}
+
 // 수집 경로별 마지막 성공 실행의 허용 나이. KRX·Yahoo 차트는 받을 날짜가 있을 때만 실행되어 주말·연휴를 포함해 넉넉하게 둔다.
 export const RUN_LIMITS: Record<string, number> = {
   yahoo_quote: 10 * MINUTE,
@@ -316,7 +347,7 @@ async function ingestionChecks(query: QueryFn): Promise<DqResult[]> {
   ];
 }
 
-async function dbChecks(query: QueryFn): Promise<DqResult[]> {
+async function dbChecks(query: QueryFn, nowMs: number, options: CheckOptions): Promise<DqResult[]> {
   // 보관 정책이 실제로 지우고 있는지 (표 이름·칼럼은 코드의 고정 표에서만 온다)
   const ages = await query(
     Object.entries(RETENTION_LIMITS)
@@ -335,14 +366,34 @@ async function dbChecks(query: QueryFn): Promise<DqResult[]> {
      WHERE j.proc_name IN ('policy_retention', 'policy_refresh_continuous_aggregate')`
   );
   const unhealthy = jobs.rows.filter(row => row.status === 'Failed' || (row.age_s !== null && row.age_s > 3 * row.schedule_s)).map(row => row.job);
+  const overdue = evalRetention(ages.rows);
+  let retention = issues('db', 'retention_overdue', overdue);
+  if (options.retentionGrace !== false && overdue.length > 0) {
+    // 표(연속 집계는 보기 이름)별 보관 작업의 마지막 시작 시각 (T-184)
+    const runs = await query(
+      `SELECT COALESCE(ca.view_name::text, j.hypertable_name::text) AS name, (extract(epoch FROM max(s.last_run_started_at)) * 1000)::float8 AS ms
+       FROM timescaledb_information.jobs j
+       JOIN timescaledb_information.job_stats s ON s.job_id = j.job_id
+       LEFT JOIN timescaledb_information.continuous_aggregates ca
+         ON ca.materialization_hypertable_schema = j.hypertable_schema AND ca.materialization_hypertable_name = j.hypertable_name
+       WHERE j.proc_name = 'policy_retention' GROUP BY 1`
+    );
+    const lastStart = new Map(runs.rows.filter(row => row.ms !== null).map(row => [row.name as string, row.ms as number]));
+    const { warn, waiting } = evalRetentionWithGrace(overdue, lastStart, retentionFirstSeen, nowMs);
+    retention = warn.length > 0
+      ? issues('db', 'retention_overdue', warn)
+      : { dataset: 'db', check: 'retention_overdue', status: 'ok', observed: 0, expected: 0, detail: waiting.map(name => `waiting_next_retention_run:${name}`) };
+  } else if (options.retentionGrace !== false) {
+    retentionFirstSeen.clear();
+  }
   return [
-    issues('db', 'retention_overdue', evalRetention(ages.rows)),
+    retention,
     issues('db', 'jobs', unhealthy),
   ];
 }
 
 // 모든 검사를 실행한다. 한 묶음이 실패해도 나머지는 계속한다.
-export async function runChecks(query: QueryFn, nowMs = Date.now()): Promise<DqResult[]> {
+export async function runChecks(query: QueryFn, nowMs = Date.now(), options: CheckOptions = {}): Promise<DqResult[]> {
   const groups: [string, () => Promise<DqResult[]>][] = [
     ['yahoo_quote', () => yahooQuoteChecks(query, nowMs)],
     ['yahoo_chart', () => yahooChartChecks(query, nowMs)],
@@ -351,7 +402,7 @@ export async function runChecks(query: QueryFn, nowMs = Date.now()): Promise<DqR
     ['dart', () => dartChecks(query)],
     ['kofia', () => kofiaChecks(query)],
     ['ingestion', () => ingestionChecks(query)],
-    ['db', () => dbChecks(query)],
+    ['db', () => dbChecks(query, nowMs, options)],
   ];
   const results: DqResult[] = [];
   for (const [dataset, run] of groups) {

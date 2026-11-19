@@ -9,6 +9,34 @@ import { RCEPT_NO_PATTERN, type Disclosure, type DisclosureGroup, type Disclosur
 
 export type DisclosureBase = Omit<Disclosure, 'amount' | 'live' | 'collectedAt' | 'producedAt'>;
 
+// 주기 조회의 쪽 넘김 (plan.md QA-09 / P2-1, T-178)
+// 예전: 한 주기에 5쪽(500건)까지만 읽고 읽은 접수번호를 모두 "봤음"으로 기록했다. 500건 넘게 밀리면 다음 주기는 1쪽에서
+//       이미 본 공시를 만나 멈춰서 6쪽 이후는 재시작 전까지 읽히지 않았다(공시 마감일·한도 초과 뒤).
+// 지금: 상한에 걸려 끝까지 못 읽으면 이어 읽을 쪽(nextPage)을 돌려준다. 다음 주기는 1쪽(새 공시)을 읽은 뒤 그 쪽부터 이어 읽는다.
+//       새 공시는 앞쪽에 붙어서 뒤쪽 항목은 뒤로 밀리기만 하므로, 이어 읽는 쪽 번호가 같아도 빠지는 항목이 없다(겹치는 항목은 접수번호로 거른다).
+export interface LivePage { rceptNos: string[]; rawCount: number; totalPage: number }
+export interface LivePageOptions {
+  firstPage: number;
+  maxPages: number;
+  pageSize: number;
+  isSeen: (rceptNo: string) => boolean;
+  stopOnSeen: boolean; // 1쪽부터 읽을 때만 참: 이미 본 공시가 나오면 그 뒤는 모두 본 공시
+  shouldStop?: () => boolean;
+}
+
+export async function readLivePages<P extends LivePage>(fetchPage: (pageNo: number) => Promise<P>, options: LivePageOptions): Promise<{ pages: P[]; nextPage: number | null }> {
+  const pages: P[] = [];
+  const lastPage = options.firstPage + options.maxPages - 1;
+  for (let pageNo = options.firstPage; pageNo <= lastPage; pageNo += 1) {
+    if (options.shouldStop?.()) return { pages, nextPage: null };
+    const page = await fetchPage(pageNo);
+    pages.push(page);
+    if (page.rawCount < options.pageSize || pageNo >= page.totalPage) return { pages, nextPage: null };
+    if (options.stopOnSeen && page.rceptNos.some(options.isSeen)) return { pages, nextPage: null };
+  }
+  return { pages, nextPage: lastPage + 1 };
+}
+
 // 공시 제목 분류 규칙 (D-59 ③). 공백을 지운 제목에 대해 위에서부터 처음 맞는 규칙을 쓴다.
 const RULES: { includes: string; group: DisclosureGroup; kind: DisclosureKind }[] = [
   { includes: '전환사채권발행결정', group: 'dilution', kind: 'cb' },

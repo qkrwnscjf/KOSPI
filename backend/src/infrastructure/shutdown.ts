@@ -8,7 +8,28 @@ type ShutdownStep = { name: string; run: () => Promise<unknown> | unknown };
 
 const SHUTDOWN_TIMEOUT_MS = Number.parseInt(process.env.SHUTDOWN_TIMEOUT_MS ?? '', 10) || 8000;
 
+// 처리되지 않은 오류 (plan.md QA-02 / P1-2, T-175): 어느 서비스에서든 놓친 Promise 거부나 예외는 한 줄로 남기고 종료 코드 1로 끝낸다.
+// 살려 두면 상태가 어긋난 채 계속 돌 수 있어 종료는 유지하고, 재시작은 compose 재시작 정책에 맡긴다.
+// 오류 이름과 짧은 메시지만 남긴다(수집기 오류는 종류만 담도록 만들어져 있고, 주소·키는 남기지 않는다).
+let crashHandlersInstalled = false;
+const describeCrash = (error: unknown) =>
+  error instanceof Error ? `${error.name}: ${error.message.slice(0, 200)}` : typeof error === 'string' ? error.slice(0, 200) : 'non-error value';
+
+function installCrashHandlers(component: string) {
+  if (crashHandlersInstalled) return;
+  crashHandlersInstalled = true;
+  process.on('unhandledRejection', reason => {
+    console.error(`[crash] ${component}: unhandled promise rejection (${describeCrash(reason)}), exiting with code 1`);
+    process.exit(1);
+  });
+  process.on('uncaughtException', error => {
+    console.error(`[crash] ${component}: uncaught exception (${describeCrash(error)}), exiting with code 1`);
+    process.exit(1);
+  });
+}
+
 export function registerShutdown(component: string, steps: ShutdownStep[]) {
+  installCrashHandlers(component);
   let started = false;
 
   const shutdown = async (signal: string) => {

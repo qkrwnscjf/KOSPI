@@ -1,6 +1,6 @@
 import { kafka, TOPICS, ensureTopics, sendToDlq, probeBroker } from '../kafka.js';
 import { registerHealthCheck, trackConsumer, trackProducer } from '../health.js';
-import { dbPool } from '../db.js';
+import { dbPool, waitForSchema } from '../db.js';
 import { Counter, Gauge, Latency, metricsConfig, startMetricsLog, startMetricsServer } from '../metrics.js';
 import { parseTick } from '../../shared/tick-validation.js';
 import type { TickData } from '../../shared/types.js';
@@ -22,6 +22,7 @@ import { runDqInjection } from './data-quality-inject.js';
 import { runBackfillOnce, runDailyHistoryBackfill, runIntradayFill, runOfficialCloseRefresh } from './backfill.js';
 import { clampWindow, mergeWindows, planLateRefresh, POLICY_START_OFFSET_MS, SAFE_RAW_WINDOW_MS, type RefreshWindow } from './late-refresh.js';
 import { runDlqReplay } from './dlq-replay.js';
+import { chunkForParams } from './sql-chunks.js';
 import { registerShutdown } from '../shutdown.js';
 
 // DB 적재 컨슈머 (docs/Task_ORDER.md T-12, D-18)
@@ -60,7 +61,19 @@ const dbRows = new Gauge('kospi_db_rows', 'Row count of the smaller tables added
 // 여러 행을 INSERT 한 번으로 저장한다 (P-16). 단일 문장이라 전부 들어가거나 전부 실패한다.
 // 실제로 들어간 행 수와, 들어간 행의 시각들(늦은 데이터 보정용, T-128)을 돌려준다.
 // 나머지는 유니크 제약에 걸려 건너뛴 중복이다 (T-15). 중복은 이미 집계에 반영된 값이라 보정 대상이 아니다.
+// 매개변수 한도를 넘지 않게 나눠 넣는다 (QA-05 / P1-6, T-185)
 async function insertBatch(ticks: TickData[]) {
+  let inserted = 0;
+  const times: number[] = [];
+  for (const chunk of chunkForParams(ticks, 7)) {
+    const result = await insertTickRows(chunk);
+    inserted += result.inserted;
+    for (const ms of result.times) times.push(ms);
+  }
+  return { inserted, times };
+}
+
+async function insertTickRows(ticks: TickData[]) {
   const values: unknown[] = [];
   const rows = ticks.map((tick, index) => {
     const base = index * 7;
@@ -88,7 +101,8 @@ let lastUnrecoverableWarnAt = 0;
 function scheduleLateRefresh(insertedTimes: number[]) {
   if (insertedTimes.length === 0) return;
   const nowMs = Date.now();
-  const oldestInsertedMs = Math.min(...insertedTimes);
+  // 행이 수만 개일 수 있어 펼치기(...) 대신 하나씩 비교한다 (T-185)
+  const oldestInsertedMs = insertedTimes.reduce((min, ms) => (ms < min ? ms : min), Infinity);
   const { window, unrecoverable } = planLateRefresh(oldestInsertedMs, nowMs);
   if (!window && !unrecoverable) return;
   const safeStart = nowMs - SAFE_RAW_WINDOW_MS;
@@ -135,6 +149,12 @@ async function runLateRefresh(planned: RefreshWindow | null) {
 const indexDailyRowsUpserted = new Counter('kospi_sink_index_daily_rows_upserted_total', 'KRX daily index rows inserted or updated');
 
 async function upsertIndexDaily(ticks: TickData[]) {
+  let upserted = 0;
+  for (const chunk of chunkForParams(ticks, 5)) upserted += await upsertIndexDailyRows(chunk);
+  return upserted;
+}
+
+async function upsertIndexDailyRows(ticks: TickData[]) {
   const values: unknown[] = [];
   const rows = ticks.map((tick, index) => {
     const base = index * 5;
@@ -217,6 +237,12 @@ async function handleDailyBatch({ batch, resolveOffset, heartbeat }: EachBatchPa
 const breadthRowsUpserted = new Counter('kospi_sink_breadth_rows_upserted_total', 'Market breadth rows inserted or updated');
 
 async function upsertBreadth(items: MarketBreadth[]) {
+  let upserted = 0;
+  for (const chunk of chunkForParams(items, 7)) upserted += await upsertBreadthRows(chunk);
+  return upserted;
+}
+
+async function upsertBreadthRows(items: MarketBreadth[]) {
   const values: unknown[] = [];
   const rows = items.map((item, index) => {
     const base = index * 7;
@@ -315,19 +341,22 @@ async function upsertMarketFlows(flows: MarketFlow[]) {
     flows.flatMap(flow => Object.entries(flow.values).map(([field, value]) => ({ time: flow.time, metric: `${flow.dataset}.${field}`, value }))),
     row => `${row.metric}|${row.time}`
   );
-  if (rows.length === 0) return 0;
-  const values: unknown[] = [];
-  const placeholders = rows.map((row, index) => {
-    const base = index * 3;
-    values.push(row.time, row.metric, row.value);
-    return `(to_timestamp($${base + 1} / 1000.0), $${base + 2}, $${base + 3}, 'kofia')`;
-  });
-  const result = await dbPool.query(
-    `INSERT INTO market_flows (time, metric, value, source) VALUES ${placeholders.join(', ')}
-     ON CONFLICT (metric, time) DO UPDATE SET value = EXCLUDED.value`,
-    values
-  );
-  return result.rowCount ?? 0;
+  let upserted = 0;
+  for (const chunk of chunkForParams(rows, 3)) {
+    const values: unknown[] = [];
+    const placeholders = chunk.map((row, index) => {
+      const base = index * 3;
+      values.push(row.time, row.metric, row.value);
+      return `(to_timestamp($${base + 1} / 1000.0), $${base + 2}, $${base + 3}, 'kofia')`;
+    });
+    const result = await dbPool.query(
+      `INSERT INTO market_flows (time, metric, value, source) VALUES ${placeholders.join(', ')}
+       ON CONFLICT (metric, time) DO UPDATE SET value = EXCLUDED.value`,
+      values
+    );
+    upserted += result.rowCount ?? 0;
+  }
+  return upserted;
 }
 
 // 다른 토픽과 같은 규칙: 잘못된 메시지는 DLQ, 저장에 성공한 뒤에만 오프셋 확정.
@@ -359,6 +388,12 @@ const yahooDailyReceived = new Counter('kospi_sink_yahoo_daily_received_total', 
 const yahooDailyWritten = new Counter('kospi_sink_yahoo_daily_rows_written_total', 'Yahoo daily rows inserted or updated in index_daily');
 
 async function writeYahooDaily(rows: YahooDailyMessage[], overwrite: boolean) {
+  let written = 0;
+  for (const chunk of chunkForParams(rows, 5)) written += await writeYahooDailyRows(chunk, overwrite);
+  return written;
+}
+
+async function writeYahooDailyRows(rows: YahooDailyMessage[], overwrite: boolean) {
   if (rows.length === 0) return 0;
   const values: unknown[] = [];
   const placeholders = rows.map((row, index) => {
@@ -740,6 +775,9 @@ async function logJobErrors() {
 
 async function run() {
   console.log('DB sink starting...');
+  // backend가 만든 스키마가 준비될 때까지만 기다린다(backend healthy·Gateway 그룹 참여는 기다리지 않음, QA-35 / P1-5, T-191)
+  const schemaVersion = await waitForSchema();
+  console.log(`DB schema ready (migration ${schemaVersion}).`);
   // 상태 점검 (T-152): Kafka 컨슈머 활동, DLQ·일봉 전송, DB 응답
   trackConsumer('kafka_consumer', consumer);
   trackProducer('kafka_producer', dlqProducer, probeBroker);

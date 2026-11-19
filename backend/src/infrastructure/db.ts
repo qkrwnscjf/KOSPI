@@ -493,9 +493,17 @@ function setAggregateChunkInterval(view: string, interval: string) {
   $$`;
 }
 
-// 마이그레이션이 실패하면 예외를 던진다. backend는 스키마 없이 뜨지 않고 종료한다 (restart: on-failure가 다시 시도).
+// 마지막 마이그레이션 번호. db-sink는 backend가 이 번호까지 적용한 뒤에 시작한다 (waitForSchema, T-191)
+export const LATEST_MIGRATION_VERSION = MIGRATIONS.reduce((max, migration) => Math.max(max, migration.version), 0);
+// 마이그레이션 잠금 번호 (plan.md QA-06 / P1-7, T-190). 프로젝트에서 이 값만 쓴다
+const MIGRATION_LOCK_ID = 7_302_026;
+
+// 마이그레이션이 실패하면 예외를 던진다. backend는 스키마 없이 뜨지 않고 종료한다 (재시작 정책이 다시 시도).
+// 두 프로세스가 동시에 마이그레이션을 실행하지 않도록 세션 잠금(advisory lock)을 건다 (QA-06 / P1-7, T-190).
+// 연속 집계 문장은 트랜잭션 안에서 실행할 수 없어 트랜잭션 잠금 대신 세션 잠금을 쓰고, 끝나면(실패해도) 푼다
 export const initDB = async () => {
   const client = await dbPool.connect();
+  await client.query('SELECT pg_advisory_lock($1)', [MIGRATION_LOCK_ID]);
   try {
     await client.query('CREATE EXTENSION IF NOT EXISTS timescaledb;');
     await client.query(`
@@ -524,6 +532,29 @@ export const initDB = async () => {
     );
     console.log(`TimescaleDB schema ready (extension ${extension.rows[0]?.extversion ?? 'unknown'}, migrations up to ${MIGRATIONS.length}).`);
   } finally {
+    await client.query('SELECT pg_advisory_unlock($1)', [MIGRATION_LOCK_ID]).catch(() => undefined);
     client.release();
   }
 };
+
+// 스키마 준비 기다리기 (plan.md QA-35 / P1-5, T-191)
+// 예전에는 db-sink가 backend healthy를 기다렸고, backend healthy에는 Gateway 컨슈머 그룹 참여까지 들어 있어
+// 실시간 경로가 늦으면 저장 경로(db-sink)도 시작하지 못했다. 이제 db-sink는 스키마(마지막 마이그레이션)만 직접 확인한다.
+// 읽기 전용 조회만 하고, 시간 안에 준비되지 않으면 예외(→ 종료 코드 1, 재시작 정책이 다시 띄움)
+export async function waitForSchema(version = LATEST_MIGRATION_VERSION, timeoutMs = 5 * 60_000, intervalMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastReason = 'not checked';
+  while (Date.now() < deadline) {
+    try {
+      const { rows } = await dbPool.query<{ version: number | null }>('SELECT max(version) AS version FROM schema_migrations');
+      const applied = rows[0]?.version ?? 0;
+      if (applied >= version) return applied;
+      lastReason = `migrations applied up to ${applied}`;
+    } catch (error) {
+      // 표가 아직 없거나 DB가 막 뜨는 중
+      lastReason = error instanceof Error ? error.message.slice(0, 120) : 'unexpected_error';
+    }
+    await new Promise(resolve => setTimeout(resolve, intervalMs));
+  }
+  throw new Error(`DB schema not ready within ${Math.round(timeoutMs / 1000)}s (need migration ${version}; ${lastReason})`);
+}

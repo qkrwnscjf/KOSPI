@@ -2,7 +2,7 @@
 // frontend/test/marketHours.test.ts에 같은 사례가 있다. 두 파일의 규칙이 어긋나면 한쪽이 실패한다 (D-36).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { KRX_SPECIAL_SESSIONS, MARKETS, YAHOO_MARKET, decideMarketStatus, latestSessionEnd, type MarketId } from '../src/infrastructure/ingestion/market-hours.js';
+import { KRX_SPECIAL_SESSIONS, MARKETS, SPECIAL_SESSION_WARN_DAYS, YAHOO_MARKET, decideMarketStatus, isKrxExtendedHour, latestSessionEnd, specialSessionHorizon, type MarketId } from '../src/infrastructure/ingestion/market-hours.js';
 import { YAHOO_KEYS } from '../src/shared/symbols.js';
 
 const isOpen = (market: MarketId, iso: string) => {
@@ -77,6 +77,48 @@ test('decideMarketStatus: 장 시간인데 소스가 모두 닫혀 있으면 hol
   assert.equal(decideMarketStatus(true, ['CLOSED', 'CLOSED']), 'holiday');
   assert.equal(decideMarketStatus(true, ['CLOSED', undefined]), 'holiday');
   assert.equal(decideMarketStatus(true, ['PRE', 'POST']), 'holiday');
+});
+
+// 특수 거래일의 늘어난 시간 (plan.md QA-44 / P4-3, T-180, B-76 ④). frontend/test/marketHours.test.ts에 같은 사례가 있다
+const krxStatus = (iso: string, states: Parameters<typeof decideMarketStatus>[1]) => {
+  const now = new Date(iso);
+  const krx = MARKETS.find(item => item.id === 'krx');
+  assert.ok(krx);
+  return decideMarketStatus(krx.isOpen(now), states, isKrxExtendedHour(now));
+};
+
+test('수능일 16:00 KST + 소스 POST → open (소스가 특수 거래일을 모름, B-69)', () => {
+  assert.equal(krxStatus('2026-11-19T07:00:00Z', ['POST', 'POST']), 'open');
+});
+
+test('수능일 16:40 KST + 소스 POST → closed (늘어난 마감도 지남)', () => {
+  assert.equal(krxStatus('2026-11-19T07:40:00Z', ['POST']), 'closed');
+});
+
+test('평소 날 15:40 KST + 소스 POST → closed', () => {
+  assert.equal(krxStatus('2026-11-18T06:40:00Z', ['POST']), 'closed');
+});
+
+test('수능일 16:00 KST + 소스 CLOSED → holiday (소스가 휴장이라고 하면 그대로)', () => {
+  assert.equal(krxStatus('2026-11-19T07:00:00Z', ['CLOSED', 'CLOSED']), 'holiday');
+});
+
+test('isKrxExtendedHour: 평소 마감 뒤 ~ 그날 마감 전만 참', () => {
+  assert.equal(isKrxExtendedHour(new Date('2026-11-19T06:29:00Z')), false, '수능일 15:29 (평소 장 시간)');
+  assert.equal(isKrxExtendedHour(new Date('2026-11-19T06:30:00Z')), true, '수능일 15:30');
+  assert.equal(isKrxExtendedHour(new Date('2026-11-19T07:30:00Z')), false, '수능일 16:30 (마감)');
+  assert.equal(isKrxExtendedHour(new Date('2027-01-04T06:40:00Z')), false, '새해 첫 거래일은 마감이 그대로');
+});
+
+// 특수 거래일 표 만료 경고 (plan.md P5-3, T-181, B-76 ⑤)
+test('specialSessionHorizon: 마지막 날짜 30일 전부터 경고하고, 지난 뒤에도 경고한다', () => {
+  const last = Object.keys(KRX_SPECIAL_SESSIONS).sort().at(-1);
+  assert.ok(last);
+  const lastMs = Date.parse(`${last}T03:00:00Z`); // 그날 12:00 KST
+  const before = (days: number) => specialSessionHorizon(lastMs - days * 86_400_000);
+  assert.deepEqual(before(SPECIAL_SESSION_WARN_DAYS + 1), { lastDate: last, daysLeft: SPECIAL_SESSION_WARN_DAYS + 1, warn: false });
+  assert.deepEqual(before(SPECIAL_SESSION_WARN_DAYS), { lastDate: last, daysLeft: SPECIAL_SESSION_WARN_DAYS, warn: true });
+  assert.deepEqual(before(-3), { lastDate: last, daysLeft: -3, warn: true });
 });
 
 test('latestSessionEnd: 수능일은 16:30 마감이라 공식 종가를 17:00부터 받는다 (T-166)', () => {

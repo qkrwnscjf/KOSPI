@@ -4,7 +4,7 @@ import { AreaChart, Area, ResponsiveContainer, YAxis, Tooltip, XAxis, CartesianG
 import { TrendingUp, TrendingDown, Minus } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { formatAxisNumber, formatClock, formatDate, formatNumber } from '@/lib/format'
-import { isMarketOpen, marketBadge, type MarketId } from '@/lib/marketHours'
+import { isKrxExtendedHour, isMarketOpen, marketBadge, type MarketId } from '@/lib/marketHours'
 import { useMarketData, useSpreadTick, type ChartStatus } from '@/hooks/useMarketData'
 import { periodDirection, type Direction } from '@/lib/chartPoints'
 import { combineLags, delayBadgeMinutes, type SourceLag } from '@/lib/sourceLag'
@@ -71,7 +71,10 @@ interface PriceAndStatusProps {
 function PriceAndStatus({ ready, latest, decimals, prefix, suffix, market, daily, lag }: PriceAndStatusProps) {
   const now = useNow(1000)
   const delayMinutes = daily ? null : delayBadgeMinutes(lag)
-  const badge = ready && market && !daily ? marketBadge(isMarketOpen(market, new Date(now)), latest?.marketState) : null
+  // 특수 거래일의 늘어난 시간에는 소스 PRE·POST를 장중으로 본다 (QA-44 / P4-3, T-180)
+  const badge = ready && market && !daily
+    ? marketBadge(isMarketOpen(market, new Date(now)), latest?.marketState, market === 'krx' && isKrxExtendedHour(new Date(now)))
+    : null
   const status = ready && !daily
     ? dataStatus({ marketLabel: badge?.label ?? null, marketOpen: badge?.open ?? false, delayMinutes, sourceTime: latest?.timestamp ?? null, receivedAt: latest?.collectedAt ?? null, now })
     : null

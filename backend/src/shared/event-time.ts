@@ -7,3 +7,9 @@ const MAX_FUTURE_MS = 36 * 3600_000;
 
 export const isPlausibleEventTime = (value: unknown, nowMs = Date.now()): value is number =>
   typeof value === 'number' && Number.isFinite(value) && value >= MIN_EVENT_TIME_MS && value <= nowMs + MAX_FUTURE_MS;
+
+// 장중 시세의 미래 허용 범위 (plan.md QA-15 / P2-4, T-187). 일별 값용 36시간을 장중 tick에도 쓰면 시간대 실수(+9시간)로 만든 tick이
+// 저장되어 "최신값"으로 보였다. 소스 시각은 늘 수집 시각보다 이르므로, 시계 차이 여유만 두고 5분으로 막는다(품질 검사 future_time과 같은 기준).
+export const TICK_MAX_FUTURE_MS = 5 * 60_000;
+export const isPlausibleTickTime = (value: unknown, nowMs = Date.now()): value is number =>
+  isPlausibleEventTime(value, nowMs) && value <= nowMs + TICK_MAX_FUTURE_MS;

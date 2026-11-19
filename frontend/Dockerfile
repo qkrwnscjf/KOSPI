@@ -4,8 +4,9 @@ FROM node:22-alpine as builder
 
 WORKDIR /app
 
+# 잠금 파일(package-lock.json) 그대로 설치한다 (plan.md QA-43 / P6-3, T-182). 잠금 파일과 package.json이 어긋나면 빌드가 실패한다
 COPY package*.json ./
-RUN npm install
+RUN npm ci
 
 COPY . .
 RUN npm run build

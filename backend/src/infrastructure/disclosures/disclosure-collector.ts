@@ -5,7 +5,7 @@ import { registerShutdown } from '../shutdown.js';
 import { isoDate, reportRun } from '../ingestion-report.js';
 import { DISCLOSURE_SCOPE, isTargetStock, RCEPT_NO_PATTERN, type Disclosure } from '../../shared/disclosures.js';
 import { DART_KEY_ERRORS, DART_STATUS, DartApiError, DartClient, readDartConfig } from './dart-client.js';
-import { backfillRanges, DETAIL_ENDPOINTS, mapListItem, sumAmountFields, toDartDate, type DisclosureBase } from './dart-disclosures.js';
+import { backfillRanges, DETAIL_ENDPOINTS, mapListItem, readLivePages, sumAmountFields, toDartDate, type DisclosureBase } from './dart-disclosures.js';
 import { safeLogList } from '../http-json.js';
 import { fetchDisclosureCoverage } from '../backend-coverage.js';
 
@@ -46,6 +46,8 @@ const readNos = new Map<string, string>();
 const loggedDetailFields = new Set<string>();
 let loggedListFields = false;
 let stopping = false;
+// 주기 조회가 상한(MAX_LIVE_PAGES)에 걸려 다음 주기에 이어 읽을 쪽 (T-178). 없으면 null
+let resumePage: number | null = null;
 let timer: ReturnType<typeof setTimeout> | undefined;
 let consecutiveFailures = 0;
 let requestDay = '';
@@ -205,17 +207,37 @@ async function pollOnce(client: DartClient) {
   const bgnDe = toDartDate(daysAgo(1));
   const endDe = toDartDate(seoulDate());
   const fresh: DisclosureBase[] = [];
+  const freshNos = new Set<string>();
   const pageNos: string[] = [];
   let sourceTotal: number | null = null;
   let rawTotal = 0;
-  for (let pageNo = 1; pageNo <= MAX_LIVE_PAGES && !stopping; pageNo += 1) {
-    const { items, rceptNos, totalPage, totalCount, rawCount } = await fetchListPage(client, bgnDe, endDe, pageNo);
-    if (pageNo === 1) sourceTotal = totalCount;
-    rawTotal += rawCount;
-    fresh.push(...items.filter(item => !seen.has(item.rceptNo)));
-    pageNos.push(...rceptNos);
-    // 이 쪽에 이미 본 공시가 있거나 마지막 쪽이면 멈춘다 (최신순이라 그 뒤는 모두 본 공시)
-    if (rceptNos.some(rceptNo => seen.has(rceptNo)) || rawCount < PAGE_COUNT || pageNo >= totalPage) break;
+  const fetchPage = async (pageNo: number) => {
+    const page = await fetchListPage(client, bgnDe, endDe, pageNo);
+    if (pageNo === 1) sourceTotal = page.totalCount;
+    return page;
+  };
+  const common = { maxPages: MAX_LIVE_PAGES, pageSize: PAGE_COUNT, isSeen: (rceptNo: string) => seen.has(rceptNo), shouldStop: () => stopping };
+  // 1쪽부터: 이미 본 공시가 있거나 마지막 쪽이면 멈춘다 (최신순이라 그 뒤는 모두 본 공시)
+  const latest = await readLivePages(fetchPage, { ...common, firstPage: 1, stopOnSeen: true });
+  const pages = [...latest.pages];
+  let nextPage = latest.nextPage;
+  // 지난 주기에 상한(5쪽)에 걸려 남은 쪽이 있으면 이어 읽는다 (QA-09 / P2-1, T-178)
+  if (nextPage === null && resumePage !== null) {
+    const resumed = await readLivePages(fetchPage, { ...common, firstPage: resumePage, stopOnSeen: false });
+    pages.push(...resumed.pages);
+    nextPage = resumed.nextPage;
+  }
+  if (nextPage !== null) console.warn(`[dart] more than ${MAX_LIVE_PAGES} pages behind; continuing from page ${nextPage} next cycle`);
+  else if (resumePage !== null) console.log('[dart] backlog caught up');
+  resumePage = nextPage;
+  for (const page of pages) {
+    rawTotal += page.rawCount;
+    for (const item of page.items) {
+      if (seen.has(item.rceptNo) || freshNos.has(item.rceptNo)) continue;
+      freshNos.add(item.rceptNo);
+      fresh.push(item);
+    }
+    pageNos.push(...page.rceptNos);
   }
   lastSuccessAt.set({}, Math.floor(Date.now() / 1000));
 

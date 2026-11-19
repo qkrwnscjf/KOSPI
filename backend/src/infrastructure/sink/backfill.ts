@@ -12,6 +12,7 @@ import { latestSessionEnd, sessionDate, YAHOO_MARKET } from '../ingestion/market
 import { CLOSE_FIX_DAYS, CLOSE_FIX_MARGIN_MS, closeFetchDone, GAP_LOOKBACK_DAYS, missingWeekdays, needsDailyHistory, rowDay, shouldRefreshClose, toDailyRows, usesOfficialDailyClose, type DailyRow } from './daily-history.js';
 import { FILL_PLANS, fillDue, findGap, needsFill, toFillRows } from './intraday-fill.js';
 import { reportRun } from '../ingestion-report.js';
+import { backfillRefreshScope } from './late-refresh.js';
 
 // 최초 1회 과거 데이터 채우기 (docs/Task_ORDER.md T-19, R-05, D-06)
 // 연속 집계에는 직접 넣을 수 없어서, 원본(market_ticks)에 종가를 넣고 → 집계를 전체 갱신하고 →
@@ -131,7 +132,10 @@ export async function runBackfillOnce() {
     return;
   }
 
-  console.log(`Backfill version ${BACKFILL_VERSION} starting (${YAHOO_KEYS.length} symbols x ${RANGES.length} ranges)...`);
+  // 재계산 범위는 과거 봉을 넣기 전에 정한다 (QA-08 / P2-2, T-179). 원본 보관 기간(3시간)보다 오래된 집계 버킷이 있으면 이미 운영한 DB다
+  const existing = await dbPool.query(`SELECT EXISTS (SELECT 1 FROM market_5m WHERE bucket < now() - INTERVAL '3 hours') AS found`);
+  const refreshScope = backfillRefreshScope(existing.rows[0]?.found === true);
+  console.log(`Backfill version ${BACKFILL_VERSION} starting (${YAHOO_KEYS.length} symbols x ${RANGES.length} ranges, aggregate refresh: ${refreshScope})...`);
   let inserted = 0;
   let failed = 0;
   for (const symbol of YAHOO_KEYS) {
@@ -152,9 +156,14 @@ export async function runBackfillOnce() {
     throw new Error(`Backfill incomplete: ${failed} requests failed`);
   }
 
-  // 집계를 아래 단계부터 전체 갱신한다 (계층형이라 순서가 중요, D-23).
-  for (const view of ['market_5m', 'market_1h', 'market_1d']) {
-    await dbPool.query(`CALL refresh_continuous_aggregate('${view}', NULL, NULL)`);
+  // 빈 DB면 집계를 아래 단계부터 전체 갱신한다 (계층형이라 순서가 중요, D-23).
+  // 이미 운영한 DB면 전체 갱신이 기존 집계를 지우므로 하지 않는다(T-179, 위 refreshScope)
+  if (refreshScope === 'full') {
+    for (const view of ['market_5m', 'market_1h', 'market_1d']) {
+      await dbPool.query(`CALL refresh_continuous_aggregate('${view}', NULL, NULL)`);
+    }
+  } else {
+    console.warn('Backfill: aggregates already exist, skipping the full refresh so live buckets are kept; past bars stay covered by daily and fill tables.');
   }
   // 집계에 반영된 오래된 원본을 바로 지운다. 보관 정책(3시간)과 같은 기준이다 (D-02).
   const dropped = await dbPool.query(`SELECT drop_chunks('market_ticks', older_than => INTERVAL '3 hours')`);

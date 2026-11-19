@@ -10,6 +10,19 @@ const bypassedTotal = new Counter('kospi_cache_bypassed_total', 'REST cache read
 
 export const CACHE_READ_TIMEOUT_MS = 200;
 
+// Redis 읽기에 시간 제한을 건다 (plan.md QA-04 / P1-3, T-176). 응답 없는 Redis가 요청을 붙잡지 않게 한다
+export async function withTimeout<T>(promise: Promise<T>, timeoutMs = CACHE_READ_TIMEOUT_MS): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('cache read timeout')), timeoutMs); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export interface CacheClient {
   status: string;
   get: (key: string) => Promise<string | null>;
@@ -23,18 +36,12 @@ export function createCache(client: CacheClient, timeoutMs = CACHE_READ_TIMEOUT_
         bypassedTotal.inc({ reason: 'not_ready' });
         return null;
       }
-      let timer: ReturnType<typeof setTimeout> | undefined;
       try {
-        const raw = await Promise.race([
-          client.get(key),
-          new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('cache read timeout')), timeoutMs); }),
-        ]);
+        const raw = await withTimeout(client.get(key), timeoutMs);
         return raw ? (JSON.parse(raw) as T) : null;
       } catch {
         bypassedTotal.inc({ reason: 'read_failed' });
         return null;
-      } finally {
-        clearTimeout(timer);
       }
     },
 

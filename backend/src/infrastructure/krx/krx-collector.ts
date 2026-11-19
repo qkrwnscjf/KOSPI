@@ -88,16 +88,46 @@ function plannedDates(endpoint: string, window: string[]) {
   return datesToCheck(window, states, Date.now());
 }
 
-// 실행 기록용 오류 종류 (T-118): 고정된 종류와 HTTP 상태만 남긴다
-const errorKind = (error: unknown) => (error instanceof KrxApiError ? (error.status ? `http_${error.status}` : error.message) : 'unexpected_error');
+// 실행 기록용 오류 종류 (T-118): 고정된 종류와 HTTP 상태만 남긴다.
+// 응답은 200인데 본문이 오류인 경우는 `http_200`이 아니라 오류 종류(message)를 남긴다 (plan.md QA-27 / P3-5, T-188)
+const errorKind = (error: unknown) => {
+  if (error instanceof KafkaSendError) return 'kafka_send_failed';
+  if (error instanceof KrxApiError) return error.status && error.status !== 200 ? `http_${error.status}` : error.message;
+  return 'unexpected_error';
+};
+
+// Kafka 전송 실패 (QA-27 / P3-5, T-188): 예전에는 KRX 호출 실패와 같은 경로로 처리되어 호출 실패 지표·로그·재시도 간격 증가로 이어졌다(KRX는 정상인데 대기).
+// 전송 실패는 따로 구분해 호출 실패로 세지 않고, 그 날짜는 다음 주기에 다시 받는다(재시도 목록)
+class KafkaSendError extends Error {
+  constructor() {
+    super('kafka_send_failed');
+    this.name = 'KafkaSendError';
+  }
+}
+const kafkaSendFailedTotal = new Counter('kospi_krx_kafka_send_failed_total', 'KRX results that could not be sent to Kafka, by endpoint (not counted as fetch failures)');
+async function sendToKafka(record: Parameters<typeof producer.send>[0]) {
+  try {
+    await producer.send(record);
+  } catch {
+    throw new KafkaSendError();
+  }
+}
+
+// 한 날짜의 결과: ok = 받음(빈 응답 포함), fetch_failed = KRX 호출 실패(재시도 간격에 반영), send_failed = Kafka 전송 실패(반영 안 함)
+type DayResult = 'ok' | 'fetch_failed' | 'send_failed';
+function sendFailed(endpoint: string, basDd: string): DayResult {
+  kafkaSendFailedTotal.inc({ endpoint });
+  console.warn(`[krx] ${endpoint} ${basDd}: Kafka send failed; the date is retried next cycle (not counted as a KRX failure)`);
+  return 'send_failed';
+}
 
 function describeError(error: unknown) {
   if (error instanceof KrxApiError) return `${error.message}${error.status ? ` status=${error.status}` : ''}${error.code ? ` code=${error.code}` : ''}`;
   return 'unexpected_error';
 }
 
-// 한 날짜·한 엔드포인트를 받아 바뀐 값만 Kafka로 보낸다. 성공하면 true
-async function collectDay(client: KrxClient, endpoint: KrxEndpoint, basDd: string) {
+// 한 날짜·한 엔드포인트를 받아 바뀐 값만 Kafka로 보낸다
+async function collectDay(client: KrxClient, endpoint: KrxEndpoint, basDd: string): Promise<DayResult> {
   const startedAt = Date.now();
   try {
     const body = await client.get(ENDPOINT_PATHS[endpoint], basDd);
@@ -113,7 +143,7 @@ async function collectDay(client: KrxClient, endpoint: KrxEndpoint, basDd: strin
       fetchTotal.inc({ endpoint, result: 'empty' });
       noteCheck(endpoint, basDd, 'empty');
       await reportRun(producer, { source: 'krx_index', endpoint: ENDPOINT_PATHS[endpoint], targetFrom: isoDate(basDd), targetTo: isoDate(basDd), startedAt, received: 0, sent: 0, status: 'empty' });
-      return true;
+      return 'ok';
     }
     fetchTotal.inc({ endpoint, result: 'ok' });
     lastSuccessAt.set({ endpoint }, Math.floor(Date.now() / 1000));
@@ -130,7 +160,7 @@ async function collectDay(client: KrxClient, endpoint: KrxEndpoint, basDd: strin
     const changed = ticks.filter(tick => lastSent.get(`${tick.symbol}|${basDd}`) !== `${tick.price}|${tick.changeRate}`);
     if (changed.length > 0) {
       const producedAt = Date.now();
-      await producer.send({
+      await sendToKafka({
         topic: TOPICS.indexDaily,
         messages: changed.map((tick: TickData) => ({
           key: tick.symbol,
@@ -149,11 +179,13 @@ async function collectDay(client: KrxClient, endpoint: KrxEndpoint, basDd: strin
       source: 'krx_index', endpoint: ENDPOINT_PATHS[endpoint], targetFrom: isoDate(basDd), targetTo: isoDate(basDd), startedAt,
       received: ticks.length + invalid.length, sent: changed.length, dropped: { missing_value: invalid.length }, status: 'ok',
     });
-    return true;
+    return 'ok';
   } catch (error) {
-    fetchDuration.observe({}, Date.now() - startedAt);
     await reportRun(producer, { source: 'krx_index', endpoint: ENDPOINT_PATHS[endpoint], targetFrom: isoDate(basDd), targetTo: isoDate(basDd), startedAt, received: 0, sent: 0, status: 'error', errorKind: errorKind(error) });
-    return handleFetchError(endpoint, basDd, error);
+    if (error instanceof KafkaSendError) return sendFailed(endpoint, basDd);
+    fetchDuration.observe({}, Date.now() - startedAt);
+    handleFetchError(endpoint, basDd, error);
+    return 'fetch_failed';
   }
 }
 
@@ -178,8 +210,8 @@ function handleFetchError(endpoint: string, basDd: string, error: unknown) {
   return false;
 }
 
-// 시장 폭 (T-106): 한 날짜·한 시장의 종목별 매매정보를 받아 합계만 Kafka로 보낸다. 종목 행은 보내지 않는다. 성공하면 true
-async function collectBreadthDay(client: KrxClient, endpoint: BreadthEndpoint, basDd: string) {
+// 시장 폭 (T-106): 한 날짜·한 시장의 종목별 매매정보를 받아 합계만 Kafka로 보낸다. 종목 행은 보내지 않는다
+async function collectBreadthDay(client: KrxClient, endpoint: BreadthEndpoint, basDd: string): Promise<DayResult> {
   const { path, market } = BREADTH_ENDPOINTS[endpoint];
   const startedAt = Date.now();
   try {
@@ -194,7 +226,7 @@ async function collectBreadthDay(client: KrxClient, endpoint: BreadthEndpoint, b
       fetchTotal.inc({ endpoint, result: 'empty' });
       noteCheck(endpoint, basDd, 'empty');
       await reportRun(producer, { source: 'krx_stock', endpoint: path, targetFrom: isoDate(basDd), targetTo: isoDate(basDd), startedAt, received: 0, sent: 0, status: 'empty' });
-      return true;
+      return 'ok';
     }
     fetchTotal.inc({ endpoint, result: 'ok' });
     lastSuccessAt.set({ endpoint }, Math.floor(Date.now() / 1000));
@@ -210,12 +242,12 @@ async function collectBreadthDay(client: KrxClient, endpoint: BreadthEndpoint, b
       }
       noteCheck(endpoint, basDd, 'rows');
       await reportRun(producer, { source: 'krx_stock', endpoint: path, targetFrom: isoDate(basDd), targetTo: isoDate(basDd), startedAt, received: rows.length, sent: 0, dropped: { missing_value: invalid }, status: 'partial', errorKind: 'no_usable_rows' });
-      return true;
+      return 'ok';
     }
     const key = `breadth|${market}|${basDd}`;
     const signature = `${breadth.advancers}|${breadth.decliners}|${breadth.unchanged}|${breadth.tradingValue}`;
     if (lastSent.get(key) !== signature) {
-      await producer.send({
+      await sendToKafka({
         topic: TOPICS.breadth,
         messages: [{ key: market, value: JSON.stringify({ ...breadth, collectedAt: startedAt, producedAt: Date.now() }) }],
       });
@@ -230,7 +262,7 @@ async function collectBreadthDay(client: KrxClient, endpoint: BreadthEndpoint, b
       const rankKey = `rankings|${market}|${basDd}`;
       const rankSignature = rankings.entries.map(entry => `${entry.code}:${entry.close}:${entry.changeRate}`).join(',');
       if (lastSent.get(rankKey) !== rankSignature) {
-        await producer.send({
+        await sendToKafka({
           topic: TOPICS.rankings,
           messages: [{ key: market, value: JSON.stringify({ ...rankings, collectedAt: startedAt, producedAt: Date.now() }) }],
         });
@@ -242,11 +274,13 @@ async function collectBreadthDay(client: KrxClient, endpoint: BreadthEndpoint, b
     // Kafka로 보낸 뒤에만 받은 날짜로 표시한다 (T-158)
     noteCheck(endpoint, basDd, 'rows');
     await reportRun(producer, { source: 'krx_stock', endpoint: path, targetFrom: isoDate(basDd), targetTo: isoDate(basDd), startedAt, received: rows.length, sent, dropped: { missing_value: invalid }, status: 'ok' });
-    return true;
+    return 'ok';
   } catch (error) {
-    fetchDuration.observe({}, Date.now() - startedAt);
     await reportRun(producer, { source: 'krx_stock', endpoint: path, targetFrom: isoDate(basDd), targetTo: isoDate(basDd), startedAt, received: 0, sent: 0, status: 'error', errorKind: errorKind(error) });
-    return handleFetchError(endpoint, basDd, error);
+    if (error instanceof KafkaSendError) return sendFailed(endpoint, basDd);
+    fetchDuration.observe({}, Date.now() - startedAt);
+    handleFetchError(endpoint, basDd, error);
+    return 'fetch_failed';
   }
 }
 
@@ -268,9 +302,9 @@ async function collectBreadthDays(client: KrxClient, dates: string[], endpoints:
     for (const endpoint of endpoints) {
       if (stopping) return failures === 0;
       if (!isEnabled(endpoint)) continue;
-      const ok = await collectBreadthDay(client, endpoint, basDd);
-      noteRetry(endpoint, basDd, ok);
-      if (!ok) failures += 1;
+      const result = await collectBreadthDay(client, endpoint, basDd);
+      noteRetry(endpoint, basDd, result === 'ok');
+      if (result === 'fetch_failed') failures += 1; // Kafka 전송 실패는 재시도 간격에 넣지 않는다 (T-188)
       await sleep(REQUEST_GAP_MS);
     }
   }
@@ -284,9 +318,9 @@ async function collectDays(client: KrxClient, dates: string[], endpoints: KrxEnd
     for (const endpoint of endpoints) {
       if (stopping) return failures === 0;
       if (!isEnabled(endpoint)) continue;
-      const ok = await collectDay(client, endpoint, basDd);
-      noteRetry(endpoint, basDd, ok);
-      if (!ok) failures += 1;
+      const result = await collectDay(client, endpoint, basDd);
+      noteRetry(endpoint, basDd, result === 'ok');
+      if (result === 'fetch_failed') failures += 1; // Kafka 전송 실패는 재시도 간격에 넣지 않는다 (T-188)
       await sleep(REQUEST_GAP_MS);
     }
   }
@@ -314,6 +348,9 @@ async function backfill(client: KrxClient) {
     loggedCoverageUnavailable = true;
     return;
   }
+  // 다시 실패하면 또 알리도록 되돌린다 (예전에는 프로세스에서 한 번만 남았다, QA-27 / T-188)
+  if (loggedCoverageUnavailable) console.log('[krx] stored range available again; backfill resumes');
+  loggedCoverageUnavailable = false;
 
   const recent = seoulWeekdays(Date.now(), RECENT_DAYS);
   const target = seoulWeekdays(Date.now(), BACKFILL_DAYS).slice(0, -recent.length);
@@ -327,7 +364,7 @@ async function backfill(client: KrxClient) {
       continue;
     }
     const probe = recent[recent.length - 1];
-    if (probe && !(await collectDay(client, endpoint, probe)) && !isEnabled(endpoint)) continue;
+    if (probe && (await collectDay(client, endpoint, probe)) !== 'ok' && !isEnabled(endpoint)) continue;
     const startedAt = Date.now();
     const ok = await collectDays(client, dates, [endpoint]);
     if (!isEnabled(endpoint)) continue; // 채우는 중에 거부되면 다음에 다시
@@ -393,7 +430,7 @@ async function backfillBreadth(client: KrxClient) {
       continue;
     }
     const probe = recent[recent.length - 1];
-    if (probe && !(await collectBreadthDay(client, endpoint, probe)) && !isEnabled(endpoint)) continue;
+    if (probe && (await collectBreadthDay(client, endpoint, probe)) !== 'ok' && !isEnabled(endpoint)) continue;
     const startedAt = Date.now();
     const ok = await collectBreadthDays(client, dates, [endpoint]);
     if (!isEnabled(endpoint)) continue;

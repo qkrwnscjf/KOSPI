@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { cache, redis } from '../../infrastructure/redis.js';
+import { withTimeout } from '../../infrastructure/cache.js';
 import { dbPool } from '../../infrastructure/db.js';
 import { Latency } from '../../infrastructure/metrics.js';
 import { DERIVED_SPREADS, isDerivedSymbol, isSubscribableSymbol, isYahooSymbolKey, YAHOO_KEYS } from '../../shared/symbols.js';
@@ -266,7 +267,8 @@ export const historyController = async (fastify: FastifyInstance) => {
   fastify.get('/api/v1/market/latest-times', async (_request, reply) => {
     if (redis.status !== 'ready') return reply.code(503).send({ error: 'cache unavailable' });
     try {
-      const values = await redis.mget(YAHOO_KEYS.map(key => `latest_tick:${key}`));
+      // 응답 없는 Redis에 붙잡히지 않게 캐시 읽기와 같은 시간 제한을 둔다 (T-176). 넘기면 500 → worker는 예전처럼 모두 보낸다
+      const values: (string | null)[] = await withTimeout(redis.mget(YAHOO_KEYS.map(key => `latest_tick:${key}`)));
       const data = YAHOO_KEYS.flatMap((symbol, index) => {
         const raw = values[index];
         if (!raw) return [];

@@ -1,6 +1,6 @@
 import { fetchYahooData } from './yahoo-api.js';
 import type { NormalizedMarketData } from './normalizer.js';
-import { MARKETS, YAHOO_MARKET, decideMarketStatus, type MarketId, type MarketStatus } from './market-hours.js';
+import { MARKETS, SPECIAL_SESSION_WARN_DAYS, YAHOO_MARKET, decideMarketStatus, isKrxExtendedHour, specialSessionHorizon, type MarketId, type MarketStatus } from './market-hours.js';
 import { planYahooRequest } from './request-plan.js';
 import { fetchLatestTickTimes } from '../backend-coverage.js';
 import { YAHOO_KEYS, isYahooSymbolKey } from '../../shared/symbols.js';
@@ -12,6 +12,8 @@ import { reportRun } from '../ingestion-report.js';
 import { TimeoutError, withAbortTimeout } from '../abort-timeout.js';
 import { Counter, Gauge, Latency, metricsConfig, startMetricsLog, startMetricsServer } from '../metrics.js';
 import { registerShutdown } from '../shutdown.js';
+import { validateTickRecord } from '../../shared/tick-validation.js';
+import { isPlausibleTickTime } from '../../shared/event-time.js';
 
 const readIntEnv = (name: string, fallback: number) => Number.parseInt(process.env[name] ?? '', 10) || fallback;
 
@@ -95,6 +97,9 @@ type FetchResult = 'success' | 'empty' | 'timeout' | 'error';
 const yahooInflight = new Gauge('kospi_worker_yahoo_inflight', 'Yahoo quote requests that have not finished yet');
 yahooInflight.set({}, 0);
 const kafkaSendFailedTotal = new Counter('kospi_worker_kafka_send_failed_total', 'Ticks that could not be sent to Kafka (T-157)');
+// 받는 쪽 검증을 통과하지 못해 보내지 않은 tick (T-187)
+const tickRejectedTotal = new Counter('kospi_worker_tick_rejected_total', 'Ticks not sent because they fail the consumer validation, by symbol and reason');
+const loggedRejections = new Set<string>();
 
 // 검증용 (기본 끔, B-63): 'abort' = 응답 없는 요청을 흉내 내고 중단 신호를 따름, 'noabort' = 신호를 무시함(결과만 버리던 이전 동작). 외부 호출은 하지 않는다
 const TEST_STALL = process.env.YAHOO_TEST_STALL_QUOTE;
@@ -227,7 +232,21 @@ async function runCycle(): Promise<FetchResult> {
       // Kafka 전송. DB 저장은 DB Sink가 Kafka에서 읽어서 한다 (docs/Task_ORDER.md T-12, D-18).
       // 이전에는 여기서 DB 저장이 끝나야 전송이 시작되어, DB 지연이 곧 실시간 지연이었다.
       const producedAt = Date.now();
-      const messages = freshData.map(data => {
+      // 보내기 전에 받는 쪽과 같은 검증(validateTickRecord)과 장중 미래 시각 5분 제한을 건다 (QA-14 · 15 / P2-4, T-187).
+      // 통과하지 못한 tick은 보내지 않고 사유를 센다(받는 쪽이 버리면 다시 오지 않으므로 보낸 것으로 세면 안 됨)
+      const sendable = freshData.filter(data => {
+        const check = validateTickRecord({ symbol: data.ticker, category: data.category, price: data.price, changeRate: data.changeRate, changePrice: data.changePrice, timestamp: data.timestamp, volume: data.volume, collectedAt: data.collectedAt, producedAt, marketState: data.marketState });
+        const reason = !check.ok ? check.reason : !isPlausibleTickTime(data.timestamp) ? 'future_timestamp' : null;
+        if (reason === null) return true;
+        tickRejectedTotal.inc({ symbol: data.ticker, reason });
+        const key = `${data.ticker}|${reason}`;
+        if (!loggedRejections.has(key)) {
+          loggedRejections.add(key);
+          console.warn(`Tick not sent (fails the consumer validation): ${data.ticker} (${reason}); further ones are only counted`);
+        }
+        return false;
+      });
+      const messages = sendable.map(data => {
         // Map ticker to symbol for internal TickData usage
         const tickData = {
           symbol: data.ticker,
@@ -248,6 +267,7 @@ async function runCycle(): Promise<FetchResult> {
         };
       });
 
+      if (messages.length === 0) return yahoo.result;
       try {
         await producer.send({ topic: TOPICS.ticks, messages });
       } catch (error) {
@@ -259,7 +279,7 @@ async function runCycle(): Promise<FetchResult> {
       quoteRun.sent += messages.length;
 
       // 전송에 성공한 뒤에만 "마지막 전송 시각"을 갱신한다. 실패하면 다음 주기에 다시 보낼 수 있도록.
-      for (const data of freshData) {
+      for (const data of sendable) {
         lastSentTimestamp.set(data.ticker, Math.max(data.timestamp, lastSentTimestamp.get(data.ticker) ?? 0));
         if (data.marketState) lastSentMarketState.set(data.ticker, data.marketState);
         tickTotal.inc({ symbol: data.ticker, result: 'sent' });
@@ -297,7 +317,8 @@ function baseInterval() {
   const now = new Date(Date.now() + MARKET_CLOCK_OFFSET_MS);
   const states = MARKETS.map(market => {
     const sourceStates = YAHOO_KEYS.filter(key => YAHOO_MARKET[key] === market.id).map(key => latestSourceState.get(key));
-    return { id: market.id, status: decideMarketStatus(market.isOpen(now), sourceStates) };
+    // 특수 거래일의 늘어난 시간에는 소스의 PRE·POST로 휴장 판단을 하지 않는다 (QA-44 / P4-3, T-180)
+    return { id: market.id, status: decideMarketStatus(market.isOpen(now), sourceStates, market.id === 'krx' && isKrxExtendedHour(now)) };
   });
   for (const state of states) {
     marketOpen.set({ market: state.id }, state.status === 'open' ? 1 : 0);
@@ -401,6 +422,14 @@ async function runIngestionWorker() {
   if (MARKET_CLOCK_OFFSET_MS !== 0) {
     console.warn(`MARKET_CLOCK_OFFSET_MS=${MARKET_CLOCK_OFFSET_MS}: market hours are evaluated on a shifted clock (verification only).`);
   }
+  // 특수 거래일 표가 끝나 가는지 (QA-31 / P5-3, T-181)
+  const horizon = specialSessionHorizon(Date.now());
+  const horizonText = horizon.lastDate === null ? 'empty' : `ends ${horizon.lastDate} (${horizon.daysLeft} days left)`;
+  if (horizon.warn) {
+    console.warn(`KRX special-session table ${horizonText}: add the next exchange-confirmed dates (warning starts ${SPECIAL_SESSION_WARN_DAYS} days before the last date).`);
+  } else {
+    console.log(`KRX special-session table ${horizonText}.`);
+  }
   if (FETCH_TIMEOUT_MS >= POLLING_INTERVAL_MS) {
     console.warn('FETCH_TIMEOUT_MS is not shorter than POLLING_INTERVAL_MS: cycles may start later than the configured interval.');
   }
@@ -452,7 +481,7 @@ async function runIngestionWorker() {
 }
 
 // 시작에 실패하면(예: Kafka 연결 재시도 소진) 종료 코드 1로 끝낸다.
-// docker-compose의 restart: on-failure가 다시 띄우도록 하기 위함 (docs/Task_ORDER.md T-08, P-11).
+// docker-compose의 재시작 정책(unless-stopped, T-177)이 다시 띄우도록 하기 위함 (docs/Task_ORDER.md T-08, P-11).
 runIngestionWorker().catch(error => {
   console.error('Worker failed to start:', error);
   process.exit(1);

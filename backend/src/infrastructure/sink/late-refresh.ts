@@ -38,3 +38,13 @@ export function clampWindow(window: RefreshWindow, nowMs: number): RefreshWindow
 
 export const mergeWindows = (a: RefreshWindow | null, b: RefreshWindow): RefreshWindow =>
   a ? { start: Math.min(a.start, b.start), end: Math.max(a.end, b.end) } : b;
+
+// 첫 과거 채우기(backfill.ts runBackfillOnce)의 집계 재계산 범위 (plan.md QA-08 / P2-2, T-179)
+// - 빈 DB(원본보다 오래된 집계가 없음): 넣은 과거 봉을 집계에 반영하려면 전체를 다시 계산해야 한다(원래 동작).
+// - 이미 운영한 DB(첫 시도가 실패한 뒤 며칠 돌다가 다시 시도하는 경우): 전체를 다시 계산하면 원본이 지워진 과거 버킷이
+//   방금 넣은 과거 봉만으로 다시 만들어져 그동안의 실시간 집계가 사라진다(저장 불변 조건). 그래서 전체 재계산을 하지 않고 갱신 정책에 맡긴다.
+//   이 경우 넣은 과거 봉은 집계에 들어가지 않고 원본 보관 기간 뒤 지워지며, 그래프는 일봉 표·채운 봉(T-104, T-127, T-151)이 메운다.
+// 판단은 과거 봉을 넣기 전에 한다(넣은 뒤에는 실시간 집계가 새 원본을 읽어 "집계가 있다"로 보일 수 있음).
+export type BackfillRefreshScope = 'full' | 'policy_only';
+export const backfillRefreshScope = (hasAggregatesOlderThanRaw: boolean): BackfillRefreshScope =>
+  hasAggregatesOlderThanRaw ? 'policy_only' : 'full';

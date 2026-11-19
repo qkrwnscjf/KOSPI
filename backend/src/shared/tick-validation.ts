@@ -24,8 +24,12 @@ export function parseTick(value: Buffer | null): TickParseResult {
     return fail('invalid_json');
   }
   if (typeof data !== 'object' || data === null || Array.isArray(data)) return fail('not_object');
+  return validateTickRecord(data as Record<string, unknown>);
+}
 
-  const record = data as Record<string, unknown>;
+// 받는 쪽(parseTick)과 보내는 쪽(worker)이 같은 기준을 쓰도록 객체 검증만 따로 둔다 (plan.md QA-14 / P2-4, T-187).
+// 예전에는 worker가 보낸 tick을 받는 쪽이 버릴 수 있었다(소수 거래량 등). 버려진 tick은 다시 오지 않는다
+export function validateTickRecord(record: Record<string, unknown>): TickParseResult {
   const { symbol, category, price, changeRate, timestamp, changePrice, volume, collectedAt, producedAt, marketState } = record;
 
   if (typeof symbol !== 'string' || !SYMBOL_PATTERN.test(symbol)) return fail('symbol');

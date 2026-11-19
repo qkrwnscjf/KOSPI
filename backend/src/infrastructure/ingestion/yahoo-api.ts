@@ -113,7 +113,8 @@ export function mapYahooQuotes(quotes: readonly YahooQuoteFields[]): NormalizedM
       changeRate: validated.changeRate,
       changePrice: validated.changePrice,
       timestamp: validated.time.getTime(),
-      ...(isFiniteNumber(quote.regularMarketVolume) ? { volume: quote.regularMarketVolume } : {}),
+      // 거래량은 받는 쪽·DB가 0 이상의 정수만 받는다(T-154). 맞지 않으면 tick 전체를 버리지 않고 거래량만 뺀다 (QA-14 / P2-4, T-187)
+      ...(Number.isSafeInteger(quote.regularMarketVolume) && (quote.regularMarketVolume as number) >= 0 ? { volume: quote.regularMarketVolume as number } : {}),
       ...(isMarketState(marketState) ? { marketState } : {}),
     });
   }

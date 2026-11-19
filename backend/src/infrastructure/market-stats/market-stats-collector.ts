@@ -106,13 +106,21 @@ async function collect(dataset: MarketFlowDataset, operation: string, key: strin
   const changed = days.filter(day => lastSent.get(`${dataset}|${day.basDt}`) !== JSON.stringify(day.values));
   if (changed.length > 0) {
     const producedAt = Date.now();
-    await producer.send({
-      topic: TOPICS.marketFlows,
-      messages: changed.map(day => {
-        const flow: MarketFlow = { time: dailyCloseTime(day.basDt), dataset, values: day.values, collectedAt: startedAt, producedAt };
-        return { key: dataset, value: JSON.stringify(flow) };
-      }),
-    });
+    try {
+      await producer.send({
+        topic: TOPICS.marketFlows,
+        messages: changed.map(day => {
+          const flow: MarketFlow = { time: dailyCloseTime(day.basDt), dataset, values: day.values, collectedAt: startedAt, producedAt };
+          return { key: dataset, value: JSON.stringify(flow) };
+        }),
+      });
+    } catch (error) {
+      // Kafka 전송 실패 (plan.md QA-02 / P1-2, T-175): 예전에는 예외가 주기 밖으로 빠져 프로세스가 끝나고 재시도 일정도 사라졌다.
+      // 일시 실패로 처리한다. 보낸 날짜로 기억하지 않으므로 다음 주기에 같은 날짜를 다시 보낸다
+      console.warn(`[market-stats] ${operation}: Kafka send failed (${error instanceof Error ? error.name : 'unexpected_error'}); retrying next cycle`);
+      await report(rows.length, 0, 'error', 'kafka_send_failed');
+      return 'error';
+    }
     for (const day of changed) lastSent.set(`${dataset}|${day.basDt}`, JSON.stringify(day.values));
     sentTotal.inc({ dataset }, changed.length);
   }
@@ -134,7 +142,11 @@ async function loop(key: string) {
   } else {
     for (const { dataset, operation } of OPERATIONS) {
       if (stopping) return;
-      results.push(await collect(dataset, operation, key));
+      // 예상 못 한 예외가 나도 다음 주기 예약이 사라지지 않게 일시 실패로 처리한다 (T-175)
+      results.push(await collect(dataset, operation, key).catch(error => {
+        console.warn(`[market-stats] ${operation}: unexpected error (${error instanceof Error ? error.name : 'unexpected_error'})`);
+        return 'error' as const;
+      }));
     }
   }
   // 다음 주기: 하루 멈춤 / 첫 일시 실패는 30분 뒤 다시 / 그 뒤는 2배씩 (T-137)
