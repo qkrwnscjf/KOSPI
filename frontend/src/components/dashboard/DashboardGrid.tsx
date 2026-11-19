@@ -11,6 +11,7 @@ import { RankingsDashboard } from '@/components/rankings/RankingsDashboard'
 import { MarketFlowsReport } from '@/components/flows/MarketFlowsReport'
 import { SectorNodes } from './SectorNodes'
 import { MarketBreadthPanel } from './MarketBreadth'
+import { ErrorBoundary } from '@/components/common/ErrorBoundary'
 
 interface DashboardGridProps {
   categoryId: string
@@ -130,6 +131,8 @@ export function DashboardGrid({ categoryId }: DashboardGridProps) {
         </div>
       )}
 
+      {/* 탭 단위 오류 경계 (plan.md FQA-07, T-200): 탭을 바꾸면(key) 새로 시작한다 */}
+      <ErrorBoundary key={categoryId} scope="tab" label={categoryNames[categoryId] ?? '이'}>
       {/* 증시 자금 흐름 탭: 금융투자협회 일별 통계 1개월 (11단계 B′ T-98, D-77). 투자자별 순매수 화면은 원천이 없어 T-164에서 지웠다 */}
       {categoryId === 'category5' ? (
         <MarketFlowsReport />
@@ -180,7 +183,10 @@ export function DashboardGrid({ categoryId }: DashboardGridProps) {
                     }}
                     className={cn(categoryId === 'category4' && index === 0 ? 'lg:col-span-2 lg:row-span-1' : '')}
                   >
-                    <ChartCard {...chart} />
+                    {/* 카드 단위 오류 경계 (FQA-07, T-200): 카드 하나의 오류가 탭 전체를 멈추지 않게 */}
+                    <ErrorBoundary scope="card" label={chart.title}>
+                      <ChartCard {...chart} />
+                    </ErrorBoundary>
                   </motion.div>
                 ))}
               </AnimatePresence>
@@ -192,6 +198,7 @@ export function DashboardGrid({ categoryId }: DashboardGridProps) {
       </div>
       </>
       )}
+      </ErrorBoundary>
 
       <StatusFooter />
     </div>
