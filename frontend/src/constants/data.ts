@@ -49,7 +49,8 @@ export const CATEGORY_DATA: Record<string, ChartCardConfig[]> = {
     { title: '미 국채 10년물', symbol: 'US10Y', ready: true, decimals: 3, suffix: '%', market: 'us_equity', group: '미국 금리' },
     { title: '미 국채 30년물', symbol: 'US30Y', ready: true, decimals: 3, suffix: '%', market: 'us_equity', group: '미국 금리' },
     { title: '장단기 금리차 (10년 − 13주)', symbol: 'US_SPREAD', ready: true, decimals: 3, suffix: '%p', market: 'us_equity', group: '미국 금리', spread: { long: 'US10Y', short: 'US13W' } },
-    { title: 'VIX 변동성 지수', symbol: 'VIX', ready: true, decimals: 2, market: 'us_equity', group: '변동성' },
+    // VIX는 미국 주식 장 밖에도 갱신되어 백엔드와 같이 24시간 시장으로 본다 (B-46 ①, plan.md QA-30 / P4-1, T-208). 표 일치는 test/marketTable.test.ts
+    { title: 'VIX 변동성 지수', symbol: 'VIX', ready: true, decimals: 2, market: 'global_24h', group: '변동성' },
   ],
   category3: [
     { title: 'S&P 500', symbol: 'SP500', ready: true, decimals: 2, suffix: 'pt', market: 'us_equity', group: '미국 지수' },
