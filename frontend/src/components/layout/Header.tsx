@@ -1,6 +1,7 @@
 import { cn } from '@/lib/utils'
-import { useState } from 'react'
-import { LayoutDashboard, Globe, TrendingUp, Activity, Terminal, Sun, Moon, ArrowLeftRight, FileText, Network, CalendarDays, ListOrdered, Settings } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { LayoutDashboard, Globe, TrendingUp, Activity, Terminal, Sun, Moon, ArrowLeftRight, FileText, Network, CalendarDays, ListOrdered, Settings, PanelLeftClose, PanelLeftOpen } from 'lucide-react'
+import { readCollapsed, writeCollapsed } from '@/lib/sidebarState'
 import { motion } from 'framer-motion'
 import { SettingsPanel } from '@/components/settings/SettingsPanel'
 import { useConnectionStatus, useLatestTick } from '@/hooks/useMarketData'
@@ -50,7 +51,8 @@ function SidebarQuote({ label, tick }: { label: string; tick: TickData | null })
 }
 
 // 실제 WebSocket 연결 상태 (T-33). 연결되면 점이 강조색으로 빛난다 (T-69).
-function ConnectionIndicator() {
+// compact(사이드바 접힘, T-199)이면 점만 보이고 글자는 화면 읽기 프로그램용으로만 남긴다
+function ConnectionIndicator({ compact = false }: { compact?: boolean }) {
   const status = useConnectionStatus()
   const label = status === 'connected' ? '실시간' : status === 'disconnected' ? '연결 끊김' : '연결 중'
   return (
@@ -64,8 +66,26 @@ function ConnectionIndicator() {
           )}
         />
       </span>
-      <span className={cn('text-[11px] font-medium', status === 'disconnected' ? 'text-down' : 'text-fg-muted')}>{label}</span>
+      <span className={cn('text-[11px] font-medium', status === 'disconnected' ? 'text-down' : 'text-fg-muted', compact && 'sr-only')}>{label}</span>
     </div>
+  )
+}
+
+// 사이드바 열기/접기 버튼 (T-199, 데스크톱만)
+function CollapseButton({ collapsed, onToggle }: { collapsed: boolean; onToggle: () => void }) {
+  const label = collapsed ? '사이드바 펼치기' : '사이드바 접기'
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-label={label}
+      aria-expanded={!collapsed}
+      aria-controls="sidebar-panel"
+      title={label}
+      className="hidden h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-line bg-surface text-fg transition-colors hover:border-neon/50 hover:text-neon lg:inline-flex"
+    >
+      {collapsed ? <PanelLeftOpen className="h-4 w-4" /> : <PanelLeftClose className="h-4 w-4" />}
+    </button>
   )
 }
 
@@ -120,13 +140,20 @@ export function Sidebar({ activeCategory, onCategoryChange }: SidebarProps) {
   const kospi = useLatestTick('KOSPI')
   const usdKrw = useLatestTick('USD/KRW')
   const [settingsOpen, setSettingsOpen] = useState(false)
+  // 데스크톱 사이드바 열기/접기 (T-199, D-95). 접으면 아이콘만 남기고 상태를 브라우저에 저장한다. 모바일(lg 미만)은 영향 없음
+  const [collapsed, setCollapsed] = useState(() => readCollapsed(typeof window === 'undefined' ? undefined : window.localStorage))
+  useEffect(() => writeCollapsed(window.localStorage, collapsed), [collapsed])
 
   return (
-    <aside className="sticky top-0 z-40 w-full border-b border-line bg-page/90 lg:h-screen lg:w-60 lg:shrink-0 lg:self-start lg:border-b-0 lg:border-r lg:bg-surface/60">
-      <div className="flex h-full flex-col gap-3 px-4 pb-2 pt-3 lg:gap-8 lg:px-4 lg:py-7">
-        {/* 로고 (모바일에서는 오른쪽에 연결 상태 · 테마 전환) */}
-        <div className="flex items-center justify-between lg:px-2">
-          <Logo />
+    <aside className={cn(
+      'sticky top-0 z-40 w-full border-b border-line bg-page/90 lg:h-screen lg:shrink-0 lg:self-start lg:border-b-0 lg:border-r lg:bg-surface/60 lg:transition-[width] lg:duration-200',
+      collapsed ? 'lg:w-16' : 'lg:w-60'
+    )}>
+      <div id="sidebar-panel" className={cn('flex h-full flex-col gap-3 px-4 pb-2 pt-3 lg:gap-8 lg:py-7', collapsed ? 'lg:px-2' : 'lg:px-4')}>
+        {/* 로고 (모바일에서는 오른쪽에 연결 상태 · 테마 전환). 데스크톱은 접기 버튼, 접히면 로고 대신 버튼만 */}
+        <div className={cn('flex items-center justify-between', collapsed ? 'lg:justify-center' : 'lg:px-2')}>
+          <div className={cn(collapsed && 'lg:hidden')}><Logo /></div>
+          <CollapseButton collapsed={collapsed} onToggle={() => setCollapsed(previous => !previous)} />
           <div className="flex items-center gap-3 lg:hidden">
             <ConnectionIndicator />
             <SettingsButton onOpen={() => setSettingsOpen(true)} />
@@ -136,19 +163,22 @@ export function Sidebar({ activeCategory, onCategoryChange }: SidebarProps) {
 
         {/* 카테고리: 선택된 항목은 강조색 면 + 왼쪽 빛 막대 (D-54) */}
         <nav aria-label="카테고리" className="no-scrollbar -mx-4 overflow-x-auto px-4 lg:mx-0 lg:overflow-visible lg:px-0">
-          <span className="mb-2 hidden px-3 text-[10px] font-semibold tracking-[0.2em] text-fg-muted lg:block">CATEGORIES</span>
+          <span className={cn('mb-2 hidden px-3 text-[10px] font-semibold tracking-[0.2em] text-fg-muted', !collapsed && 'lg:block')}>CATEGORIES</span>
           <ul className="flex gap-1 lg:flex-col">
             {CATEGORIES.map(item => {
               const Icon = item.icon
               const isActive = activeCategory === item.id
               return (
                 <li key={item.id} className="shrink-0">
+                  {/* 현재 보고 있는 탭은 aria-current로 알린다 (plan.md FQA-11, T-197). 예전 aria-pressed는 켜고 끄는 버튼이라는 뜻이었다 */}
                   <button
                     type="button"
-                    aria-pressed={isActive}
+                    aria-current={isActive ? 'page' : undefined}
                     onClick={() => onCategoryChange(item.id)}
+                    title={collapsed ? item.name : undefined}
                     className={cn(
                       'relative flex w-full items-center gap-2.5 whitespace-nowrap rounded-lg px-3 py-2 text-left transition-colors duration-200 lg:py-2.5',
+                      collapsed && 'lg:justify-center lg:px-0',
                       isActive ? 'text-fg' : 'text-fg-muted hover:bg-fg/5 hover:text-fg'
                     )}
                   >
@@ -162,7 +192,8 @@ export function Sidebar({ activeCategory, onCategoryChange }: SidebarProps) {
                       </motion.span>
                     )}
                     <Icon className={cn('relative z-10 h-4 w-4 shrink-0', isActive && 'text-neon')} />
-                    <span className={cn('relative z-10 text-sm', isActive ? 'font-semibold' : 'font-medium')}>{item.name}</span>
+                    {/* 접혀도 탭 이름은 화면 읽기 프로그램용으로 남긴다(sr-only) */}
+                    <span className={cn('relative z-10 text-sm', isActive ? 'font-semibold' : 'font-medium', collapsed && 'lg:sr-only')}>{item.name}</span>
                   </button>
                 </li>
               )
@@ -171,14 +202,16 @@ export function Sidebar({ activeCategory, onCategoryChange }: SidebarProps) {
         </nav>
 
         {/* 데스크톱 아래쪽: 지수 · 연결 상태 · 테마 전환 */}
-        <div className="mt-auto hidden flex-col gap-4 border-t border-line px-2 pt-5 lg:flex">
-          <div className="flex flex-col gap-2">
-            <SidebarQuote label="KOSPI" tick={kospi} />
-            <SidebarQuote label="USD/KRW" tick={usdKrw} />
-          </div>
-          <div className="flex items-center justify-between">
-            <ConnectionIndicator />
-            <div className="flex items-center gap-2">
+        <div className={cn('mt-auto hidden flex-col gap-4 border-t border-line pt-5 lg:flex', collapsed ? 'items-center px-0' : 'px-2')}>
+          {!collapsed && (
+            <div className="flex flex-col gap-2">
+              <SidebarQuote label="KOSPI" tick={kospi} />
+              <SidebarQuote label="USD/KRW" tick={usdKrw} />
+            </div>
+          )}
+          <div className={cn('flex items-center justify-between', collapsed && 'flex-col gap-3')}>
+            <ConnectionIndicator compact={collapsed} />
+            <div className={cn('flex items-center gap-2', collapsed && 'flex-col')}>
               <SettingsButton onOpen={() => setSettingsOpen(true)} />
               <ThemeToggle />
             </div>
