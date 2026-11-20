@@ -1,29 +1,99 @@
 import pg from 'pg';
+import { Gauge } from './metrics.js';
+import { safeLogText } from './http-json.js';
 
-const { Pool } = pg;
+const { Pool, Client } = pg;
 
-// 유휴 연결 유지 (docs/Task_ORDER.md T-32). pg의 기본값(10초)이면 60초 간격 조회마다 연결을 다시 맺는다.
-// 0이면 유휴 연결을 닫지 않는다. 최대 연결 수(기본 10)는 그대로라 연결이 무한히 늘지는 않는다.
-const idleTimeoutValue = Number.parseInt(process.env.DB_POOL_IDLE_TIMEOUT_MS ?? '', 10);
-const DB_POOL_IDLE_TIMEOUT_MS = Number.isNaN(idleTimeoutValue) ? 0 : idleTimeoutValue;
+// 0 이상 정수 설정값. 없거나 숫자가 아니면 기본값
+const readNonNegativeInt = (value: string | undefined, fallback: number) => {
+  const parsed = Number.parseInt(value ?? '', 10);
+  return Number.isNaN(parsed) || parsed < 0 ? fallback : parsed;
+};
 
-export const dbPool = new Pool({
-  user: process.env.DB_USER || 'postgres',
-  host: process.env.DB_HOST || 'localhost',
-  database: process.env.DB_NAME || 'kospi',
-  password: process.env.DB_PASSWORD || 'password',
-  port: parseInt(process.env.DB_PORT || '5432', 10),
-  idleTimeoutMillis: DB_POOL_IDLE_TIMEOUT_MS,
+// 접속 정보 (연결마다 같음). 마이그레이션 전용 연결도 이 값을 쓴다
+const connectionConfig = (env: Record<string, string | undefined> = process.env) => ({
+  user: env.DB_USER || 'postgres',
+  host: env.DB_HOST || 'localhost',
+  database: env.DB_NAME || 'kospi',
+  password: env.DB_PASSWORD || 'password',
+  port: parseInt(env.DB_PORT || '5432', 10),
   keepAlive: true,
+  // 연결 시간 제한 (plan.md QA-03 / P1-1, T-209). 0이면 DB가 응답하지 않을 때 연결을 끝없이 기다린다
+  connectionTimeoutMillis: readNonNegativeInt(env.DB_CONNECT_TIMEOUT_MS, 10_000),
 });
+
+// 풀 설정 (시험할 수 있도록 함수로 분리, T-209)
+// - 유휴 연결 유지 (docs/Task_ORDER.md T-32). pg의 기본값(10초)이면 60초 간격 조회마다 연결을 다시 맺는다.
+//   0이면 유휴 연결을 닫지 않는다. 최대 연결 수(기본 10)는 그대로라 연결이 무한히 늘지는 않는다.
+// - 문장 시간 제한(DB가 문장을 취소, 연결은 그대로 씀)과 응답 시간 제한(DB가 응답하지 않을 때 이쪽에서 포기).
+//   기본은 둘 다 없음: db-sink의 과거 채우기·집계 다시 계산은 몇 분 걸릴 수 있다. backend REST만 compose에서 켠다 (QA-03)
+export function dbPoolConfig(env: Record<string, string | undefined> = process.env) {
+  const statementTimeout = readNonNegativeInt(env.DB_STATEMENT_TIMEOUT_MS, 0);
+  const queryTimeout = readNonNegativeInt(env.DB_QUERY_TIMEOUT_MS, 0);
+  return {
+    ...connectionConfig(env),
+    idleTimeoutMillis: readNonNegativeInt(env.DB_POOL_IDLE_TIMEOUT_MS, 0),
+    ...(statementTimeout > 0 ? { statement_timeout: statementTimeout } : {}),
+    ...(queryTimeout > 0 ? { query_timeout: queryTimeout } : {}),
+  };
+}
+
+export const dbPool = new Pool(dbPoolConfig());
+
+// DB 연결 오류 (plan.md QA-01 / P1-1, T-209, 결정 1 "프로세스 유지")
+// DB가 재시작되면 쉬고 있던 연결이 57P01로 끊기며 풀이 'error'를 낸다. 받는 곳이 없으면 Node가 프로세스를 끝냈다(B-75 ④).
+// 끊긴 연결은 풀이 버리고 다음 조회 때 새로 맺는다. 그동안 상태 점검 'db'(SELECT 1)는 실패해 unhealthy로 보인다.
+// 로그는 오류 코드만 1분에 한 줄(주소·접속 정보·메시지는 남기지 않음)
+const DB_ERROR_LOG_INTERVAL_MS = 60_000;
+let lastDbErrorLogAt = 0;
+let suppressedDbErrors = 0;
+
+export const dbErrorCode = (error: unknown) => {
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === 'string' && /^[A-Z0-9_]{1,20}$/.test(code) ? code : 'unknown';
+};
+
+export function logDbConnectionError(source: string, error: unknown, now = Date.now()) {
+  if (now - lastDbErrorLogAt < DB_ERROR_LOG_INTERVAL_MS) {
+    suppressedDbErrors += 1;
+    return false;
+  }
+  console.warn(`[db] ${source} connection error (${dbErrorCode(error)})${suppressedDbErrors > 0 ? `, ${suppressedDbErrors} more since last log` : ''}; the pool reconnects on the next query`);
+  lastDbErrorLogAt = now;
+  suppressedDbErrors = 0;
+  return true;
+}
+
+dbPool.on('error', error => { logDbConnectionError('idle client', error); });
+
+// 연결을 빌려 여러 문장을 실행할 때(트랜잭션 등) 쓴다 (T-209).
+// 빌린 동안 연결이 끊기면 'error'를 받아 기록하고, 돌려줄 때 그 연결을 버린다(풀에 다시 넣지 않음)
+export async function withDbClient<T>(pool: pg.Pool, run: (client: pg.PoolClient) => Promise<T>): Promise<T> {
+  const client = await pool.connect();
+  let broken: Error | undefined;
+  const onError = (error: Error) => {
+    broken = error;
+    logDbConnectionError('checked-out client', error);
+  };
+  client.on('error', onError);
+  try {
+    return await run(client);
+  } finally {
+    client.removeListener('error', onError);
+    client.release(broken);
+  }
+}
 
 // 버전별 스키마 마이그레이션 (docs/Task_ORDER.md T-15 ~ T-18)
 // 실행한 버전은 schema_migrations에 기록되어 한 번만 실행된다.
 // 연속 집계(continuous aggregate) 관련 문장은 트랜잭션 안에서 실행할 수 없어서 문장 단위로 실행한다.
-interface Migration {
+// cleanup: 지난 표를 지우는 정리용 마이그레이션 (plan.md QA-06 / P1-7, T-211). 실패해도 기동은 계속하고 기록하지 않아 다음 기동에 다시 시도한다.
+// 정리용은 다른 마이그레이션의 전제 조건이 되면 안 된다(뒤 마이그레이션은 정리용 실패와 상관없이 실행된다)
+export interface Migration {
   version: number;
   name: string;
   statements: string[];
+  cleanup?: boolean;
 }
 
 const MIGRATIONS: Migration[] = [
@@ -436,6 +506,7 @@ const MIGRATIONS: Migration[] = [
   {
     version: 15,
     name: 'T-164 drop investor_flows (no collector ever wrote to it)',
+    cleanup: true,
     statements: [
       // 투자자별 흐름 표 (마이그레이션 5). 보내는 수집기가 없어 항상 비어 있었고(2026-11-07 행 0 확인), 읽고 쓰는 코드는 T-164에서 지웠다.
       // 2026-11-07 사용자 승인("지워도 영향 없으면 정리"). 비어 있을 때만 지운다. 행이 있으면 그대로 두어 데이터가 사라지지 않게 한다.
@@ -452,11 +523,13 @@ const MIGRATIONS: Migration[] = [
   {
     version: 16,
     name: 'T-173 drop index_daily_legacy (pre-split daily table, replaced by index_daily_krx / index_daily_yahoo in migration 12)',
+    cleanup: true,
     statements: [
       // 2026-11-17 사용자 승인("index_daily_legacy 삭제"). 마이그레이션 12 뒤로 이 표에는 아무도 쓰지 않았고, 읽는 쪽은 뷰 index_daily를 쓴다.
       // 지우기 전에 보관 기간(1년) 안의 모든 행이 출처별 새 표에 같은 (symbol, time)으로 있는지 확인한다. 값은 보지 않는다(공식 종가 보정·KRX 정정으로 바뀔 수 있음).
       // 1년보다 오래된 행은 표마다 보관 작업 시각이 달라 한쪽에만 남아 있을 수 있어 보지 않는다.
       // 빠진 행이 있으면 오류로 멈춘다: 이 마이그레이션은 기록되지 않고 표도 그대로 남아(데이터 손실 없음) backend 기동 로그에 건수가 나온다.
+      // 정리용이라 실패해도 backend는 뜨고 다음 기동에 다시 시도한다 (T-211)
       `DO $$
       DECLARE missing bigint;
       BEGIN
@@ -493,68 +566,104 @@ function setAggregateChunkInterval(view: string, interval: string) {
   $$`;
 }
 
-// 마지막 마이그레이션 번호. db-sink는 backend가 이 번호까지 적용한 뒤에 시작한다 (waitForSchema, T-191)
-export const LATEST_MIGRATION_VERSION = MIGRATIONS.reduce((max, migration) => Math.max(max, migration.version), 0);
+// 필수 마이그레이션 번호(정리용 제외). db-sink는 backend가 이 번호를 모두 적용한 뒤에 시작한다 (waitForSchema, T-191, T-211)
+export const REQUIRED_MIGRATION_VERSIONS = MIGRATIONS.filter(migration => !migration.cleanup).map(migration => migration.version);
 // 마이그레이션 잠금 번호 (plan.md QA-06 / P1-7, T-190). 프로젝트에서 이 값만 쓴다
 const MIGRATION_LOCK_ID = 7_302_026;
 
-// 마이그레이션이 실패하면 예외를 던진다. backend는 스키마 없이 뜨지 않고 종료한다 (재시작 정책이 다시 시도).
-// 두 프로세스가 동시에 마이그레이션을 실행하지 않도록 세션 잠금(advisory lock)을 건다 (QA-06 / P1-7, T-190).
-// 연속 집계 문장은 트랜잭션 안에서 실행할 수 없어 트랜잭션 잠금 대신 세션 잠금을 쓰고, 끝나면(실패해도) 푼다
-export const initDB = async () => {
-  const client = await dbPool.connect();
-  await client.query('SELECT pg_advisory_lock($1)', [MIGRATION_LOCK_ID]);
-  try {
-    await client.query('CREATE EXTENSION IF NOT EXISTS timescaledb;');
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS schema_migrations (
-        version INTEGER PRIMARY KEY,
-        name TEXT NOT NULL,
-        applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
-      )
-    `);
+// 기록되지 않은 정리용 마이그레이션 수 (T-211). 0이 아니면 backend 기동 로그에 번호·오류 코드가 있다
+const cleanupPending = new Gauge('kospi_db_cleanup_migrations_pending', 'Cleanup migrations that failed at startup and will be retried on the next start (T-211)');
 
-    const { rows } = await client.query<{ version: number }>('SELECT version FROM schema_migrations');
-    const applied = new Set(rows.map(row => row.version));
+type QueryOnly = { query: (sql: string, params?: unknown[]) => Promise<unknown> };
+export interface MigrationResult { applied: number[]; pendingCleanup: { version: number; code: string }[] }
 
-    for (const migration of MIGRATIONS) {
-      if (applied.has(migration.version)) continue;
-      console.log(`Applying DB migration ${migration.version}: ${migration.name}`);
+// 아직 적용하지 않은 마이그레이션을 차례로 실행한다 (시험할 수 있도록 분리, T-211)
+// 필수 마이그레이션이 실패하면 예외(backend는 스키마 없이 뜨지 않는다). 정리용이 실패하면 기록하지 않고 다음으로 넘어간다
+export async function applyMigrations(client: QueryOnly, migrations: Migration[], alreadyApplied: Set<number>): Promise<MigrationResult> {
+  const result: MigrationResult = { applied: [], pendingCleanup: [] };
+  for (const migration of migrations) {
+    if (alreadyApplied.has(migration.version)) continue;
+    console.log(`Applying DB migration ${migration.version}: ${migration.name}`);
+    try {
       for (const statement of migration.statements) {
         await client.query(statement);
       }
-      await client.query('INSERT INTO schema_migrations (version, name) VALUES ($1, $2)', [migration.version, migration.name]);
-      console.log(`DB migration ${migration.version} applied.`);
+    } catch (error) {
+      if (!migration.cleanup) throw error;
+      const code = dbErrorCode(error);
+      result.pendingCleanup.push({ version: migration.version, code });
+      // 메시지는 마이그레이션이 만든 문장(예: 빠진 행 수)일 수 있어 길이를 줄이고 제어 문자를 지워 남긴다
+      console.warn(`DB cleanup migration ${migration.version} failed (${code}): ${safeLogText(error instanceof Error ? error.message : 'unexpected_error', 160)}; not recorded, retried on the next start`);
+      continue;
     }
-
-    const extension = await client.query<{ extversion: string }>(
-      "SELECT extversion FROM pg_extension WHERE extname = 'timescaledb'"
-    );
-    console.log(`TimescaleDB schema ready (extension ${extension.rows[0]?.extversion ?? 'unknown'}, migrations up to ${MIGRATIONS.length}).`);
-  } finally {
-    await client.query('SELECT pg_advisory_unlock($1)', [MIGRATION_LOCK_ID]).catch(() => undefined);
-    client.release();
+    await client.query('INSERT INTO schema_migrations (version, name) VALUES ($1, $2)', [migration.version, migration.name]);
+    result.applied.push(migration.version);
+    console.log(`DB migration ${migration.version} applied.`);
   }
+  return result;
+}
+
+// 두 프로세스가 동시에 마이그레이션을 실행하지 않도록 세션 잠금(advisory lock)을 건다 (QA-06 / P1-7, T-190).
+// 연속 집계 문장은 트랜잭션 안에서 실행할 수 없어 트랜잭션 잠금 대신 세션 잠금을 쓰고, 끝나면(실패해도) 푼다.
+// 마이그레이션은 시간 제한 없는 전용 연결로 한다 (T-209): backend 풀에는 REST용 문장 시간 제한이 걸릴 수 있다
+export const initDB = async () => {
+  const client = new Client(connectionConfig());
+  client.on('error', error => { logDbConnectionError('migration client', error); });
+  await client.connect();
+  try {
+    await client.query('SELECT pg_advisory_lock($1)', [MIGRATION_LOCK_ID]);
+    try {
+      await client.query('CREATE EXTENSION IF NOT EXISTS timescaledb;');
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          version INTEGER PRIMARY KEY,
+          name TEXT NOT NULL,
+          applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+      `);
+
+      const { rows } = await client.query<{ version: number }>('SELECT version FROM schema_migrations');
+      const result = await applyMigrations({ query: (sql, params) => client.query(sql, params) }, MIGRATIONS, new Set(rows.map(row => row.version)));
+      cleanupPending.set({}, result.pendingCleanup.length);
+
+      const extension = await client.query<{ extversion: string }>(
+        "SELECT extversion FROM pg_extension WHERE extname = 'timescaledb'"
+      );
+      const pending = result.pendingCleanup.length > 0 ? `, cleanup pending: ${result.pendingCleanup.map(item => item.version).join(', ')}` : '';
+      console.log(`TimescaleDB schema ready (extension ${extension.rows[0]?.extversion ?? 'unknown'}, migrations up to ${MIGRATIONS.length}${pending}).`);
+    } finally {
+      await client.query('SELECT pg_advisory_unlock($1)', [MIGRATION_LOCK_ID]).catch(() => undefined);
+    }
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+};
+
+// 필수 번호가 모두 적용됐는지 (T-211). 정리용은 남아 있어도 된다
+export const schemaReady = (applied: number[], required = REQUIRED_MIGRATION_VERSIONS) => {
+  const set = new Set(applied);
+  return required.every(version => set.has(version));
 };
 
 // 스키마 준비 기다리기 (plan.md QA-35 / P1-5, T-191)
 // 예전에는 db-sink가 backend healthy를 기다렸고, backend healthy에는 Gateway 컨슈머 그룹 참여까지 들어 있어
-// 실시간 경로가 늦으면 저장 경로(db-sink)도 시작하지 못했다. 이제 db-sink는 스키마(마지막 마이그레이션)만 직접 확인한다.
+// 실시간 경로가 늦으면 저장 경로(db-sink)도 시작하지 못했다. 이제 db-sink는 스키마(필수 마이그레이션)만 직접 확인한다.
+// 정리용 마이그레이션이 실패해 남아 있어도 기다리지 않는다 (T-211).
 // 읽기 전용 조회만 하고, 시간 안에 준비되지 않으면 예외(→ 종료 코드 1, 재시작 정책이 다시 띄움)
-export async function waitForSchema(version = LATEST_MIGRATION_VERSION, timeoutMs = 5 * 60_000, intervalMs = 2_000) {
+export async function waitForSchema(required = REQUIRED_MIGRATION_VERSIONS, timeoutMs = 5 * 60_000, intervalMs = 2_000) {
   const deadline = Date.now() + timeoutMs;
   let lastReason = 'not checked';
   while (Date.now() < deadline) {
     try {
-      const { rows } = await dbPool.query<{ version: number | null }>('SELECT max(version) AS version FROM schema_migrations');
-      const applied = rows[0]?.version ?? 0;
-      if (applied >= version) return applied;
-      lastReason = `migrations applied up to ${applied}`;
+      const { rows } = await dbPool.query<{ version: number }>('SELECT version FROM schema_migrations');
+      const applied = rows.map(row => row.version);
+      if (schemaReady(applied, required)) return Math.max(...required);
+      lastReason = `${applied.length} migrations applied`;
     } catch (error) {
       // 표가 아직 없거나 DB가 막 뜨는 중
-      lastReason = error instanceof Error ? error.message.slice(0, 120) : 'unexpected_error';
+      lastReason = `query failed (${dbErrorCode(error)})`;
     }
     await new Promise(resolve => setTimeout(resolve, intervalMs));
   }
-  throw new Error(`DB schema not ready within ${Math.round(timeoutMs / 1000)}s (need migration ${version}; ${lastReason})`);
+  throw new Error(`DB schema not ready within ${Math.round(timeoutMs / 1000)}s (need migrations up to ${Math.max(...required)}; ${lastReason})`);
 }

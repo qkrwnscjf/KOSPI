@@ -1,5 +1,6 @@
 import type { Pool } from 'pg';
 import { safeLogText } from '../http-json.js';
+import { logDbConnectionError } from '../db.js';
 import { runChecks, type DqResult, type QueryFn } from './data-quality.js';
 
 // 품질 검사 검증 (docs/BENCHMARK.md B-62 기준 4, 스위치 DQ_TEST_INJECT=true일 때만, 기본 끔)
@@ -62,6 +63,13 @@ export async function runDqInjection(pool: Pool) {
   };
   const rowsBefore = await count();
   const client = await pool.connect();
+  // 빌린 동안 연결이 끊겨도 프로세스가 끝나지 않게 받고, 돌려줄 때 그 연결은 버린다 (QA-01 / P1-1, T-209)
+  let broken: Error | undefined;
+  const onError = (error: Error) => {
+    broken = error;
+    logDbConnectionError('dq-inject client', error);
+  };
+  client.on('error', onError);
   const query: QueryFn = (sql, params) => client.query(sql, params as unknown[]);
   const applied: string[] = [];
   const failed: string[] = [];
@@ -88,7 +96,8 @@ export async function runDqInjection(pool: Pool) {
     misses = applied.filter(target => !hits.includes(target));
   } finally {
     await client.query('ROLLBACK').catch(() => undefined);
-    client.release();
+    client.removeListener('error', onError);
+    client.release(broken);
   }
   const rowsAfter = await count();
   console.log(`[dq-inject] ${JSON.stringify({ injected: applied.length, detected: hits.length, misses, failed, rowsBefore, rowsAfter })}`);

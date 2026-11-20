@@ -1,6 +1,7 @@
 import { kafka, TOPICS, ensureTopics, sendToDlq, probeBroker } from '../kafka.js';
 import { registerHealthCheck, trackConsumer, trackProducer } from '../health.js';
-import { dbPool, waitForSchema } from '../db.js';
+import { dbErrorCode, dbPool, waitForSchema, withDbClient } from '../db.js';
+import type { PoolClient } from 'pg';
 import { Counter, Gauge, Latency, metricsConfig, startMetricsLog, startMetricsServer } from '../metrics.js';
 import { parseTick } from '../../shared/tick-validation.js';
 import type { TickData } from '../../shared/types.js';
@@ -283,8 +284,12 @@ async function handleBreadthBatch({ batch, resolveOffset, heartbeat }: EachBatch
 // 지우기와 넣기를 한 트랜잭션으로 해서, 실패하면 이전 순위가 그대로 남는다.
 const rankingRowsReplaced = new Counter('kospi_sink_ranking_rows_replaced_total', 'Stock ranking rows written (each market-day is replaced as a whole)');
 
+// 빌린 연결이 끊기면 그 연결은 풀로 돌려보내지 않고 버린다 (withDbClient, QA-01 / P1-1, T-209)
 async function replaceRankings(item: StockRankings) {
-  const client = await dbPool.connect();
+  return withDbClient(dbPool, client => replaceRankingsWith(client, item));
+}
+
+async function replaceRankingsWith(client: PoolClient, item: StockRankings) {
   try {
     await client.query('BEGIN');
     await client.query(`DELETE FROM stock_rankings WHERE market = $1 AND time = to_timestamp($2 / 1000.0)`, [item.market, item.time]);
@@ -305,8 +310,6 @@ async function replaceRankings(item: StockRankings) {
   } catch (error) {
     await client.query('ROLLBACK').catch(() => undefined);
     throw error;
-  } finally {
-    client.release();
   }
 }
 
@@ -556,8 +559,10 @@ async function handleTicksBatch({ batch, resolveOffset, heartbeat }: EachBatchPa
       scheduleLateRefresh(result.times);
     } catch (error) {
       insertDuration.observe({ result: 'error' }, Date.now() - startedAt);
-      // 예외를 던져서 오프셋을 커밋하지 않는다. 값 오류면 runIsolated가 한 건씩 나눠 저장하고, 그 밖의 오류는 kafkajs가 같은 묶음을 다시 시도한다.
-      console.error(`DB sink insert failed (${valid.length} rows): ${error instanceof Error ? error.message : String(error)}`);
+      // 예외를 던져서 오프셋을 커밋하지 않는다. 값 오류면 runIsolated가 한 건씩 나눠 저장하고, 결정적 오류가 3번 반복되면 한 건씩 나눠 본다(T-210).
+      // 연결 같은 일시적 오류는 kafkajs가 같은 묶음을 다시 시도한다.
+      // 오류 문장에 값이 들어갈 수 있어 원문 대신 오류 코드만 남긴다 (T-210)
+      console.error(`DB sink insert failed (${valid.length} rows, ${dbErrorCode(error)})`);
       throw error;
     }
     const committedAt = Date.now();
@@ -803,7 +808,7 @@ async function run() {
   await consumer.run({
     eachBatchAutoResolve: false,
     eachBatch: async payload => {
-      // 토픽별로 나눠 처리한다. 값 오류는 그 메시지만 DLQ로 보내고, 그 밖의 오류는 다시 시도한다 (T-154)
+      // 토픽별로 나눠 처리한다. 값 오류는 그 메시지만 DLQ로 보내고, 결정적 오류는 3번 실패 뒤 한 건씩, 일시적 오류는 다시 시도한다 (T-154, T-210)
       const handler = BATCH_HANDLERS[payload.batch.topic];
       if (!handler) return;
       await runIsolated(payload, handler, (message, code) => sendRejectedToDlq(payload, message, code));

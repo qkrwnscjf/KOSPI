@@ -105,6 +105,10 @@ services:
       - DB_USER=postgres
       - DB_PASSWORD=password
       - DB_NAME=kospi
+      # REST 조회 시간 제한 (plan.md QA-03 / P1-1, T-209): DB가 문장을 15초에 취소하고, 응답이 아예 없으면 20초에 포기한다.
+      # 마이그레이션은 시간 제한 없는 전용 연결이라 영향 없음. db-sink는 과거 채우기가 길어 켜지 않는다
+      - DB_STATEMENT_TIMEOUT_MS=15000
+      - DB_QUERY_TIMEOUT_MS=20000
       - KAFKA_BROKERS=kafka:29092
       # 파이프라인 상태(T-112)를 묻는 Prometheus 내부 주소. Docker 내부 네트워크만 쓰고, 정해진 쿼리만 보낸다.
       - PROMETHEUS_URL=http://prometheus:9090
