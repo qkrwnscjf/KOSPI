@@ -8,9 +8,9 @@ import { cn } from '@/lib/utils'
 import { formatDate } from '@/lib/format'
 import { formatReturn, rankSectors, returnDirection, returnIntensity, SECTOR_LABELS } from '@/lib/sectors'
 import { useSectorReturns } from '@/hooks/useSectorReturns'
-import { SegmentedControl, segmentsOf } from '@/components/common/SegmentedControl'
+import { SegmentedControl } from '@/components/common/SegmentedControl'
 import { StatusMessage } from '@/components/common/StatusMessage'
-import { CARD_FRAME, statusText } from '@/lib/ui'
+import { CARD_FRAME, segmentsOf, statusText } from '@/lib/ui'
 
 // 섹터 수익률 노드 (docs/Task_ORDER.md D-66)
 // 국내 섹터 모멘텀 탭 위쪽에 섹터를 노드로 놓고 기간 수익률을 보여 준다. 수익률 높은 순으로 정렬한다.

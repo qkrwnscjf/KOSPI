@@ -1,4 +1,4 @@
-import { Component, type ErrorInfo, type ReactNode } from 'react'
+import { Component, type ReactNode } from 'react'
 import { fallbackText, type BoundaryScope } from '@/lib/errorBoundary'
 
 // 오류 경계 (plan.md FQA-07, T-200)
@@ -23,7 +23,8 @@ export class ErrorBoundary extends Component<Props, State> {
     return { failed: true }
   }
 
-  componentDidCatch(error: Error, _info: ErrorInfo) {
+  // 두 번째 인자(컴포넌트 경로)는 내부 구조라 남기지 않는다 (lint 쓰지 않는 매개변수, T-224)
+  componentDidCatch(error: Error) {
     console.error(`[ui] ${this.props.scope} "${this.props.label}" render failed: ${error.name}: ${error.message.slice(0, 200)}`)
   }
 

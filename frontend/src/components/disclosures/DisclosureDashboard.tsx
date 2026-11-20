@@ -7,9 +7,9 @@ import { useTokenColors } from '@/lib/theme'
 import { dartViewerUrl, formatKrw, GROUPS, groupLabel, kindLabel, seoulToday, toEokWon, type DisclosureItem } from '@/lib/disclosures'
 import { useCapitalEvents, useRecentDisclosures, type CapitalBucket, type DisclosureScope } from '@/hooks/useDisclosures'
 import type { ChartStatus } from '@/hooks/useMarketData'
-import { SegmentedControl, segmentsOf } from '@/components/common/SegmentedControl'
+import { SegmentedControl } from '@/components/common/SegmentedControl'
 import { StatusMessage } from '@/components/common/StatusMessage'
-import { CARD_FRAME, isLoadingText, statusText } from '@/lib/ui'
+import { CARD_FRAME, isLoadingText, segmentsOf, statusText } from '@/lib/ui'
 
 // 공시·자본 이벤트 탭 (docs/Task_ORDER.md 12단계 T-78, D-59)
 // ① 공시 속보: 최근 공시 목록(새 공시는 실시간으로 위에 추가)

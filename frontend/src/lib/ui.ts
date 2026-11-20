@@ -26,3 +26,12 @@ export function statusText(status: LoadState, empty: boolean, emptyText: string 
 }
 
 export const isLoadingText = (message: string | null) => message === STATUS_TEXT.loading
+
+// 선택 버튼 묶음(components/common/SegmentedControl.tsx)의 항목 (plan.md FQA-08, T-205). 부품 파일에서 옮겨 왔다 (T-224)
+export interface SegmentOption<T extends string> {
+  key: T
+  label: string
+}
+
+// 글자 목록을 항목으로(값과 이름이 같음)
+export const segmentsOf = <T extends string>(values: readonly T[]): SegmentOption<T>[] => values.map(value => ({ key: value, label: value }))

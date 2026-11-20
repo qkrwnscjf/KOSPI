@@ -7,9 +7,9 @@ import { useTokenColors } from '@/lib/theme'
 import { BREADTH_MARKET_LABELS, BREADTH_MARKETS, breadthShares, formatTradingValue, netAdvancers, type BreadthMarket, type BreadthPoint } from '@/lib/breadth'
 import { useMarketBreadth } from '@/hooks/useMarketBreadth'
 import type { ChartStatus } from '@/hooks/useMarketData'
-import { CARD_FRAME, STATUS_TEXT, statusText } from '@/lib/ui'
+import { CARD_FRAME, segmentsOf, STATUS_TEXT, statusText } from '@/lib/ui'
 import { StatusMessage } from '@/components/common/StatusMessage'
-import { SegmentedControl, segmentsOf } from '@/components/common/SegmentedControl'
+import { SegmentedControl } from '@/components/common/SegmentedControl'
 
 // 시장 폭·거래대금 (docs/Task_ORDER.md T-106, D-67)
 // 시장별로 최근 거래일의 상승·보합·하락 종목 수 막대와 거래대금, 기간 동안의 순상승 종목 수(상승 − 하락) 막대를 보여 준다.

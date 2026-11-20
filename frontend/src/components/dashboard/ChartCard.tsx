@@ -12,9 +12,9 @@ import { useSourceLags } from '@/hooks/useSourceLags'
 import type { TickData } from '@/lib/marketSocket'
 import type { ChartCardConfig } from '@/constants/data'
 import { createClock } from '@/lib/sharedSource'
-import { SegmentedControl, segmentsOf } from '@/components/common/SegmentedControl'
+import { SegmentedControl } from '@/components/common/SegmentedControl'
 import { chartSummary } from '@/lib/chartSummary'
-import { CARD_FRAME, STATUS_TEXT, statusText } from '@/lib/ui'
+import { CARD_FRAME, segmentsOf, STATUS_TEXT, statusText } from '@/lib/ui'
 import { StatusMessage } from '@/components/common/StatusMessage'
 
 const TIME_RANGES = ['실시간', '1일', '1주', '1개월', '3개월', '1년']

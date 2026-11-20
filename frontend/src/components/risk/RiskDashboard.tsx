@@ -4,8 +4,8 @@ import { cn } from '@/lib/utils'
 import { formatDate } from '@/lib/format'
 import { correlationBar, correlationStrength, formatSigned, RISK_LABELS, RISK_RANGES, type PairStats, type SeriesStats, type TargetRisk } from '@/lib/risk'
 import { useMarketRisk } from '@/hooks/useMarketRisk'
-import { CARD_FRAME, STATUS_TEXT, statusText } from '@/lib/ui'
-import { SegmentedControl, segmentsOf } from '@/components/common/SegmentedControl'
+import { CARD_FRAME, segmentsOf, STATUS_TEXT, statusText } from '@/lib/ui'
+import { SegmentedControl } from '@/components/common/SegmentedControl'
 import { StatusMessage } from '@/components/common/StatusMessage'
 
 // 시장 연관성·리스크 탭 (docs/Task_ORDER.md 15단계 T-110, D-72)

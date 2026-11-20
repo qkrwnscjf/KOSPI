@@ -1,0 +1,10 @@
+{
+  // 시험 코드 타입 검사 (plan.md P6-3 · QA-43, T-224). 시험은 `node --experimental-strip-types`로 타입을 지운 채 실행해서 타입 오류를 잡지 못했다.
+  // 시험은 src 파일을 `.ts` 확장자로 직접 가져오므로(node 실행 방식) allowImportingTsExtensions를 켠다. Node 내장 모듈 선언은 test/node-test.d.ts
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "allowImportingTsExtensions": true
+  },
+  "include": ["test", "src/vite-env.d.ts"]
+}
