@@ -51,6 +51,14 @@ export const needsFill = (gap: { longestRun: number }, resolution: BarResolution
 
 export const fillDue = (lastFetchedMs: number | undefined, nowMs: number) => lastFetchedMs === undefined || nowMs - lastFetchedMs >= FILL_REFETCH_MS;
 
+// 응답 전체가 0건일 때 (plan.md QA-16 / P2-5, T-217)
+// 예전에는 0건이어도 "요청해 봤음"(market_bars_fill_runs)을 기록해, 그 공백은 다시 받지도 않고 품질 검사(graph_gap)에서도 빠졌다.
+// 응답에 봉이 하나라도 있으면 지금처럼 기록한다: 공휴일·휴장 칸은 다른 날 봉은 오고 그 칸만 없으므로 다시 받아도 채워지지 않는다(경고 소음 없음).
+// 봉이 하나도 없으면 Yahoo 쪽 일시 문제로 보고 기록하지 않아 공백이 보이고 다시 시도된다. 같은 프로세스에서는 지표·해상도마다 FILL_EMPTY_RETRY_LIMIT번까지
+export const FILL_EMPTY_RETRY_LIMIT = 3;
+export const shouldRecordFill = (barCount: number) => barCount > 0;
+export const emptyFillRetryAllowed = (emptyAttempts: number | undefined, limit = FILL_EMPTY_RETRY_LIMIT) => (emptyAttempts ?? 0) < limit;
+
 export interface IntradayQuote {
   date: Date;
   close?: number | null | undefined;

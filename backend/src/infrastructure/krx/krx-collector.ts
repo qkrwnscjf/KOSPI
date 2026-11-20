@@ -8,11 +8,11 @@ import { KRX_STOCK_BY_CODE } from '../../shared/symbols.js';
 import { fetchBreadthCoverage, fetchDailyIndexCoverage, fetchKrxHistoryDays, fetchRankingsCoverage } from '../backend-coverage.js';
 import type { TickData } from '../../shared/types.js';
 import { KrxApiError, KrxClient, readKrxConfig } from './krx-client.js';
-import { combineCoverage, ENDPOINT_PATHS, FIELDS, internalGaps, mapIndexRows, missingDates, parseKrxNumber, pastSeoulWeekdays, rowsOf, seoulWeekdays } from './krx-index-daily.js';
+import { combineCoverage, coverageSymbols, ENDPOINT_PATHS, FIELDS, internalGaps, mapIndexRows, missingDates, parseKrxNumber, pastSeoulWeekdays, rowsOf, seoulWeekdays } from './krx-index-daily.js';
 import { BREADTH_ENDPOINTS, rankStocks, STOCK_FIELDS, summarizeBreadth, type BreadthEndpoint } from './krx-breadth.js';
 import { safeLogList } from '../http-json.js';
 import { setWallClockTimeout, type WallClockTimer } from '../wall-clock-timer.js';
-import { datesToCheck, mergeRetryDates, recordCheck, type DateCheckState } from './krx-schedule.js';
+import { datesToCheck, mergeRetryDates, nextRetryAttempt, recordCheck, selectRetryDates, type DateCheckState } from './krx-schedule.js';
 
 // KRX 일별 지수 수집기 (docs/Task_ORDER.md T-67, D-60)
 // VKOSPI와 KRX 섹터 5종의 일별 종가를 KRX Open API에서 받아 Kafka `index-daily`로 보낸다.
@@ -150,6 +150,7 @@ async function collectDay(client: KrxClient, endpoint: KrxEndpoint, basDd: strin
 
     const { ticks, invalid } = mapIndexRows(endpoint, basDd, rows);
     for (const symbol of invalid) invalidTotal.inc({ symbol });
+    matchedAtSource.set(endpoint, new Set<string>([...ticks.map(tick => tick.symbol), ...invalid]));
     // 대상 지수 이름이 응답에 없으면 한 번만 공개 지수 이름 일부를 남긴다 (이름 표 확정용)
     if (ticks.length === 0 && invalid.length === 0 && !loggedMissing.has(endpoint)) {
       loggedMissing.add(endpoint);
@@ -285,15 +286,34 @@ async function collectBreadthDay(client: KrxClient, endpoint: BreadthEndpoint, b
 }
 
 // 실패한 날짜 다시 받기 (T-159): 과거 채우기는 실패가 있어도 완료로 표시하고, 재시작 때도 저장 범위의 앞뒤만 보므로 중간 날짜가 빈 채로 남았다.
-// 실패한 날짜를 기억해 뒀다가 다음 주기마다 다시 받는다. 성공하면 지운다
-const retryDates = new Map<string, Set<string>>();
+// 실패한 날짜를 기억해 뒀다가 다음 주기마다 다시 받는다. 성공하면 지운다.
+// 상한 (plan.md QA-12 / P2-3, T-216): 같은 날짜는 3번까지, 한 주기에 최근 20개까지, 60일 안쪽만(krx-schedule RETRY_LIMITS).
+// 상한으로 빠진 날짜는 다음 기동의 빈 날 채우기(INDEX_GAP_LOOKBACK_DAYS, DB 기준)가 맡는다
+const retryDates = new Map<string, Map<string, number>>();
+const retryDropped = new Counter('kospi_krx_retry_dropped_total', 'Failed KRX dates removed from the retry list after the attempt limit, by endpoint (T-216)');
 function noteRetry(endpoint: string, basDd: string, ok: boolean) {
-  const dates = retryDates.get(endpoint) ?? new Set<string>();
-  if (ok) dates.delete(basDd);
-  else dates.add(basDd);
+  const dates = retryDates.get(endpoint) ?? new Map<string, number>();
+  if (ok) {
+    dates.delete(basDd);
+  } else {
+    const { attempts, keep } = nextRetryAttempt(dates.get(basDd));
+    if (keep) dates.set(basDd, attempts);
+    else {
+      dates.delete(basDd);
+      retryDropped.inc({ endpoint });
+    }
+  }
   retryDates.set(endpoint, dates);
 }
-const withRetries = (endpoint: string, planned: string[]) => mergeRetryDates(planned, retryDates.get(endpoint));
+const seoulToday = () => new Date(Date.now() + 9 * 3600_000).toISOString().slice(0, 10).replace(/-/g, '');
+const withRetries = (endpoint: string, planned: string[]) => mergeRetryDates(planned, selectRetryDates(retryDates.get(endpoint), seoulToday()));
+
+// 엔드포인트마다 마지막 응답에서 찾은 대상 지수 (T-216): 저장값이 없는 지표가 KRX 응답에 아직 있는지(이름이 바뀌지 않았는지) 판단한다
+const matchedAtSource = new Map<string, Set<string>>();
+// 저장된 날짜 사이의 빈 날을 찾는 기간 (plan.md QA-10 / P2-3, T-216). 실패한 날짜가 메모리에서 사라져도(재기동) DB 기준으로 다시 찾는다.
+// 길면 평일 공휴일을 기동마다 한 번씩 더 받으므로(빈 응답) 스택이 꺼져 있을 만한 기간만 본다
+const INDEX_GAP_LOOKBACK_DAYS = 30;
+const loggedAbsent = new Set<string>();
 
 // 시장 폭 날짜들을 오래된 순서로 받는다. 거부된 엔드포인트는 건너뛴다
 async function collectBreadthDays(client: KrxClient, dates: string[], endpoints: BreadthEndpoint[]) {
@@ -354,10 +374,28 @@ async function backfill(client: KrxClient) {
 
   const recent = seoulWeekdays(Date.now(), RECENT_DAYS);
   const target = seoulWeekdays(Date.now(), BACKFILL_DAYS).slice(0, -recent.length);
+  // 최근 7일은 loop의 확인 일정이 받는다
+  const gapWindow = pastSeoulWeekdays(Date.now(), INDEX_GAP_LOOKBACK_DAYS).filter(date => date < (recent[0] ?? ''));
   for (const endpoint of pending) {
     if (stopping) return;
-    const stored = combineCoverage(ENDPOINT_SYMBOLS[endpoint].map(symbol => coverage.get(symbol)));
-    const dates = missingDates(target, stored);
+    let symbols = ENDPOINT_SYMBOLS[endpoint];
+    // 저장값이 없는 지표가 일부 있으면, 다른 지표의 마지막 저장일을 한 번 받아 KRX 응답에 그 이름이 있는지 본다 (QA-11 / P2-3, T-216)
+    const hasStored = (symbol: string) => !!coverage.get(symbol);
+    const storedSymbols = symbols.filter(hasStored);
+    if (storedSymbols.length > 0 && storedSymbols.length < symbols.length) {
+      const reference = combineCoverage(storedSymbols.map(symbol => coverage.get(symbol)))?.latest;
+      if (reference) await collectDay(client, endpoint, reference);
+      const { usable, absent } = coverageSymbols(symbols, hasStored, matchedAtSource.get(endpoint) ?? new Set());
+      if (absent.length > 0 && !loggedAbsent.has(endpoint)) {
+        loggedAbsent.add(endpoint);
+        console.warn(`[krx] ${endpoint}: no stored rows and not in the KRX response of ${reference ?? 'the last stored day'} for ${absent.join(', ')} (index name changed?); left out of the backfill`);
+      }
+      symbols = usable;
+    }
+    const stored = combineCoverage(symbols.map(symbol => coverage.get(symbol)));
+    const gaps = internalGaps(gapWindow, symbols.map(symbol => coverage.get(symbol)?.days ?? new Set<string>()));
+    const dates = [...new Set([...missingDates(target, stored), ...gaps])].sort();
+    if (gaps.length > 0) console.log(`[krx] ${endpoint}: ${gaps.length} missing trade days between stored days in the last ${INDEX_GAP_LOOKBACK_DAYS} days (${gaps.join(', ')})`);
     if (dates.length === 0) {
       backfilled.add(endpoint);
       console.log(`[krx] ${endpoint} backfill skipped: already stored ${stored?.earliest}-${stored?.latest}`);
@@ -420,10 +458,14 @@ async function backfillBreadth(client: KrxClient) {
 
   const recent = seoulWeekdays(Date.now(), BREADTH_RECENT_DAYS);
   const target = seoulWeekdays(Date.now(), BACKFILL_DAYS).slice(0, -recent.length);
+  // 저장된 날짜 사이의 빈 날 (QA-10 / P2-3, T-216). 최근 3일은 loop가 받는다
+  const gapWindow = pastSeoulWeekdays(Date.now(), INDEX_GAP_LOOKBACK_DAYS).filter(date => date < (recent[0] ?? ''));
   for (const endpoint of pending) {
     if (stopping) return;
     const stored = coverage.get(BREADTH_ENDPOINTS[endpoint].market) ?? null;
-    const dates = missingDates(target, stored);
+    const gaps = internalGaps(gapWindow, [stored?.days ?? new Set<string>()]);
+    const dates = [...new Set([...missingDates(target, stored), ...gaps])].sort();
+    if (gaps.length > 0) console.log(`[krx] ${endpoint}: ${gaps.length} missing breadth days between stored days in the last ${INDEX_GAP_LOOKBACK_DAYS} days (${gaps.join(', ')})`);
     if (dates.length === 0) {
       backfilled.add(endpoint);
       console.log(`[krx] ${endpoint} breadth backfill skipped: already stored ${stored?.earliest}-${stored?.latest}`);

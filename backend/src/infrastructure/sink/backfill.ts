@@ -10,7 +10,7 @@ import type { YahooDailyMessage } from '../../shared/yahoo-daily.js';
 import { BAR_RESOLUTIONS, type YahooBarMessage } from '../../shared/yahoo-bars.js';
 import { latestSessionEnd, sessionDate, YAHOO_MARKET } from '../ingestion/market-hours.js';
 import { CLOSE_FIX_DAYS, CLOSE_FIX_MARGIN_MS, closeFetchDone, GAP_LOOKBACK_DAYS, missingWeekdays, needsDailyHistory, rowDay, shouldRefreshClose, toDailyRows, usesOfficialDailyClose, type DailyRow } from './daily-history.js';
-import { FILL_PLANS, fillDue, findGap, needsFill, toFillRows } from './intraday-fill.js';
+import { emptyFillRetryAllowed, FILL_PLANS, fillDue, findGap, needsFill, shouldRecordFill, toFillRows } from './intraday-fill.js';
 import { reportRun } from '../ingestion-report.js';
 import { backfillRefreshScope } from './late-refresh.js';
 
@@ -303,12 +303,15 @@ export async function runOfficialCloseRefresh(producer: Producer) {
 // 집계는 건드리지 않고, History API가 집계에 없는 시각만 이어 붙인다. 공백 판단에는 이미 채운 값도 포함한다.
 // 받지 못한 지표는 다음 확인 때 다시 시도한다. 채워지지 않는 공백(공휴일 등)은 FILL_REFETCH_MS마다 한 번만 받는다.
 const lastFillAt = new Map<string, number>();
+// 봉이 하나도 오지 않은 횟수 (QA-16 / P2-5, T-217). 기록하지 않고 다음 확인(6시간 뒤)에 다시 받되, 프로세스당 FILL_EMPTY_RETRY_LIMIT번까지
+const emptyFillAttempts = new Map<string, number>();
 
 export async function runIntradayFill(producer: Producer) {
   const startedAt = Date.now();
   let calls = 0;
   let failed = 0;
   let sent = 0;
+  let emptyFills = 0;
   for (const symbol of YAHOO_KEYS) {
     for (const resolution of BAR_RESOLUTIONS) {
       const plan = FILL_PLANS[resolution];
@@ -329,10 +332,18 @@ export async function runIntradayFill(producer: Producer) {
       const key = `${symbol}|${resolution}`;
       if (!needsFill(findGap(rows.map(row => row.ms), YAHOO_MARKET[symbol], resolution, now, lastRun?.fetched ?? null), resolution)) continue;
       if (!fillDue(lastFillAt.get(key), now)) continue;
+      if (!emptyFillRetryAllowed(emptyFillAttempts.get(key))) continue;
       calls += 1;
       try {
         const result = await fetchChart(symbol, plan.yahooInterval, plan.fetchDays);
         const bars = toFillRows(result.quotes, resolution, now);
+        if (!shouldRecordFill(bars.length)) {
+          // 기록하지 않아 공백이 품질 검사에 남고, 다음 확인에 다시 받는다
+          emptyFillAttempts.set(key, (emptyFillAttempts.get(key) ?? 0) + 1);
+          emptyFills += 1;
+          continue;
+        }
+        emptyFillAttempts.delete(key);
         if (bars.length > 0) {
           await producer.send({
             topic: TOPICS.yahooBars,
@@ -356,7 +367,7 @@ export async function runIntradayFill(producer: Producer) {
       }
     }
   }
-  if (calls > 0) console.log(`Intraday fill: ${calls} charts fetched, ${failed} failed, ${sent} bars sent in ${Date.now() - startedAt}ms`);
+  if (calls > 0) console.log(`Intraday fill: ${calls} charts fetched, ${failed} failed, ${emptyFills} returned no bars (not recorded, retried), ${sent} bars sent in ${Date.now() - startedAt}ms`);
   else console.log(`Intraday fill: nothing to fetch (checked in ${Date.now() - startedAt}ms)`);
   await reportChartRun(producer, 'intraday_fill', startedAt, calls, failed, sent);
 }

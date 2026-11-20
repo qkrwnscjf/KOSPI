@@ -9,6 +9,7 @@ import type { MarketState } from '../../shared/market-state.js';
 import { producer, TOPICS, ensureTopics, probeBroker } from '../kafka.js';
 import { registerHealthCheck, registerHeartbeat, trackProducer } from '../health.js';
 import { createCycleSummary, yahooFetchHealthy, type CycleCounts } from './worker-status.js';
+import { createTickBuffer, TICK_BUFFER_LIMITS } from './tick-buffer.js';
 import { reportRun } from '../ingestion-report.js';
 import { TimeoutError, withAbortTimeout } from '../abort-timeout.js';
 import { Counter, Gauge, Latency, metricsConfig, startMetricsLog, startMetricsServer } from '../metrics.js';
@@ -177,6 +178,24 @@ async function collect(
   };
 }
 
+// Kafka 전송 실패 때 tick 버퍼 (plan.md QA-13 / P2-6, T-218). 보낼 때 producedAt을 붙인다
+interface PendingTick {
+  symbol: string;
+  category: string;
+  price: number;
+  changeRate: number;
+  changePrice: number | undefined;
+  timestamp: number;
+  volume: number | undefined;
+  collectedAt: number | undefined;
+  marketState: MarketState | undefined;
+}
+const tickBuffer = createTickBuffer<PendingTick>();
+const bufferedTicks = new Gauge('kospi_worker_tick_buffer_size', 'Ticks kept in memory while Kafka sends fail (T-218)');
+const bufferFlushedTotal = new Counter('kospi_worker_tick_buffer_flushed_total', 'Buffered ticks sent after Kafka came back (T-218)');
+const bufferDroppedTotal = new Counter('kospi_worker_tick_buffer_dropped_total', 'Buffered ticks dropped because the buffer limit (age or count) was exceeded (T-218)');
+const ticksSentTotal = new Counter('kospi_worker_ticks_sent_total', 'Ticks delivered to Kafka, including buffered ones (T-218)');
+
 // 주기별 건수 (1분 요약 로그용, QA-29 / P3-5, T-214). 예전에는 주기마다 "Fetching market data..."와 결과 줄을 남겼다
 let cycleCounts: Omit<CycleCounts, 'failed'> = { received: 0, fresh: 0, sent: 0 };
 const cycleSummary = createCycleSummary();
@@ -229,64 +248,74 @@ async function runCycle(): Promise<FetchResult> {
   cycleCounts.received = allData.length;
   cycleCounts.fresh = freshData.length;
   try {
-    if (freshData.length > 0) {
-      // Kafka 전송. DB 저장은 DB Sink가 Kafka에서 읽어서 한다 (docs/Task_ORDER.md T-12, D-18).
-      // 이전에는 여기서 DB 저장이 끝나야 전송이 시작되어, DB 지연이 곧 실시간 지연이었다.
-      const producedAt = Date.now();
-      // 보내기 전에 받는 쪽과 같은 검증(validateTickRecord)과 장중 미래 시각 5분 제한을 건다 (QA-14 · 15 / P2-4, T-187).
-      // 통과하지 못한 tick은 보내지 않고 사유를 센다(받는 쪽이 버리면 다시 오지 않으므로 보낸 것으로 세면 안 됨)
-      const sendable = freshData.filter(data => {
-        const check = validateTickRecord({ symbol: data.ticker, category: data.category, price: data.price, changeRate: data.changeRate, changePrice: data.changePrice, timestamp: data.timestamp, volume: data.volume, collectedAt: data.collectedAt, producedAt, marketState: data.marketState });
-        const reason = !check.ok ? check.reason : !isPlausibleTickTime(data.timestamp) ? 'future_timestamp' : null;
-        if (reason === null) return true;
-        tickRejectedTotal.inc({ symbol: data.ticker, reason });
-        const key = `${data.ticker}|${reason}`;
-        if (!loggedRejections.has(key)) {
-          loggedRejections.add(key);
-          console.warn(`Tick not sent (fails the consumer validation): ${data.ticker} (${reason}); further ones are only counted`);
-        }
-        return false;
-      });
-      const messages = sendable.map(data => {
-        // Map ticker to symbol for internal TickData usage
-        const tickData = {
-          symbol: data.ticker,
-          category: data.category,
-          price: data.price,
-          changeRate: data.changeRate,
-          changePrice: data.changePrice,
-          timestamp: data.timestamp,
-          volume: data.volume,
-          collectedAt: data.collectedAt,
-          producedAt,
-          marketState: data.marketState,
-        };
-
-        return {
-          key: data.ticker,
-          value: JSON.stringify(tickData)
-        };
-      });
-
-      if (messages.length === 0) return yahoo.result;
-      try {
-        await producer.send({ topic: TOPICS.ticks, messages });
-      } catch (error) {
-        quoteRun.sendFailed += messages.length;
-        kafkaSendFailedTotal.inc({}, messages.length);
-        throw error;
+    // Kafka 전송. DB 저장은 DB Sink가 Kafka에서 읽어서 한다 (docs/Task_ORDER.md T-12, D-18).
+    // 이전에는 여기서 DB 저장이 끝나야 전송이 시작되어, DB 지연이 곧 실시간 지연이었다.
+    const checkedAt = Date.now();
+    // 보내기 전에 받는 쪽과 같은 검증(validateTickRecord)과 장중 미래 시각 5분 제한을 건다 (QA-14 · 15 / P2-4, T-187).
+    // 통과하지 못한 tick은 보내지 않고 사유를 센다(받는 쪽이 버리면 다시 오지 않으므로 보낸 것으로 세면 안 됨)
+    const sendable = freshData.filter(data => {
+      const check = validateTickRecord({ symbol: data.ticker, category: data.category, price: data.price, changeRate: data.changeRate, changePrice: data.changePrice, timestamp: data.timestamp, volume: data.volume, collectedAt: data.collectedAt, producedAt: checkedAt, marketState: data.marketState });
+      const reason = !check.ok ? check.reason : !isPlausibleTickTime(data.timestamp) ? 'future_timestamp' : null;
+      if (reason === null) return true;
+      tickRejectedTotal.inc({ symbol: data.ticker, reason });
+      const key = `${data.ticker}|${reason}`;
+      if (!loggedRejections.has(key)) {
+        loggedRejections.add(key);
+        console.warn(`Tick not sent (fails the consumer validation): ${data.ticker} (${reason}); further ones are only counted`);
       }
-      kafkaSendDuration.observe({}, Date.now() - producedAt);
-      quoteRun.sent += messages.length;
-      cycleCounts.sent = messages.length;
-
-      // 전송에 성공한 뒤에만 "마지막 전송 시각"을 갱신한다. 실패하면 다음 주기에 다시 보낼 수 있도록.
+      return false;
+    });
+    // Map ticker to symbol for internal TickData usage. producedAt은 실제로 보낼 때 붙인다(버퍼에서 늦게 나가도 Kafka 구간 지연이 부풀지 않게)
+    const ticks: PendingTick[] = sendable.map(data => ({
+      symbol: data.ticker,
+      category: data.category,
+      price: data.price,
+      changeRate: data.changeRate,
+      changePrice: data.changePrice,
+      timestamp: data.timestamp,
+      volume: data.volume,
+      collectedAt: data.collectedAt,
+      marketState: data.marketState,
+    }));
+    // 보낸 것(또는 버퍼에 맡긴 것)으로 기록한다. 버퍼에 넣은 tick은 다음 주기에 다시 보내지 않는다(버퍼가 보냄, T-218)
+    const markAccepted = () => {
       for (const data of sendable) {
         lastSentTimestamp.set(data.ticker, Math.max(data.timestamp, lastSentTimestamp.get(data.ticker) ?? 0));
         if (data.marketState) lastSentMarketState.set(data.ticker, data.marketState);
         tickTotal.inc({ symbol: data.ticker, result: 'sent' });
       }
+    };
+
+    // 버퍼에 남은 tick을 새 tick보다 먼저 보낸다 (QA-13 / P2-6, T-218)
+    const buffered = tickBuffer.drain();
+    const batch = [...buffered, ...ticks];
+    if (batch.length === 0) return yahoo.result;
+    const producedAt = Date.now();
+    try {
+      await producer.send({
+        topic: TOPICS.ticks,
+        messages: batch.map(tick => ({ key: tick.symbol, value: JSON.stringify({ ...tick, producedAt }) })),
+      });
+    } catch (error) {
+      quoteRun.sendFailed += ticks.length;
+      kafkaSendFailedTotal.inc({}, ticks.length);
+      const dropped = tickBuffer.restore(batch, Date.now());
+      if (dropped > 0) bufferDroppedTotal.inc({}, dropped);
+      bufferedTicks.set({}, tickBuffer.size());
+      markAccepted();
+      if (buffered.length === 0) console.warn(`Kafka send failed; buffering ticks in memory (up to ${TICK_BUFFER_LIMITS.maxAgeMs / 60_000} min / ${TICK_BUFFER_LIMITS.maxCount}) until Kafka is back`);
+      throw error;
     }
+    kafkaSendDuration.observe({}, Date.now() - producedAt);
+    quoteRun.sent += batch.length;
+    cycleCounts.sent = batch.length;
+    ticksSentTotal.inc({}, batch.length);
+    bufferedTicks.set({}, 0);
+    if (buffered.length > 0) {
+      bufferFlushedTotal.inc({}, buffered.length);
+      console.log(`Kafka send recovered: sent ${buffered.length} buffered ticks (oldest collected ${Math.round((Date.now() - (buffered[0]?.collectedAt ?? Date.now())) / 1000)}s ago)`);
+    }
+    markAccepted();
   } catch (error) {
     // Kafka 전송 실패는 백오프하지 않는다 (외부 API 보호가 백오프의 목적)
     console.error('Worker loop error:', error);

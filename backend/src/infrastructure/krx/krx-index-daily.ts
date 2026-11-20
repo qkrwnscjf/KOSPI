@@ -104,6 +104,17 @@ export function combineCoverage(coverages: ({ earliest: string; latest: string }
   };
 }
 
+// 저장 범위를 합칠 지표 고르기 (plan.md QA-11 / P2-3, T-216)
+// 저장값이 없는 지표가 하나라도 있으면 combineCoverage가 null이 되어 그 엔드포인트 1년을 기동마다 다시 받았다.
+// KRX가 지수 이름을 바꾸면 그 지표는 영원히 비어 있으므로, 최근 저장일 응답(matchedAtSource)에 이름이 없는 빈 지표는 빼고 계산한다.
+// 응답에 있는 빈 지표(새로 추가한 지표)는 지금처럼 전체 채우기 대상이다. 모두 비어 있으면(첫 기동) 그대로 둔다
+export function coverageSymbols(symbols: readonly string[], hasStored: (symbol: string) => boolean, matchedAtSource: ReadonlySet<string>) {
+  const empty = symbols.filter(symbol => !hasStored(symbol));
+  if (empty.length === 0 || empty.length === symbols.length) return { usable: [...symbols], absent: [] as string[] };
+  const absent = empty.filter(symbol => !matchedAtSource.has(symbol));
+  return { usable: symbols.filter(symbol => !absent.includes(symbol)), absent };
+}
+
 export function rowsOf(body: Record<string, unknown>): Record<string, unknown>[] {
   const block = body.OutBlock_1;
   return Array.isArray(block) ? block.filter((row): row is Record<string, unknown> => !!row && typeof row === 'object') : [];

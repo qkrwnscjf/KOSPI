@@ -64,7 +64,12 @@ export function isKrxExtendedHour(now: Date): boolean {
   return special !== undefined && isWeekday(day) && minutes >= KRX_REGULAR_SESSION.close && minutes < special.close
 }
 
-export function isMarketOpen(market: MarketId, now: Date): boolean {
+// 미국 조기 폐장일 (plan.md QA-17 / P2-7, T-219): backend market-hours.ts의 US_EARLY_CLOSES와 같은 표다. 바꾸면 두 파일을 함께 고친다.
+// 거래소(NYSE) 공지로 사용자가 확인한 날짜만 넣는다(2026-11-20 구조만 추가, 날짜는 확인 대기)
+export const US_EARLY_CLOSES: Readonly<Record<string, { close: number }>> = {}
+const US_REGULAR_SESSION = { open: hm(9, 30), close: hm(16) }
+
+export function isMarketOpen(market: MarketId, now: Date, usEarlyCloses: Readonly<Record<string, { close: number }>> = US_EARLY_CLOSES): boolean {
   if (market === 'krx') {
     // KOSPI, KOSDAQ: 월~금 09:00 ~ 15:30 (서울). 특수 거래일은 표의 시간
     const { day, minutes, date } = zonedClock(now, 'Asia/Seoul')
@@ -81,10 +86,11 @@ export function isMarketOpen(market: MarketId, now: Date): boolean {
     const { day, minutes } = zonedClock(now, 'Asia/Taipei')
     return isWeekday(day) && minutes >= hm(9) && minutes < hm(13, 30)
   }
-  const { day, minutes } = zonedClock(now, 'America/New_York')
+  const { day, minutes, date } = zonedClock(now, 'America/New_York')
   if (market === 'us_equity') {
-    // SP500, NASDAQ, SOX, US10Y: 월~금 09:30 ~ 16:00 (뉴욕)
-    return isWeekday(day) && minutes >= hm(9, 30) && minutes < hm(16)
+    // SP500, NASDAQ, SOX, US10Y: 월~금 09:30 ~ 16:00 (뉴욕), 조기 폐장일은 표의 시각 (T-219)
+    const close = usEarlyCloses[date]?.close ?? US_REGULAR_SESSION.close
+    return isWeekday(day) && minutes >= US_REGULAR_SESSION.open && minutes < close
   }
   // USD/KRW, DXY, WTI, COPPER: 일 18:00 ~ 금 17:00 (뉴욕)
   if (day === 6) return false

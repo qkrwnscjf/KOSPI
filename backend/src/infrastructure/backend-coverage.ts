@@ -63,16 +63,27 @@ export async function fetchKrxHistoryDays(): Promise<Map<string, ReadonlySet<str
 }
 
 // 시장 폭 (T-106): 시장별 저장된 첫 날짜·마지막 날짜. 저장된 것이 없는 시장은 null, 확인하지 못하면 null.
-export async function fetchBreadthCoverage(markets: readonly string[]): Promise<Map<string, DateCoverage | null> | null> {
+// days: 최근 1년 응답 행의 서울 날짜(사이 빈 날 찾기용, plan.md QA-10 / P2-3, T-216)
+export async function fetchBreadthCoverage(markets: readonly string[]): Promise<Map<string, (DateCoverage & { days: ReadonlySet<string> }) | null> | null> {
   const body = await getJson(`/api/v1/market/breadth?range=${encodeURIComponent('1년')}`);
-  const coverage = body?.coverage;
-  if (!body || !coverage || typeof coverage !== 'object' || Array.isArray(coverage)) return null;
-  const result = new Map<string, DateCoverage | null>();
+  return body ? parseBreadthCoverage(body, markets) : null;
+}
+
+export function parseBreadthCoverage(body: Record<string, unknown>, markets: readonly string[]): Map<string, (DateCoverage & { days: ReadonlySet<string> }) | null> | null {
+  const coverage = body.coverage;
+  if (!coverage || typeof coverage !== 'object' || Array.isArray(coverage)) return null;
+  const data = body.data && typeof body.data === 'object' && !Array.isArray(body.data) ? (body.data as Record<string, unknown>) : {};
+  const result = new Map<string, (DateCoverage & { days: ReadonlySet<string> }) | null>();
   for (const market of markets) {
     const item = (coverage as Record<string, unknown>)[market];
     const { since, until } = item && typeof item === 'object' ? (item as Record<string, unknown>) : {};
+    const rows = Array.isArray(data[market]) ? (data[market] as unknown[]) : [];
+    const days = new Set(rows
+      .map(row => (row && typeof row === 'object' ? (row as Record<string, unknown>).time : undefined))
+      .filter((time): time is number => typeof time === 'number' && Number.isFinite(time))
+      .map(seoulDay));
     result.set(market, typeof since === 'string' && typeof until === 'string' && ISO_DATE.test(since) && ISO_DATE.test(until)
-      ? { earliest: since.replace(/-/g, ''), latest: until.replace(/-/g, '') }
+      ? { earliest: since.replace(/-/g, ''), latest: until.replace(/-/g, ''), days }
       : null);
   }
   return result;

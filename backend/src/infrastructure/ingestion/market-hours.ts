@@ -119,10 +119,26 @@ export function specialSessionHorizon(nowMs: number): { lastDate: string | null;
   return { lastDate, daysLeft, warn: daysLeft <= SPECIAL_SESSION_WARN_DAYS };
 }
 
-// 정규 장 마감 시각 (T-145). 24시간 시장은 하루 종가의 기준이 없어 넣지 않는다. 국내는 특수 거래일이면 그날 마감 시각을 쓴다(T-166)
+// 미국 조기 폐장일 (plan.md QA-17 / P2-7, docs/Task_ORDER.md T-219, BENCHMARK B-91): 뉴욕 날짜(YYYY-MM-DD)별 마감 시각.
+// 추수감사절 다음 날·크리스마스 전날 등 거래소가 13:00 ET에 닫는 날이다. 예전에는 16:00 마감으로 보아 공식 종가를 3시간 늦게 받았다.
+// 국내 특수 거래일 표와 같은 규칙: **거래소(NYSE) 공지로 사용자가 확인한 날짜만 넣는다**(2026-11-20 구조만 추가, 날짜는 확인 대기).
+// frontend/src/lib/marketHours.ts에 같은 표가 있다. 바꾸면 두 파일을 함께 고친다.
+// 이 표를 쓰는 곳: 미국 장 열림(수집 요청·지연 측정·그래프 공백 판단·화면 배지), 마감 시각(공식 종가를 받는 시점, T-145)
+export const US_EARLY_CLOSES: Readonly<Record<string, { close: number; reason: string }>> = {};
+const US_REGULAR_SESSION = { open: hm(9, 30), close: hm(16) };
+export const usClose = (nyDate: string, earlyCloses: Readonly<Record<string, { close: number }>> = US_EARLY_CLOSES) =>
+  earlyCloses[nyDate]?.close ?? US_REGULAR_SESSION.close;
+
+// 미국 주식 장 열림 (시험할 수 있도록 표를 받는다)
+export function isUsEquityOpen(now: Date, earlyCloses: Readonly<Record<string, { close: number }>> = US_EARLY_CLOSES): boolean {
+  const { day, minutes, date } = zonedClock(now, 'America/New_York');
+  return isWeekday(day) && minutes >= US_REGULAR_SESSION.open && minutes < usClose(date, earlyCloses);
+}
+
+// 정규 장 마감 시각 (T-145). 24시간 시장은 하루 종가의 기준이 없어 넣지 않는다. 국내는 특수 거래일, 미국은 조기 폐장일이면 그날 마감 시각을 쓴다(T-166, T-219)
 const SESSION_CLOSE: Partial<Record<MarketId, { timeZone: string; close: number }>> = {
   krx: { timeZone: 'Asia/Seoul', close: KRX_REGULAR_SESSION.close },
-  us_equity: { timeZone: 'America/New_York', close: hm(16) },
+  us_equity: { timeZone: 'America/New_York', close: US_REGULAR_SESSION.close },
   tokyo: { timeZone: 'Asia/Tokyo', close: hm(15, 30) },
   taiwan: { timeZone: 'Asia/Taipei', close: hm(13, 30) },
 };
@@ -135,14 +151,15 @@ export function sessionDate(market: MarketId, ms: number): string | null {
 
 // 마감 후 marginMs가 지난 가장 최근 평일 장의 마감 시각(ms). 공휴일은 시간표로 알 수 없어 평일로 친다(그날 봉이 없을 뿐이다).
 // 일수를 빼서 계산하므로 미국 서머타임이 바뀌는 주말을 건너뛸 때 1시간 어긋날 수 있다(받는 시점만 달라지고 값은 같다).
-export function latestSessionEnd(market: MarketId, nowMs: number, marginMs: number): number | null {
+export function latestSessionEnd(market: MarketId, nowMs: number, marginMs: number, usEarlyCloses: Readonly<Record<string, { close: number }>> = US_EARLY_CLOSES): number | null {
   const session = SESSION_CLOSE[market];
   if (!session) return null;
   const at = nowMs - marginMs;
   const { day, minutes, date } = zonedClock(new Date(at), session.timeZone);
   const closeOn = (back: number) => {
-    if (market !== 'krx') return session.close;
-    return krxSession(back === 0 ? date : zonedClock(new Date(at - back * 86_400_000), session.timeZone).date).close;
+    if (market !== 'krx' && market !== 'us_equity') return session.close;
+    const dayDate = back === 0 ? date : zonedClock(new Date(at - back * 86_400_000), session.timeZone).date;
+    return market === 'krx' ? krxSession(dayDate).close : usClose(dayDate, usEarlyCloses);
   };
   for (let back = 0; back <= 7; back += 1) {
     if (!isWeekday((day - back + 7) % 7)) continue;
@@ -164,12 +181,9 @@ export const MARKETS: { id: MarketId; isOpen: (now: Date) => boolean }[] = [
     },
   },
   {
-    // SP500, NASDAQ, SOX, US10Y: 월~금 09:30 ~ 16:00 (뉴욕). US10Y는 측정상 미국 장 시간에만 갱신됨 (B-08, B-10)
+    // SP500, NASDAQ, SOX, US10Y: 월~금 09:30 ~ 16:00 (뉴욕), 조기 폐장일은 US_EARLY_CLOSES의 시각 (T-219). US10Y는 측정상 미국 장 시간에만 갱신됨 (B-08, B-10)
     id: 'us_equity',
-    isOpen: now => {
-      const { day, minutes } = zonedClock(now, 'America/New_York');
-      return isWeekday(day) && minutes >= hm(9, 30) && minutes < hm(16);
-    },
+    isOpen: now => isUsEquityOpen(now),
   },
   {
     // USD/KRW, DXY, WTI, COPPER: 일 18:00 ~ 금 17:00 (뉴욕). 주말만 닫힌다고 단순화 (선물의 일일 휴장 1시간은 무시)
