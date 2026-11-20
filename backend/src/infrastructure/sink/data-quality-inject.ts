@@ -14,12 +14,23 @@ const runRow = (source: string, endpoint: string, received: number, dropped: num
   `INSERT INTO ingestion_runs (started_at, finished_at, run_id, source, endpoint, received, sent, dropped_total, dropped, status, source_total, covered)
    VALUES (now(), now(), gen_random_uuid(), '${source}', '${endpoint}', ${received}, 0, ${dropped}, '{}'::jsonb, '${status}', ${total}, ${covered})`;
 
+// 서울 날짜 기준 시각 (QA-45, T-223): 오늘 23:59 KST, 다음 평일 15:30 KST(금 → 월, 토 → 월)
+const SEOUL_TODAY = `(now() AT TIME ZONE 'Asia/Seoul')::date`;
+const TODAY_2359_KST = `((${SEOUL_TODAY} + TIME '23:59') AT TIME ZONE 'Asia/Seoul')`;
+const NEXT_WEEKDAY_1530_KST = `((${SEOUL_TODAY} + (CASE extract(isodow FROM now() AT TIME ZONE 'Asia/Seoul') WHEN 5 THEN 3 WHEN 6 THEN 2 ELSE 1 END)::int + TIME '15:30') AT TIME ZONE 'Asia/Seoul')`;
+
 const INJECTIONS: { target: string; sql: string[] }[] = [
   { target: 'yahoo_quote/future_time', sql: [`INSERT INTO market_ticks (time, symbol, category, price, change_rate, change_price) VALUES (now() + INTERVAL '1 hour', 'DQ_TEST', 'macro', 100, 0, 0)`] },
   { target: 'yahoo_quote/price_jump', sql: [`INSERT INTO market_ticks (time, symbol, category, price, change_rate, change_price) VALUES (now() - INTERVAL '20 minutes', 'DQ_JUMP', 'macro', 100, 0, 0), (now() - INTERVAL '19 minutes', 'DQ_JUMP', 'macro', 200, 0, 0)`] },
   { target: 'yahoo_quote/rate_consistency', sql: [`INSERT INTO market_ticks (time, symbol, category, price, change_rate, change_price) VALUES (now() - INTERVAL '18 minutes', 'DQ_RATE', 'macro', 100, 5, 50)`] },
   { target: 'yahoo_quote/freshness', sql: [`DELETE FROM market_ticks WHERE symbol = 'USD/KRW'`] },
-  { target: 'yahoo_chart/date_label', sql: [`INSERT INTO index_daily_yahoo (time, symbol, close, change_rate, change_price) VALUES (date_trunc('week', now()) - INTERVAL '2 days' + INTERVAL '6 hours 30 minutes', 'SP500', 100, 0, 0) ON CONFLICT (symbol, time) DO NOTHING`] },
+  // 주말 날짜(SP500), 다음 평일 15:30 KST(DQ_FUTURE, 진짜 미래 날짜)는 잡혀야 하고,
+  // 오늘 23:59 KST(DQ_TODAY, 오늘 날짜인데 시각만 아직 오지 않음)는 잡히면 안 된다 (plan.md QA-45, T-223). 판정 상세는 [dq-inject]의 labels
+  { target: 'yahoo_chart/date_label', sql: [
+    `INSERT INTO index_daily_yahoo (time, symbol, close, change_rate, change_price) VALUES (date_trunc('week', now()) - INTERVAL '2 days' + INTERVAL '6 hours 30 minutes', 'SP500', 100, 0, 0) ON CONFLICT (symbol, time) DO NOTHING`,
+    `INSERT INTO index_daily_yahoo (time, symbol, close, change_rate, change_price) VALUES (${NEXT_WEEKDAY_1530_KST}, 'DQ_FUTURE', 100, 0, 0)`,
+    `INSERT INTO index_daily_yahoo (time, symbol, close, change_rate, change_price) VALUES (${TODAY_2359_KST}, 'DQ_TODAY', 100, 0, 0)`,
+  ] },
   { target: 'yahoo_chart/date_shift', sql: [
     `UPDATE index_daily_yahoo y SET close = a.prev
      FROM (SELECT bucket, lag(close) OVER (ORDER BY bucket) AS prev FROM market_1d WHERE symbol = 'DOW' AND bucket >= now() - INTERVAL '21 days') a
@@ -75,6 +86,7 @@ export async function runDqInjection(pool: Pool) {
   const failed: string[] = [];
   let hits: string[] = [];
   let misses: string[] = [];
+  let labels: unknown[] = [];
   try {
     await client.query('BEGIN');
     await client.query(`SET LOCAL lock_timeout = '5s'`);
@@ -94,12 +106,14 @@ export async function runDqInjection(pool: Pool) {
     const after = await runChecks(query, Date.now(), { retentionGrace: false });
     hits = applied.filter(target => detected(before, after, target));
     misses = applied.filter(target => !hits.includes(target));
+    labels = after.find(result => keyOf(result) === 'yahoo_chart/date_label')?.detail ?? [];
   } finally {
     await client.query('ROLLBACK').catch(() => undefined);
     client.removeListener('error', onError);
     client.release(broken);
   }
   const rowsAfter = await count();
-  console.log(`[dq-inject] ${JSON.stringify({ injected: applied.length, detected: hits.length, misses, failed, rowsBefore, rowsAfter })}`);
+  // labels: date_label에 걸린 "지표:날짜"(주입한 시험 지표와 공개 시세 지표만, QA-45 / T-223)
+  console.log(`[dq-inject] ${JSON.stringify({ injected: applied.length, detected: hits.length, misses, failed, labels, rowsBefore, rowsAfter })}`);
   // 옛 일별 표와 뷰를 비교하던 [split-check](B-62 기준 2)는 옛 표를 지우면서 뺐다 (T-173, 마이그레이션 16이 지우기 전에 같은 확인을 한다)
 }

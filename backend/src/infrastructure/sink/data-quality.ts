@@ -193,14 +193,26 @@ async function graphGap(query: QueryFn, resolution: BarResolution, nowMs: number
   return issues('yahoo_quote', `graph_gap_${resolution}`, gaps);
 }
 
+// 일봉 날짜가 잘못 붙었는지 (plan.md QA-45, T-223, BENCHMARK B-95): 서울 기준 주말이거나, 서울 날짜가 오늘보다 뒤이면 잘못이다.
+// 일별 값 시각은 거래일 15:30 KST라는 날짜 표식이다. 예전에는 시각(time > now())으로 비교해서, 대만처럼 15:30 KST 전에 공식 종가를
+// 받는 날(대만 마감 14:30 KST + 30분)에는 오늘 값이 15:00 ~ 15:30 KST 동안 "미래"로 fail이 났다(11/20 06:21 UTC 실제 발생)
+const seoulDate = (ms: number) => new Date(ms + 9 * 3600_000);
+export function isInvalidDailyLabel(timeMs: number, nowMs: number) {
+  const day = seoulDate(timeMs);
+  const weekday = day.getUTCDay();
+  if (weekday === 0 || weekday === 6) return true;
+  return day.toISOString().slice(0, 10) > seoulDate(nowMs).toISOString().slice(0, 10);
+}
+
 async function yahooChartChecks(query: QueryFn, nowMs: number): Promise<DqResult[]> {
-  // 일봉 날짜는 거래일이어야 한다: 주말 날짜나, 그 시각이 아직 오지 않은 날짜는 잘못 붙은 값이다
-  const labels = await query(
-    `SELECT symbol, ${dayExpr('time')} AS day FROM index_daily_yahoo
+  // 일봉 날짜는 거래일이어야 한다: 주말 날짜나, 아직 오지 않은 날짜는 잘못 붙은 값이다. 후보만 DB에서 고르고 판정은 isInvalidDailyLabel 한 곳
+  const candidates = await query(
+    `SELECT symbol, ${dayExpr('time')} AS day, (extract(epoch FROM time) * 1000)::float8 AS ms FROM index_daily_yahoo
      WHERE time >= now() - INTERVAL '30 days'
        AND (extract(isodow FROM time AT TIME ZONE 'Asia/Seoul') IN (6, 7) OR time > now())
      ORDER BY day DESC`
   );
+  const labels = { rows: candidates.rows.filter(row => isInvalidDailyLabel(row.ms as number, nowMs)) };
   // 하루 밀림: 일봉 값이 그날 집계 종가와 다르고 전날 집계 종가와 같으면 날짜가 밀린 값으로 의심한다
   const usKeys = YAHOO_KEYS.filter(key => YAHOO_MARKET[key] === 'us_equity');
   const shifted = await query(
