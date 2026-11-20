@@ -744,6 +744,15 @@ async function logTelemetryLevel() {
     const level = safeLogText(rows[0]?.level ?? 'unknown', 20);
     if (level === 'off') console.log(`DB telemetry level: ${level}`);
     else console.warn(`DB telemetry level: ${level} (expected off, SEC-017)`);
+    // DB 메모리 설정 (plan.md QA-36, T-220): compose 메모리 상한이 이 값보다 넉넉한지 보기 위함. 설정 이름과 값만
+    const memory = await dbPool.query<{ shared_buffers: string; work_mem: string; max_connections: string; maintenance_work_mem: string }>(
+      `SELECT current_setting('shared_buffers') AS shared_buffers, current_setting('work_mem') AS work_mem,
+              current_setting('maintenance_work_mem') AS maintenance_work_mem, current_setting('max_connections') AS max_connections`
+    );
+    const settings = memory.rows[0];
+    if (settings) {
+      console.log(`DB memory settings: shared_buffers=${safeLogText(settings.shared_buffers, 12)}, work_mem=${safeLogText(settings.work_mem, 12)}, maintenance_work_mem=${safeLogText(settings.maintenance_work_mem, 12)}, max_connections=${safeLogText(settings.max_connections, 6)}`);
+    }
   } catch (error) {
     console.warn(`DB telemetry level check failed: ${error instanceof Error ? error.message : String(error)}`);
   }

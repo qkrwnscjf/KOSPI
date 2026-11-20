@@ -5,6 +5,8 @@ import { formatClock } from '@/lib/format'
 import { DATASET_LABELS, formatAge, formatBytes, jobState, SERVICE_LABELS } from '@/lib/pipeline'
 import { usePipelineStatus } from '@/hooks/useAnalytics'
 import { FOCUSABLE_SELECTOR, nextFocusIndex } from '@/lib/focusTrap'
+import { STATUS_TEXT } from '@/lib/ui'
+import { StatusMessage } from '@/components/common/StatusMessage'
 
 // 설정 창 (docs/Task_ORDER.md 15단계 T-112, D-72)
 // 사이드바 아래 톱니바퀴 버튼으로 연다. "파이프라인 상태"(서비스·데이터 신선도·Kafka·수집기·DB)를 보여 준다(테마 전환은 사이드바 버튼).
@@ -38,8 +40,9 @@ function Row({ label, value, state = 'neutral' }: { label: string; value: string
 
 function PipelineStatusView() {
   const { data, status } = usePipelineStatus(true)
-  if (status === 'loading' && !data) return <p className="py-6 text-center text-xs text-fg-muted">불러오는 중</p>
-  if (!data) return <p className="py-6 text-center text-xs text-fg-muted">상태를 불러오지 못했습니다</p>
+  // 상태 문구·골격은 공통 (plan.md FQA-08 · 16, T-221 · T-222)
+  if (status === 'loading' && !data) return <StatusMessage message={STATUS_TEXT.loading} className="h-24" />
+  if (!data) return <StatusMessage message={STATUS_TEXT.error} className="h-24" />
   if (data.prometheus === 'unavailable') return <p className="py-6 text-center text-xs text-fg-muted">Prometheus에 연결되지 않아 상태를 확인할 수 없습니다</p>
 
   const yahooOk = data.yahoo15m.success ?? 0

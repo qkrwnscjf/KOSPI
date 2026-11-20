@@ -5,13 +5,16 @@ import { cn } from '@/lib/utils'
 import { CALENDAR_LABELS, CALENDAR_TYPES, monthGrid, monthOf, shiftMonth, type CalendarType } from '@/lib/calendar'
 import { dartViewerUrl, seoulToday } from '@/lib/disclosures'
 import { useCalendarDay, useDisclosureCalendar } from '@/hooks/useAnalytics'
+import { CARD_FRAME, STATUS_TEXT, statusText } from '@/lib/ui'
+import { StatusMessage } from '@/components/common/StatusMessage'
 
 // 실적·배당 캘린더 탭 (docs/Task_ORDER.md 15단계 T-111, D-72)
 // 이미 저장된 DART 공시(유가증권)에서 잠정실적·배당 결정·정기보고서를 날짜별로 보여 준다. 정정 공시는 빼고 원 공시만 센다.
 // 앞으로의 일정(발표 예정일)은 공시 본문에 있어서 보여 주지 않는다. 종류는 점 모양과 글자로 구분한다(색만으로 구분하지 않음).
 
 const WEEKDAYS = ['월', '화', '수', '목', '금', '토', '일']
-const cardClass = 'card-neon rounded-xl border border-line bg-surface'
+// 카드 틀·상태 문구는 공통(lib/ui.ts, plan.md FQA-08, T-221)
+const cardClass = CARD_FRAME
 // 종류별 표시: 데이터 색은 흑백 농도로만(네온 강조색은 데이터에 쓰지 않음, D-54)
 const TYPE_STYLE: Record<CalendarType, string> = {
   earnings: 'bg-fg',
@@ -29,9 +32,8 @@ function DayDetail({ date, filter }: { date: string; filter: Set<CalendarType> }
   return (
     <div className={cn(cardClass, 'flex flex-col p-5')}>
       <h3 className="mb-3 text-[13px] font-medium text-fg-muted">{date} 공시 <span className="text-[11px]">({items.length}건)</span></h3>
-      {status === 'loading' && <p className="py-6 text-center text-xs text-fg-muted">불러오는 중</p>}
-      {status === 'error' && <p className="py-6 text-center text-xs text-fg-muted">데이터를 불러오지 못했습니다</p>}
-      {status === 'loaded' && items.length === 0 && <p className="py-6 text-center text-xs text-fg-muted">이 날의 공시가 없습니다</p>}
+      {/* 불러오는 중에는 골격, 그 밖은 글 (plan.md FQA-16, T-222) */}
+      <StatusMessage message={statusText(status, items.length === 0, '이 날의 공시가 없습니다')} className="h-24" />
       <ul className="max-h-[520px] overflow-y-auto">
         {items.map(item => {
           const href = dartViewerUrl(item.rceptNo)
@@ -139,7 +141,7 @@ export function EarningsCalendar() {
               )
             })}
           </div>
-          {status === 'error' && <p className="pt-3 text-center text-xs text-fg-muted">데이터를 불러오지 못했습니다</p>}
+          {status === 'error' && <p className="pt-3 text-center text-xs text-fg-muted">{STATUS_TEXT.error}</p>}
         </div>
         {selected && <DayDetail date={selected} filter={filter} />}
       </div>

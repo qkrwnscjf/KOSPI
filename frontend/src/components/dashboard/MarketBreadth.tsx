@@ -7,6 +7,9 @@ import { useTokenColors } from '@/lib/theme'
 import { BREADTH_MARKET_LABELS, BREADTH_MARKETS, breadthShares, formatTradingValue, netAdvancers, type BreadthMarket, type BreadthPoint } from '@/lib/breadth'
 import { useMarketBreadth } from '@/hooks/useMarketBreadth'
 import type { ChartStatus } from '@/hooks/useMarketData'
+import { CARD_FRAME, STATUS_TEXT, statusText } from '@/lib/ui'
+import { StatusMessage } from '@/components/common/StatusMessage'
+import { SegmentedControl, segmentsOf } from '@/components/common/SegmentedControl'
 
 // 시장 폭·거래대금 (docs/Task_ORDER.md T-106, D-67)
 // 시장별로 최근 거래일의 상승·보합·하락 종목 수 막대와 거래대금, 기간 동안의 순상승 종목 수(상승 − 하락) 막대를 보여 준다.
@@ -15,13 +18,9 @@ import type { ChartStatus } from '@/hooks/useMarketData'
 
 const RANGES = ['1주', '1개월', '3개월', '1년']
 const COLOR_TOKENS = ['up', 'down', 'fg-muted', 'surface', 'line'] as const
-const cardClass = 'card-neon flex flex-col rounded-xl border border-line bg-surface p-5'
-
-function statusMessage(status: ChartStatus, empty: boolean) {
-  if (status === 'error') return '데이터를 불러오지 못했습니다'
-  if (status === 'loading') return '불러오는 중'
-  return empty ? '데이터 준비 중 (KRX 일별매매정보 수집 후 표시)' : null
-}
+// 카드 틀·상태 문구는 공통(lib/ui.ts, plan.md FQA-08, T-221)
+const cardClass = cn(CARD_FRAME, 'flex flex-col p-5')
+const statusMessage = (status: ChartStatus, empty: boolean) => statusText(status, empty, `${STATUS_TEXT.notReady} (KRX 일별매매정보 수집 후 표시)`)
 
 function BreadthCard({ market, points, status }: { market: BreadthMarket; points: BreadthPoint[]; status: ChartStatus }) {
   const colors = useTokenColors(COLOR_TOKENS)
@@ -62,7 +61,7 @@ function BreadthCard({ market, points, status }: { market: BreadthMarket; points
 
       <h4 className="mb-1 text-[11px] font-medium text-fg-muted">순상승 종목 수 (상승 − 하락)</h4>
       <div className="relative -mx-2 h-[160px] text-fg">
-        {message && <div className="absolute inset-0 z-10 flex items-center justify-center px-4 text-center text-xs text-fg-muted">{message}</div>}
+        <StatusMessage message={message} className="absolute inset-0 z-10" />
         <ResponsiveContainer width="100%" height="100%">
           <BarChart data={data} margin={{ top: 4, right: 8, left: -12, bottom: 0 }} barCategoryGap="15%">
             <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="currentColor" strokeOpacity={0.08} />
@@ -108,15 +107,7 @@ export function MarketBreadthPanel() {
         <h3 className="flex items-center gap-2 text-[12px] font-semibold tracking-wide text-fg-muted">
           시장 폭 · 거래대금 <span className="text-[11px] font-normal">(KRX 일별매매정보, 장 마감 후 갱신)</span>
         </h3>
-        <div className="flex gap-1" role="group" aria-label="시장 폭 기간 선택">
-          {RANGES.map(item => (
-            <button key={item} type="button" aria-pressed={range === item} onClick={() => setRange(item)}
-              className={cn('rounded-md px-2 py-1 text-[11px] transition-colors duration-150',
-                range === item ? 'bg-fg font-medium text-page' : 'text-fg-muted hover:bg-fg/5 hover:text-fg')}>
-              {item}
-            </button>
-          ))}
-        </div>
+        <SegmentedControl label="시장 폭 기간 선택" options={segmentsOf(RANGES)} value={range} onChange={setRange} />
       </div>
       <div className="grid w-full grid-cols-1 gap-5 md:grid-cols-2">
         {BREADTH_MARKETS.map(market => <BreadthCard key={market} market={market} points={data?.[market] ?? []} status={status} />)}

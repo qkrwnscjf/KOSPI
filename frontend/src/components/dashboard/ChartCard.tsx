@@ -14,6 +14,8 @@ import type { ChartCardConfig } from '@/constants/data'
 import { createClock } from '@/lib/sharedSource'
 import { SegmentedControl, segmentsOf } from '@/components/common/SegmentedControl'
 import { chartSummary } from '@/lib/chartSummary'
+import { CARD_FRAME, STATUS_TEXT, statusText } from '@/lib/ui'
+import { StatusMessage } from '@/components/common/StatusMessage'
 
 const TIME_RANGES = ['실시간', '1일', '1주', '1개월', '3개월', '1년']
 // 일별 시세 지표(T-67)는 하루 1개 값이라 실시간·1일 그래프가 없다
@@ -21,14 +23,10 @@ const DAILY_RANGES = ['1주', '1개월', '3개월', '1년']
 // 계산 카드(T-107)는 서버가 집계끼리 계산하므로 실시간 그래프가 없다
 const SPREAD_RANGES = ['1일', '1주', '1개월', '3개월', '1년']
 
-// 차트 영역에 데이터 대신 보여 줄 안내 문구. 데이터가 있으면 null.
-function chartMessage(status: ChartStatus, points: number, isRealtime: boolean) {
-  if (status === 'not_ready') return '데이터 준비 중' // T-26, R-04
-  if (status === 'error') return '데이터를 불러오지 못했습니다'
-  if (points > 0) return null
-  if (status === 'loading') return '불러오는 중'
-  return isRealtime ? '실시간 데이터 수신 대기 중' : '표시할 데이터가 없습니다'
-}
+// 차트 영역에 데이터 대신 보여 줄 안내 문구. 데이터가 있으면 null. 공통 문구는 lib/ui.ts 한 곳 (plan.md FQA-08, T-221)
+// 준비 중(T-26, R-04)·오류는 데이터 여부와 상관없이 알린다
+const chartMessage = (status: ChartStatus, points: number, isRealtime: boolean) =>
+  statusText(status, points === 0, isRealtime ? '실시간 데이터 수신 대기 중' : STATUS_TEXT.empty)
 
 // X축 눈금 (타임프레임별)
 function formatXAxis(time: number, range: string) {
@@ -153,7 +151,7 @@ export function ChartCard({ title, symbol, ready, decimals, prefix, suffix, mark
     // 등장 효과는 DashboardGrid의 감싸는 요소가 맡는다 (plan.md FQA-04, T-195: 예전에는 카드 안에서 한 번 더 움직였다)
     // 마우스를 올리면 테두리가 강조색으로 은은하게 빛난다 (T-69). 그래프 색은 등락 색 그대로다
     // 모바일(md 미만, 1열)은 카드를 280px로 낮춰 스크롤을 줄인다 (plan.md FQA-10, T-206). 국내 탭 10장 기준 약 3,400 → 2,800px
-    <div className="card-neon relative h-[280px] rounded-xl border border-line bg-surface md:h-[340px]">
+    <div className={cn(CARD_FRAME, 'relative h-[280px] md:h-[340px]')}>
       <div className="flex h-full flex-col p-5">
         <div className="mb-2 flex items-start justify-between gap-3">
           <div className="min-w-0">
@@ -175,11 +173,8 @@ export function ChartCard({ title, symbol, ready, decimals, prefix, suffix, mark
         {/* 격자·축·커서는 currentColor(본문색), 선·채우기는 등락 색 클래스를 따로 받는다. 모두 라이트·다크에 맞게 바뀐다 */}
         {/* 그래프의 글 대안 (plan.md FQA-11, T-197): 화면 읽기 프로그램은 그림 대신 시작·마지막 값과 기간 등락을 읽는다 */}
         <div className="relative -mx-2 flex-1 text-fg" role="img" aria-label={chartSummary(title, activeRange, chartData, value => `${prefix ?? ''}${formatNumber(value, decimals)}${suffix ? ` ${suffix}` : ''}`)}>
-          {message && (
-            <div className="absolute inset-0 z-10 flex items-center justify-center text-xs text-fg-muted">
-              {message}
-            </div>
-          )}
+          {/* 불러오는 중에는 골격, 그 밖은 글. 차트 영역 높이가 고정이라 데이터가 와도 카드 높이는 그대로 (plan.md FQA-16, T-222) */}
+          <StatusMessage message={message} className="absolute inset-0 z-10" />
           <ResponsiveContainer width="100%" height="100%">
             <AreaChart data={chartData} margin={{ top: 8, right: 8, left: -12, bottom: 0 }}>
               <defs>

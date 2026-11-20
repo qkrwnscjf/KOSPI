@@ -8,6 +8,8 @@ import { dartViewerUrl, formatKrw, GROUPS, groupLabel, kindLabel, seoulToday, to
 import { useCapitalEvents, useRecentDisclosures, type CapitalBucket, type DisclosureScope } from '@/hooks/useDisclosures'
 import type { ChartStatus } from '@/hooks/useMarketData'
 import { SegmentedControl, segmentsOf } from '@/components/common/SegmentedControl'
+import { StatusMessage } from '@/components/common/StatusMessage'
+import { CARD_FRAME, isLoadingText, statusText } from '@/lib/ui'
 
 // 공시·자본 이벤트 탭 (docs/Task_ORDER.md 12단계 T-78, D-59)
 // ① 공시 속보: 최근 공시 목록(새 공시는 실시간으로 위에 추가)
@@ -17,7 +19,8 @@ import { SegmentedControl, segmentsOf } from '@/components/common/SegmentedContr
 
 const RANGES = ['1주', '1개월', '3개월', '1년']
 const COLOR_TOKENS = ['up', 'down', 'fg-muted', 'surface', 'line'] as const
-const cardClass = 'card-neon rounded-xl border border-line bg-surface p-5'
+// 카드 틀·상태 문구는 공통(lib/ui.ts, plan.md FQA-08, T-221)
+const cardClass = cn(CARD_FRAME, 'p-5')
 const badgeClass = 'inline-flex shrink-0 items-center rounded-full border px-1.5 py-px text-[10px] font-medium leading-4'
 const CAPITAL_GROUPS = new Set(['dilution', 'shareholder_return', 'treasury_disposal'])
 
@@ -30,11 +33,7 @@ const SERIES = [
 const groupBadgeClass = (group: string) =>
   group === 'dilution' ? 'border-down/40 text-down' : group === 'shareholder_return' ? 'border-up/40 text-up' : 'border-line text-fg-muted'
 
-function statusMessage(status: ChartStatus, empty: boolean, emptyText: string) {
-  if (status === 'error') return '데이터를 불러오지 못했습니다'
-  if (status === 'loading') return '불러오는 중'
-  return empty ? emptyText : null
-}
+const statusMessage = (status: ChartStatus, empty: boolean, emptyText: string) => statusText(status, empty, emptyText)
 
 function ScopeNote({ scope }: { scope: DisclosureScope | null }) {
   if (!scope) return null
@@ -98,8 +97,9 @@ function DisclosureFeed({ group, setGroup }: { group: string; setGroup: (group: 
       </div>
       <SegmentedControl className="mb-2" scroll label="공시 분류" options={GROUPS} value={group} onChange={setGroup} />
       <div className="relative min-h-[200px] flex-1">
+        {/* 불러오는 동안은 목록 최대 높이(520px)를 미리 잡아, 목록이 오면서 오른쪽 카드·아래 내용이 밀리지 않게 한다 (plan.md FQA-16, T-222) */}
         {message ? (
-          <div className="flex h-[200px] items-center justify-center text-xs text-fg-muted">{message}</div>
+          <StatusMessage message={message} className={isLoadingText(message) ? 'h-[520px] justify-start py-4' : 'h-[200px]'} />
         ) : (
           <ul className="max-h-[520px] overflow-y-auto pr-1">
             {items.map(item => <DisclosureRow key={item.rceptNo} item={item} />)}
@@ -151,7 +151,7 @@ function CapitalEventsCard({ range, setRange, buckets, top, since, status, weekl
       </div>
 
       <div className="relative -mx-2 h-[220px] text-fg">
-        {message && <div className="absolute inset-0 z-10 flex items-center justify-center text-xs text-fg-muted">{message}</div>}
+        <StatusMessage message={message} className="absolute inset-0 z-10" />
         <ResponsiveContainer width="100%" height="100%">
           <BarChart data={data} margin={{ top: 8, right: 8, left: -12, bottom: 0 }} barGap={2} barCategoryGap="20%">
             <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="currentColor" strokeOpacity={0.08} />

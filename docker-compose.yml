@@ -2,6 +2,10 @@
 # - 재시작 정책: Docker·PC를 다시 켜도 직접 멈춘(stop) 서비스가 아니면 다시 뜬다. 예전에는 인프라·모니터링에 정책이 없고 앱은 on-failure라
 #   Docker 재시작 뒤 일부만 뜨거나 전부 멈춰 있었다.
 # - 로그 크기 제한: 서비스마다 10MB × 3개까지만 남긴다(상시 실행 때 디스크가 계속 늘지 않게)
+# 메모리 상한 (plan.md QA-36, T-220, BENCHMARK B-92): 서비스마다 mem_limit. 한 서비스가 메모리를 다 써서 다른 서비스까지 멈추게 하지 않기 위한 폭주 방지 상한이다.
+# - Node 서비스 6개: 실측 78 ~ 93MB(2026-11-20, kospi_process_resident_memory_bytes)의 4배 이상
+# - TimescaleDB: shared_buffers 약 980MB(기동 로그 DB memory settings)의 3배
+# - Kafka·Redis·Prometheus·Grafana·kafka-exporter·nginx: 메모리를 볼 수단이 없어 기본값 기준 넉넉한 값(추정, Kafka 힙 기본 1GB)
 x-defaults: &service-defaults
   restart: unless-stopped
   logging:
@@ -16,6 +20,7 @@ services:
     <<: *service-defaults
     image: confluentinc/cp-kafka:7.5.0
     container_name: kospi-kafka
+    mem_limit: 1536m
     # 호스트 포트는 모두 이 PC(127.0.0.1)에만 연다. 같은 Wi-Fi·LAN의 다른 기기는 접속할 수 없다 (docs/Task_ORDER.md T-92, SEC-001)
     # 컨트롤러 리스너(29093)는 컨테이너 안에서만 쓰고 호스트에 열지 않는다
     ports:
@@ -52,8 +57,10 @@ services:
   # Redis (Caching Layer)
   redis:
     <<: *service-defaults
-    image: redis:alpine
+    # 버전 고정 (plan.md QA-36, T-220, SEC-006 일부): 예전 `redis:alpine`으로 실행 중이던 버전(로그 Redis version=8.8.0)
+    image: redis:8.8.0-alpine
     container_name: kospi-redis
+    mem_limit: 256m
     ports:
       - "127.0.0.1:6379:6379"
     # 최신값 캐시를 down → up 뒤에도 유지한다. worker가 재시작 때 이 값으로 변경 감지를 시작한다 (docs/Task_ORDER.md T-142, T-133). 공개 시세 캐시만 있다
@@ -68,8 +75,10 @@ services:
   # TimescaleDB (Time-series Database based on PostgreSQL)
   timescaledb:
     <<: *service-defaults
-    image: timescale/timescaledb:latest-pg14
+    # 버전 고정 (QA-36, T-220): 예전 `latest-pg14`로 실행 중이던 버전(PostgreSQL 14.17, TimescaleDB 2.19.3). 볼륨의 데이터·확장 버전과 맞아야 한다
+    image: timescale/timescaledb:2.19.3-pg14
     container_name: kospi-timescaledb
+    mem_limit: 3g
     # 사용 통계 전송을 끈다 (docs/security.md SEC-017). 기존 볼륨에도 적용되도록 실행 옵션으로 준다
     command: ["postgres", "-c", "timescaledb.telemetry_level=off"]
     environment:
@@ -94,6 +103,7 @@ services:
       dockerfile: Dockerfile
     container_name: kospi-backend
     <<: *service-defaults
+    mem_limit: 512m
     ports:
       - "127.0.0.1:3001:3001"
     environment:
@@ -137,6 +147,7 @@ services:
       dockerfile: Dockerfile
     container_name: kospi-worker
     <<: *service-defaults
+    mem_limit: 384m
     command: ["node", "dist/infrastructure/ingestion/worker.js"]
     # worker는 Kafka에만 전송한다. DB 저장은 db-sink가 맡으므로 DB 접속 정보가 필요 없다 (T-12, D-18)
     environment:
@@ -163,6 +174,7 @@ services:
       dockerfile: Dockerfile
     container_name: kospi-db-sink
     <<: *service-defaults
+    mem_limit: 512m
     command: ["node", "dist/infrastructure/sink/db-sink.js"]
     environment:
       - KAFKAJS_NO_PARTITIONER_WARNING=1
@@ -197,6 +209,7 @@ services:
       dockerfile: Dockerfile
     container_name: kospi-krx-collector
     <<: *service-defaults
+    mem_limit: 384m
     command: ["node", "dist/infrastructure/krx/krx-collector.js"]
     environment:
       - KAFKAJS_NO_PARTITIONER_WARNING=1
@@ -227,6 +240,7 @@ services:
       dockerfile: Dockerfile
     container_name: kospi-disclosure-collector
     <<: *service-defaults
+    mem_limit: 384m
     command: ["node", "dist/infrastructure/disclosures/disclosure-collector.js"]
     environment:
       - KAFKAJS_NO_PARTITIONER_WARNING=1
@@ -257,6 +271,7 @@ services:
       dockerfile: Dockerfile
     container_name: kospi-market-stats-collector
     <<: *service-defaults
+    mem_limit: 384m
     command: ["node", "dist/infrastructure/market-stats/market-stats-collector.js"]
     environment:
       - KAFKAJS_NO_PARTITIONER_WARNING=1
@@ -281,6 +296,7 @@ services:
       dockerfile: Dockerfile
     container_name: kospi-frontend
     <<: *service-defaults
+    mem_limit: 64m
     ports:
       - "127.0.0.1:5173:80"
     depends_on:
@@ -289,10 +305,12 @@ services:
   # --- Monitoring Stack ---
 
   kafka-exporter:
-    image: danielqsj/kafka-exporter:latest
+    # 버전 고정 (QA-36, T-220): 예전 `latest`로 실행 중이던 버전(로그 version=1.9.0)
+    image: danielqsj/kafka-exporter:v1.9.0
     container_name: kospi-kafka-exporter
     command: ["--kafka.server=kafka:29092"]
     <<: *service-defaults
+    mem_limit: 128m
     ports:
       - "127.0.0.1:9308:9308"
     depends_on:
@@ -300,9 +318,11 @@ services:
         condition: service_healthy
 
   prometheus:
-    image: prom/prometheus:latest
+    # 버전 고정 (QA-36, T-220): 예전 `latest`로 실행 중이던 버전(로그 version=3.13.1). prometheus_data 볼륨 형식과 맞아야 한다
+    image: prom/prometheus:v3.13.1
     container_name: kospi-prometheus
     <<: *service-defaults
+    mem_limit: 1g
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
       - prometheus_data:/prometheus
@@ -312,9 +332,11 @@ services:
       - kafka-exporter
 
   grafana:
-    image: grafana/grafana:latest
+    # 버전 고정 (QA-36, T-220): 예전 `latest`로 실행 중이던 버전 13.1.0(사용자 허용으로 로그에서 버전 숫자만 추출). grafana_data의 DB 형식과 맞아야 한다
+    image: grafana/grafana:13.1.0
     container_name: kospi-grafana
     <<: *service-defaults
+    mem_limit: 768m
     # Grafana가 스스로 외부(grafana.com 등)에 접속하지 않게 한다 (docs/Task_ORDER.md T-55, SEC-011). 비밀값이 아닌 설정값이다.
     environment:
       - GF_ANALYTICS_REPORTING_ENABLED=false         # 익명 사용 통계 전송

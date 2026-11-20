@@ -9,6 +9,8 @@ import { formatDate } from '@/lib/format'
 import { formatReturn, rankSectors, returnDirection, returnIntensity, SECTOR_LABELS } from '@/lib/sectors'
 import { useSectorReturns } from '@/hooks/useSectorReturns'
 import { SegmentedControl, segmentsOf } from '@/components/common/SegmentedControl'
+import { StatusMessage } from '@/components/common/StatusMessage'
+import { CARD_FRAME, statusText } from '@/lib/ui'
 
 // 섹터 수익률 노드 (docs/Task_ORDER.md D-66)
 // 국내 섹터 모멘텀 탭 위쪽에 섹터를 노드로 놓고 기간 수익률을 보여 준다. 수익률 높은 순으로 정렬한다.
@@ -88,7 +90,7 @@ export function SectorNodes() {
   const { ref: listRef, edges, scrollByPage } = useHorizontalOverflow([status, ranked.length])
 
   return (
-    <div className="card-neon mb-6 w-full rounded-xl border border-line bg-surface p-5">
+    <div className={cn(CARD_FRAME, 'mb-6 w-full p-5')}>
       <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
         <h3 className="text-[13px] font-medium text-fg-muted">
           섹터 수익률 <span className="text-[11px]">(기간 첫 거래일 종가 대비, 높은 순{baseTime > 0 ? ` · 기준일 ${formatDate(baseTime, true)}` : ''})</span>
@@ -97,9 +99,8 @@ export function SectorNodes() {
       </div>
 
       {status !== 'loaded' || ranked.length === 0 ? (
-        <div className="flex h-28 items-center justify-center text-xs text-fg-muted">
-          {status === 'error' ? '데이터를 불러오지 못했습니다' : status === 'loading' ? '불러오는 중' : '표시할 데이터가 없습니다'}
-        </div>
+        // 상태 문구·골격은 공통 (plan.md FQA-08 · 16, T-221 · T-222)
+        <StatusMessage message={statusText(status, true)} className="h-28" />
       ) : (
         // 한 줄로 나열한다. 넓은 화면에서는 고르게 펼치고, 넘치면 좌우 버튼·밀기로 넘긴다
         <div className="relative">

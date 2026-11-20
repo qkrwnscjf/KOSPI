@@ -217,7 +217,14 @@ export class Latency implements Metric {
   }
 }
 
-export const renderMetrics = () => `${registry.map(metric => metric.render()).join('\n')}\n`;
+// 프로세스 메모리 (plan.md QA-36, T-220): compose 메모리 상한을 실측으로 정하고 넘지 않는지 보기 위함. 수집·로그 때 갱신한다
+const residentMemory = new Gauge('kospi_process_resident_memory_bytes', 'Resident memory of this Node process in bytes (T-220)');
+const refreshProcessMetrics = () => residentMemory.set({}, process.memoryUsage().rss);
+
+export const renderMetrics = () => {
+  refreshProcessMetrics();
+  return `${registry.map(metric => metric.render()).join('\n')}\n`;
+};
 
 // /health 결과를 만드는 함수 (T-152). health.ts가 불러와지면 자기 평가 함수로 바꾼다(서로 import하지 않도록 이쪽은 받기만 함).
 // 점검이 등록되지 않은 프로세스는 응답한다는 것만으로 정상이다
@@ -259,6 +266,7 @@ export const startMetricsLog = (component: string, intervalMs: number) => {
   collectSamples = true;
 
   setInterval(() => {
+    refreshProcessMetrics();
     const summary = {
       component,
       window_s: intervalMs / 1000,

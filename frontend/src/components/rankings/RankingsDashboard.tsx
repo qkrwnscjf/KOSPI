@@ -5,12 +5,15 @@ import { formatNumber } from '@/lib/format'
 import { formatWonShort, RANKING_MARKETS, RANKING_VIEWS, type RankingItem, type RankingView } from '@/lib/rankings'
 import { useRankings } from '@/hooks/useAnalytics'
 import { SegmentedControl } from '@/components/common/SegmentedControl'
+import { StatusMessage } from '@/components/common/StatusMessage'
+import { CARD_FRAME, statusText } from '@/lib/ui'
 
 // 종목 순위 탭 (docs/Task_ORDER.md 15단계 T-113, D-72)
 // KRX 종목별 일별매매정보에서 시장·날짜마다 상승률·하락률·거래대금·시가총액 상위 100개를 보여 준다(장 마감 후 하루 1번).
 // 등락률만 등락 색 규칙(상승 초록·하락 빨강, D-32)을 따른다. 이미지(로고 등)는 쓰지 않는다.
 
-const cardClass = 'card-neon rounded-xl border border-line bg-surface'
+// 카드 틀·상태 문구는 공통(lib/ui.ts, plan.md FQA-08, T-221)
+const cardClass = CARD_FRAME
 
 const rateClass = (rate: number | null) => (rate === null || rate === 0 ? 'text-fg' : rate > 0 ? 'text-up' : 'text-down')
 const formatRate = (rate: number | null) => (rate === null ? '—' : `${rate > 0 ? '+' : ''}${rate.toFixed(2)}%`)
@@ -56,8 +59,8 @@ export function RankingsDashboard() {
   const { data, status } = useRankings(market, view, date)
   const coverage = data?.coverage[market] ?? null
   const items = data?.items ?? []
-  const message = status === 'loading' ? '불러오는 중' : status === 'error' ? '데이터를 불러오지 못했습니다'
-    : items.length === 0 ? (date ? '이 날의 순위가 없습니다 (휴장일이거나 수집 전)' : '종목 순위를 준비하고 있습니다 (KRX 일별매매정보 수집 후 표시)') : null
+  const message = statusText(status, items.length === 0,
+    date ? '이 날의 순위가 없습니다 (휴장일이거나 수집 전)' : '종목 순위를 준비하고 있습니다 (KRX 일별매매정보 수집 후 표시)')
 
   return (
     <motion.div
@@ -88,7 +91,8 @@ export function RankingsDashboard() {
           </h3>
           {data?.date && <span className="inline-flex items-center rounded-full border border-line px-1.5 py-px text-[10px] font-medium leading-4 text-fg-muted">기준일 {data.date}</span>}
         </div>
-        {message ? <p className="py-16 text-center text-xs text-fg-muted">{message}</p> : <RankingTable items={items} />}
+        {/* 불러오는 중에는 골격, 그 밖은 글 (plan.md FQA-16, T-222). 받은 뒤 표 높이는 행 수에 따라 달라 이 영역은 높이가 바뀐다 */}
+        {message ? <StatusMessage message={message} className="h-40" /> : <RankingTable items={items} />}
       </div>
 
       <p className="text-[11px] leading-relaxed text-fg-muted">

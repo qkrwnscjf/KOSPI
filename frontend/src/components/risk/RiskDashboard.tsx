@@ -4,12 +4,15 @@ import { cn } from '@/lib/utils'
 import { formatDate } from '@/lib/format'
 import { correlationBar, correlationStrength, formatSigned, RISK_LABELS, RISK_RANGES, type PairStats, type SeriesStats, type TargetRisk } from '@/lib/risk'
 import { useMarketRisk } from '@/hooks/useMarketRisk'
+import { CARD_FRAME, STATUS_TEXT, statusText } from '@/lib/ui'
+import { SegmentedControl, segmentsOf } from '@/components/common/SegmentedControl'
+import { StatusMessage } from '@/components/common/StatusMessage'
 
 // 시장 연관성·리스크 탭 (docs/Task_ORDER.md 15단계 T-110, D-72)
 // 코스피와 해외 지수·환율·변동성·금리가 얼마나 같이 움직이는지(상관계수·베타)와, 지표별 변동성·최대 낙폭을 보여 준다.
 // 이미 저장된 일봉으로 서버가 계산한 값이다(저장하지 않음). 데이터 막대는 흑백, 등락 수치만 등락 색 규칙(D-32)을 따른다.
 
-const cardClass = 'card-neon flex flex-col rounded-xl border border-line bg-surface p-5'
+const cardClass = cn(CARD_FRAME, 'flex flex-col p-5')
 const badgeClass = 'inline-flex items-center rounded-full border border-line px-1.5 py-px text-[10px] font-medium leading-4 text-fg-muted'
 
 const changeColor = (value: number | null) => (value === null || value === 0 ? 'text-fg' : value > 0 ? 'text-up' : 'text-down')
@@ -82,7 +85,8 @@ function TargetCard({ target }: { target: TargetRisk }) {
 export function RiskDashboard() {
   const [range, setRange] = useState<string>('3개월')
   const { data, status } = useMarketRisk(range)
-  const message = status === 'loading' ? '불러오는 중' : status === 'error' ? '데이터를 불러오지 못했습니다' : !data || data.base.stats.points < 2 ? '계산할 일봉이 아직 없습니다' : null
+  // 상태 문구는 공통(lib/ui.ts, plan.md FQA-08, T-221)
+  const message = statusText(status, !data || data.base.stats.points < 2, '계산할 일봉이 아직 없습니다')
 
   return (
     <motion.div
@@ -97,19 +101,12 @@ export function RiskDashboard() {
           해외 지표와 환율은 한국 장보다 늦게 닫혀서 <b className="font-medium text-fg">전 거래일 값이 다음 날 코스피에 주는 영향(선행)</b>을 함께 보여 줍니다.
           장중인 오늘 값은 빼고 확정된 일봉만 씁니다.
         </p>
-        <div className="flex gap-1" role="group" aria-label="기간 선택">
-          {RISK_RANGES.map(item => (
-            <button key={item} type="button" aria-pressed={range === item} onClick={() => setRange(item)}
-              className={cn('rounded-md px-2 py-1 text-[11px] transition-colors duration-150',
-                range === item ? 'bg-fg font-medium text-page' : 'text-fg-muted hover:bg-fg/5 hover:text-fg')}>
-              {item}
-            </button>
-          ))}
-        </div>
+        <SegmentedControl label="기간 선택" options={segmentsOf<string>(RISK_RANGES)} value={range} onChange={setRange} />
       </div>
 
       {message || !data ? (
-        <div className="card-neon flex h-[240px] w-full items-center justify-center rounded-xl border border-dashed border-line bg-surface text-xs text-fg-muted">{message}</div>
+        // 불러오는 중에는 골격, 그 밖은 글 (plan.md FQA-16, T-222)
+        <StatusMessage message={message ?? STATUS_TEXT.empty} className={cn(CARD_FRAME, 'h-[240px] w-full border-dashed')} />
       ) : (
         <>
           <div className={cardClass}>

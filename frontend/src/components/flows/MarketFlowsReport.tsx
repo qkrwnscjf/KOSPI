@@ -6,6 +6,9 @@ import { formatDate } from '@/lib/format'
 import { useTokenColors } from '@/lib/theme'
 import { changeRanking, compositionShares, FLOW_GROUPS, formatFlowChange, formatFlowValue, formatWon, latestWithChange, rangePosition, summaryLine, type FlowMetric } from '@/lib/marketFlows'
 import { useMarketFlows } from '@/hooks/useMarketFlows'
+import { CARD_FRAME, STATUS_TEXT, statusText } from '@/lib/ui'
+import { SegmentedControl } from '@/components/common/SegmentedControl'
+import { StatusMessage } from '@/components/common/StatusMessage'
 
 // 증시 자금 흐름 탭 (docs/Task_ORDER.md 11단계 B′ T-98, D-65, D-77, D-78)
 // 금융투자협회 종합통계(공공데이터포털)의 일별 통계를 최근 1개월만 보여 준다.
@@ -14,7 +17,9 @@ import { useMarketFlows } from '@/hooks/useMarketFlows'
 // 지표 사이를 잇는 흐름도와 "과열·위험" 신호등은 넣지 않는다(측정된 이동이 없고 기준선 근거가 없음, D-46 · D-78).
 
 const COLOR_TOKENS = ['surface', 'line'] as const
-const cardClass = 'card-neon flex flex-col rounded-xl border border-line bg-surface p-4'
+// 카드 틀·상태 문구는 공통(lib/ui.ts, plan.md FQA-08, T-221)
+const cardClass = cn(CARD_FRAME, 'flex flex-col p-4')
+const VIEW_OPTIONS = [{ key: 'summary', label: '요약' }, { key: 'charts', label: '그래프로 보기' }] as const
 const changeColor = (change: number | null) => (change === null || change === 0 ? 'text-fg-muted' : change > 0 ? 'text-up' : 'text-down')
 
 // 축 글자는 짧게: 금액은 조·억, 비중은 %
@@ -44,7 +49,7 @@ function MetricCard({ metric }: { metric: FlowMetric }) {
       <div className="relative -mx-1 h-[110px] text-fg">
         {metric.points.length < 2 && (
           <div className="absolute inset-0 z-10 flex items-center justify-center px-3 text-center text-[11px] text-fg-muted">
-            {metric.points.length === 0 ? '데이터 준비 중' : '추이를 그리려면 이틀 이상 필요합니다'}
+            {metric.points.length === 0 ? STATUS_TEXT.notReady : '추이를 그리려면 이틀 이상 필요합니다'}
           </div>
         )}
         <ResponsiveContainer width="100%" height="100%">
@@ -71,7 +76,7 @@ function MetricCard({ metric }: { metric: FlowMetric }) {
 }
 
 const SUMMARY_METRICS = ['capital.invrDpsgAmt', 'credit.crdTrFingWhl', 'capital.brkTrdUcolMny', 'capital.ucolMnyVsOppsTrdRlImpt']
-const panelClass = 'card-neon rounded-xl border border-line bg-surface p-5'
+const panelClass = cn(CARD_FRAME, 'p-5')
 const panelTitle = 'mb-3 flex flex-wrap items-baseline gap-2 text-[12px] font-semibold tracking-wide text-fg-muted'
 
 // ① 한 줄 요약 (핵심 4개 지표)
@@ -211,7 +216,7 @@ export function MarketFlowsReport() {
   const [view, setView] = useState<'summary' | 'charts'>('summary')
   const byKey = new Map((data?.metrics ?? []).map(metric => [metric.metric, metric]))
   const hasData = (data?.metrics ?? []).some(metric => metric.points.length > 0)
-  const message = status === 'loading' ? '불러오는 중' : status === 'error' ? '데이터를 불러오지 못했습니다' : !hasData ? '데이터 준비 중 (금융투자협회 일별 통계 수집 후 표시)' : null
+  const message = statusText(status, !hasData, `${STATUS_TEXT.notReady} (금융투자협회 일별 통계 수집 후 표시)`)
   const deposit = byKey.get('capital.invrDpsgAmt')
   const latest = deposit ? latestWithChange(deposit.points) : null
 
@@ -230,20 +235,13 @@ export function MarketFlowsReport() {
         </p>
         <div className="flex items-center gap-2">
           <span className="inline-flex items-center rounded-full border border-line px-1.5 py-px text-[10px] font-medium leading-4 text-fg-muted">일별 · 1개월</span>
-          <div className="flex gap-1" role="group" aria-label="보기 방식">
-            {(['summary', 'charts'] as const).map(item => (
-              <button key={item} type="button" aria-pressed={view === item} onClick={() => setView(item)}
-                className={cn('rounded-md px-2 py-1 text-[11px] transition-colors duration-150',
-                  view === item ? 'bg-fg font-medium text-page' : 'text-fg-muted hover:bg-fg/5 hover:text-fg')}>
-                {item === 'summary' ? '요약' : '그래프로 보기'}
-              </button>
-            ))}
-          </div>
+          <SegmentedControl label="보기 방식" options={VIEW_OPTIONS} value={view} onChange={setView} />
         </div>
       </div>
 
       {message ? (
-        <div className="card-neon flex h-[240px] w-full items-center justify-center rounded-xl border border-dashed border-line bg-surface px-6 text-center text-xs text-fg-muted">{message}</div>
+        // 불러오는 중에는 골격, 그 밖은 글 (plan.md FQA-16, T-222)
+        <StatusMessage message={message} className={cn(CARD_FRAME, 'h-[240px] w-full border-dashed px-6')} />
       ) : view === 'summary' ? (
         <>
           <SummaryPanel byKey={byKey} />
