@@ -1,6 +1,7 @@
 import { io, Socket } from 'socket.io-client'
 import type { MarketState } from '@/lib/marketHours'
 import { createThrottledNotifier } from '@/lib/sharedSource'
+import { isNewerTick } from '@/lib/liveSignals'
 
 // 앱 전체가 함께 쓰는 WebSocket 연결 1개 (docs/Task_ORDER.md T-24, P-12)
 // 이전에는 차트 카드마다 소켓을 따로 열어서, 브라우저 1개가 카드 수만큼 연결을 만들었다.
@@ -84,8 +85,11 @@ function getSocket() {
     const previous = latestTicks.get(tick.symbol)
     if (previous && tick.timestamp < previous.timestamp) return
     latestTicks.set(tick.symbol, tick)
-    lastReceivedAt = Date.now()
-    notifyReceived()
+    // 구독 때 받은 캐시값·같은 값은 "마지막 데이터 수신"을 바꾸지 않는다 (QA-32 / P4-2, T-215)
+    if (isNewerTick(previous, tick)) {
+      lastReceivedAt = Date.now()
+      notifyReceived()
+    }
     listeners.get(tick.symbol)?.forEach(listener => listener(tick))
   })
 

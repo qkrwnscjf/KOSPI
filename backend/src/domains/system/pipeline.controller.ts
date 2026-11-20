@@ -23,7 +23,9 @@ const statusDuration = new Latency('kospi_pipeline_status_duration_seconds', 'Pi
 const QUERIES = {
   up: 'up',
   consumerLag: 'sum by (consumergroup) (kafka_consumergroup_lag)',
-  dlq: 'sum by (topic) (kafka_topic_partition_current_offset{topic=~".+\\\\.dlq"})',
+  // 최근 7일 동안 DLQ에 새로 들어온 메시지 수 (plan.md QA-28 / P3-5, T-214). 예전에는 토픽 끝 오프셋(누적)이라
+  // 잘못된 메시지가 한 번 생기면 보관 기간(7일)이 지나 지워진 뒤에도 화면 경고가 계속 남았다
+  dlq: 'sum by (topic) (increase(kafka_topic_partition_current_offset{topic=~".+\\\\.dlq"}[7d]))',
   yahoo: 'sum by (result) (increase(kospi_worker_fetch_total{source="yahoo"}[15m]))',
   krxAge: 'max by (endpoint) (time() - kospi_krx_last_success_timestamp_seconds)',
   dartAge: 'max(time() - kospi_disclosure_last_success_timestamp_seconds)',

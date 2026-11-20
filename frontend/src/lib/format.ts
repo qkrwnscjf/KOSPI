@@ -10,16 +10,27 @@ export function formatAxisNumber(value: number, decimals: number) {
   return value.toLocaleString('ko-KR', { maximumFractionDigits: decimals })
 }
 
-const pad = (value: number) => value.toString().padStart(2, '0')
+// 날짜·시각은 브라우저 시간대가 아니라 서울 시간으로 보여 준다 (plan.md QA-32 / P4-2, T-215).
+// 일별 값은 15:30 KST 시각으로 저장되어, 서쪽 시간대(예: 하와이)의 브라우저에서는 하루 전 날짜로 보였다.
+// 시장 판단(lib/marketHours.ts)과 같은 방식으로 Intl에 시간대를 지정한다
+const SEOUL_PARTS = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'Asia/Seoul', year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+})
+
+function seoulParts(ms: number) {
+  const parts = SEOUL_PARTS.formatToParts(new Date(ms))
+  const part = (type: Intl.DateTimeFormatPartTypes) => parts.find(item => item.type === type)?.value ?? ''
+  return { year: part('year'), month: part('month'), day: part('day'), hour: part('hour'), minute: part('minute'), second: part('second') }
+}
 
 export function formatClock(ms: number, withSeconds = true) {
-  const date = new Date(ms)
-  const time = `${pad(date.getHours())}:${pad(date.getMinutes())}`
-  return withSeconds ? `${time}:${pad(date.getSeconds())}` : time
+  const { hour, minute, second } = seoulParts(ms)
+  const time = `${hour}:${minute}`
+  return withSeconds ? `${time}:${second}` : time
 }
 
 export function formatDate(ms: number, withYear = false) {
-  const date = new Date(ms)
-  const monthDay = `${date.getMonth() + 1}/${date.getDate()}`
-  return withYear ? `${date.getFullYear()}/${monthDay}` : monthDay
+  const { year, month, day } = seoulParts(ms)
+  const monthDay = `${month}/${day}`
+  return withYear ? `${year}/${monthDay}` : monthDay
 }

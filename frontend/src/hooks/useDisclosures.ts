@@ -5,6 +5,7 @@ import { requestStatus } from '@/lib/api'
 import { parseCapitalEvents, parseDisclosurePage } from '@/lib/parsers'
 import { STALE_MS } from '@/lib/queryClient'
 import { toResult, useApiQuery } from '@/hooks/useApiQuery'
+import { watchReconnect } from '@/hooks/realtimeCache'
 
 // 공시·자본 이벤트 데이터 (docs/Task_ORDER.md 12단계 T-78, 조회 계층 T-165)
 // - 최근 공시: REST `/api/v1/disclosures/recent` + 공유 소켓의 새 공시(방 `disclosures:KOSPI`)
@@ -17,6 +18,8 @@ export function useRecentDisclosures(group: string) {
   // 새 공시는 고른 분류에 맞는 것만 목록 위에 붙인다 (REST 응답보다 먼저 온 것도 합침)
   const [live, setLive] = useState<DisclosureItem[]>([])
   useEffect(() => {
+    // 연결이 끊겼다 다시 붙으면 최근 공시를 새로 받는다 (끊긴 동안 온 공시는 소켓으로 다시 오지 않음, QA-32 / P4-2, T-215)
+    watchReconnect()
     setLive([])
     return subscribeDisclosures(disclosure => {
       if (group !== 'all' && disclosure.group !== group) return

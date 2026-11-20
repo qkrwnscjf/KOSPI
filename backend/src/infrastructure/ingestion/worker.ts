@@ -7,7 +7,8 @@ import { YAHOO_KEYS, isYahooSymbolKey } from '../../shared/symbols.js';
 import type { YahooSymbolKey } from '../../shared/symbols.js';
 import type { MarketState } from '../../shared/market-state.js';
 import { producer, TOPICS, ensureTopics, probeBroker } from '../kafka.js';
-import { registerHeartbeat, trackProducer } from '../health.js';
+import { registerHealthCheck, registerHeartbeat, trackProducer } from '../health.js';
+import { createCycleSummary, yahooFetchHealthy, type CycleCounts } from './worker-status.js';
 import { reportRun } from '../ingestion-report.js';
 import { TimeoutError, withAbortTimeout } from '../abort-timeout.js';
 import { Counter, Gauge, Latency, metricsConfig, startMetricsLog, startMetricsServer } from '../metrics.js';
@@ -176,10 +177,13 @@ async function collect(
   };
 }
 
+// 주기별 건수 (1분 요약 로그용, QA-29 / P3-5, T-214). 예전에는 주기마다 "Fetching market data..."와 결과 줄을 남겼다
+let cycleCounts: Omit<CycleCounts, 'failed'> = { received: 0, fresh: 0, sent: 0 };
+const cycleSummary = createCycleSummary();
+
 // 수집 1회: Yahoo 조회 → Kafka 전송. Yahoo 수집 결과를 돌려준다 (백오프 판단용).
 async function runCycle(): Promise<FetchResult> {
-  console.log(`\n[${new Date().toISOString()}] Fetching market data...`);
-
+  cycleCounts = { received: 0, fresh: 0, sent: 0 };
   const plan = planYahooRequest(marketStatuses, marketClosedAt, lastFullRequestAt, Date.now());
   if (plan.full) lastFullRequestAt = Date.now();
   symbolsRequested.inc({ scope: plan.full ? 'full' : 'open' }, plan.keys.length);
@@ -222,13 +226,10 @@ async function runCycle(): Promise<FetchResult> {
     return isNew;
   });
 
+  cycleCounts.received = allData.length;
+  cycleCounts.fresh = freshData.length;
   try {
-    if (allData.length > 0 && freshData.length === 0) {
-      console.log(`Fetched ${allData.length} items, no new ticks.`);
-    }
     if (freshData.length > 0) {
-      console.log(`Successfully fetched ${allData.length} items (${freshData.length} new). Sending to Kafka...`);
-
       // Kafka 전송. DB 저장은 DB Sink가 Kafka에서 읽어서 한다 (docs/Task_ORDER.md T-12, D-18).
       // 이전에는 여기서 DB 저장이 끝나야 전송이 시작되어, DB 지연이 곧 실시간 지연이었다.
       const producedAt = Date.now();
@@ -277,6 +278,7 @@ async function runCycle(): Promise<FetchResult> {
       }
       kafkaSendDuration.observe({}, Date.now() - producedAt);
       quoteRun.sent += messages.length;
+      cycleCounts.sent = messages.length;
 
       // 전송에 성공한 뒤에만 "마지막 전송 시각"을 갱신한다. 실패하면 다음 주기에 다시 보낼 수 있도록.
       for (const data of sendable) {
@@ -364,6 +366,8 @@ async function pollOnce() {
   if (Date.now() - quoteRun.startedAt >= QUOTE_RUN_INTERVAL_MS) await flushQuoteRun();
 
   consecutiveFailures = yahooResult === 'success' ? 0 : consecutiveFailures + 1;
+  const summaryLine = cycleSummary.add({ ...cycleCounts, failed: yahooResult !== 'success' });
+  if (summaryLine) console.log(summaryLine);
   const interval = baseInterval();
   // 백오프 상한은 현재 주기보다 짧아지지 않게 한다 (유휴 주기 60초가 백오프 때문에 줄어들지 않도록)
   const targetDelay = consecutiveFailures === 0
@@ -437,6 +441,8 @@ async function runIngestionWorker() {
   // 상태 점검 (T-152): Kafka 전송과 수집 루프
   trackProducer('kafka_producer', producer, probeBroker);
   pollLoopHealth = registerHeartbeat('poll_loop', POLL_LOOP_MAX_AGE_MS);
+  // 장중 Yahoo 연속 실패 (plan.md QA-23 / P3-2, T-212): 루프는 돌지만 새 값을 못 받는 상태를 unhealthy로 보여 준다
+  registerHealthCheck('yahoo_fetch', () => yahooFetchHealthy(consecutiveFailures, Object.values(marketStatuses).includes('open')));
 
   await producer.connect();
   console.log('Connected to Kafka producer.');

@@ -38,7 +38,7 @@
       "id": 3,
       "type": "timeseries",
       "title": "소스 대비 지연 (M-02, 심볼별 p50)",
-      "description": "DXY, US10Y, WTI, COPPER는 소스 자체가 10~15분 지연 시세입니다 (BENCHMARK B-02).",
+      "description": "소스(Yahoo) 자체가 늦은 지표가 있습니다. 장중 실측(B-61 · B-66): 국내 지수·대형주·대만 약 20분, 니케이 약 15분, 러셀·미국 금리·VIX 약 15분, 달러지수·원자재 약 10분, 미국 지수 1 ~ 4초, 원/달러 약 3초.",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
       "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
@@ -86,13 +86,14 @@
       "id": 7,
       "type": "timeseries",
       "title": "Kafka 컨슈머 지연(그룹별) · 토픽 유입 속도 (M-07)",
-      "description": "market-group은 실시간 전송(Gateway), db-sink는 DB 적재입니다 (T-12).",
+      "description": "market-group은 실시간 전송(Gateway), db-sink는 DB 적재입니다 (T-12). 'db-sink 토픽'은 시세 외 토픽의 지연이며, 15분 내내 0이 아니면 'DB 적재 토픽 멈춤' 알림이 울립니다 (T-212).",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "x": 0, "y": 24, "w": 12, "h": 8 },
       "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
       "targets": [
         { "refId": "A", "legendFormat": "lag ({{consumergroup}})", "expr": "sum by (consumergroup) (kafka_consumergroup_lag{topic=\"market-ticks\"})" },
-        { "refId": "B", "legendFormat": "유입 (msg/s)", "expr": "sum(rate(kafka_topic_partition_current_offset{topic=\"market-ticks\"}[1m]))" }
+        { "refId": "B", "legendFormat": "유입 (msg/s)", "expr": "sum(rate(kafka_topic_partition_current_offset{topic=\"market-ticks\"}[1m]))" },
+        { "refId": "C", "legendFormat": "db-sink 토픽 {{topic}}", "expr": "sum by (topic) (kafka_consumergroup_lag{consumergroup=\"db-sink\", topic!=\"market-ticks\"})" }
       ]
     },
     {
@@ -187,7 +188,7 @@
       "gridPos": { "x": 12, "y": 45, "w": 12, "h": 8 },
       "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
       "targets": [
-        { "refId": "A", "legendFormat": "{{job}}", "expr": "kospi_db_job_last_success_age_seconds" },
+        { "refId": "A", "legendFormat": "{{exported_job}}", "expr": "kospi_db_job_last_success_age_seconds" },
         { "refId": "B", "legendFormat": "원본 최고령", "expr": "kospi_db_raw_oldest_age_seconds" }
       ]
     },

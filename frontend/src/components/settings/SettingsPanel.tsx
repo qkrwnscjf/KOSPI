@@ -64,8 +64,9 @@ function PipelineStatusView() {
           {data.consumerLag.map(item => (
             <Row key={item.group} label={`처리 대기 · ${item.group}`} value={`${item.lag.toLocaleString('ko-KR')}건`} state={item.lag > 100 ? 'warn' : 'ok'} />
           ))}
+          {/* 최근 7일 동안 새로 격리된 메시지 (plan.md QA-28 / P3-5, T-214). 예전에는 토픽이 생긴 뒤 누적이라 한 번 생기면 경고색이 계속 남았다 */}
           {data.dlq.map(item => (
-            <Row key={item.topic} label={`격리된 메시지 · ${item.topic}`} value={`${item.messages.toLocaleString('ko-KR')}건`} state={item.messages > 0 ? 'warn' : 'ok'} />
+            <Row key={item.topic} label={`격리된 메시지(최근 7일) · ${item.topic}`} value={`${item.messages.toLocaleString('ko-KR')}건`} state={item.messages > 0 ? 'warn' : 'ok'} />
           ))}
         </div>
       </Section>

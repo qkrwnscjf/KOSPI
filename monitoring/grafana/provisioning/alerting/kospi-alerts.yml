@@ -353,6 +353,70 @@ groups:
         annotations:
           summary: "서비스 상태 점검(/health) 중 실패한 항목이 5분 넘게 이어집니다. Grafana에서 kospi_health_status를 확인하세요."
 
+      # 장중 시세가 저장되지 않음 (plan.md QA-23 / P3-2 나머지, T-212)
+      # 어느 시장이든 열려 있는데(worker 판단, 소스 휴장 반영) 원본 시세(market_ticks)의 가장 최근 값이 30분 넘게 오래됨.
+      # 국내 지표는 소스가 약 20분 늦어(B-61) 30분으로 둔다. 시장이 모두 닫혀 있으면 값이 없어 OK
+      - uid: kospi-ticks-stale
+        title: 장중 시세 저장 멈춤
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: max(kospi_db_latest_data_age_seconds{dataset="market_ticks"}) and on() (sum(kospi_worker_market_open) > 0)
+              instant: true
+          - refId: B
+            datasourceUid: __expr__
+            model: { refId: B, type: reduce, expression: A, reducer: last }
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [1800] }
+        for: 15m
+        noDataState: OK
+        execErrState: Error
+        labels: { severity: warning }
+        annotations:
+          summary: "장이 열려 있는데 저장된 원본 시세의 가장 최근 값이 30분 넘게 오래됐습니다. worker의 Yahoo 수집, Kafka, db-sink 저장을 확인하세요."
+
+      # db-sink가 시세 외 토픽에서 멈춤 (plan.md QA-25 / P3-2 나머지, T-212)
+      # 컨슈머 지연 알림은 market-ticks만 봤다. 일별·공시·실행 기록 토픽은 몰아서 들어와 잠깐 밀리는 것이 정상이라(과거 채우기 등)
+      # 건수 대신 "15분 내내 지연이 0이 된 적이 없음"(따라잡지 못하고 멈춤)으로 판단한다. 토픽마다 알린다
+      - uid: kospi-sink-topic-stuck
+        title: DB 적재 토픽 멈춤
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 1200, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: min_over_time((sum by (topic) (kafka_consumergroup_lag{consumergroup="db-sink", topic!="market-ticks"}))[15m:1m])
+              instant: true
+          - refId: B
+            datasourceUid: __expr__
+            model: { refId: B, type: reduce, expression: A, reducer: last }
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        labels: { severity: warning }
+        annotations:
+          summary: "db-sink가 {{ $labels.topic }} 토픽을 15분 넘게 따라잡지 못하고 있습니다. db-sink 로그(저장 실패·DB 오류)를 확인하세요."
+
       # 공식 종가 보정이 멈춤 (T-136, T-150): 지표마다 장이 끝나면 받으므로, 금요일 → 월요일 약 72시간이 정상 최대. 78시간을 넘으면 알린다
       - uid: kospi-official-close-stale
         title: 공식 종가 보정 중단

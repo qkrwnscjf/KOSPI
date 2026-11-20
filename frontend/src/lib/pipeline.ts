@@ -7,14 +7,18 @@ export const DATASET_LABELS: Record<string, string> = {
   market_breadth: '시장 폭·거래대금',
   disclosures: 'DART 공시',
   stock_rankings: '종목 순위',
+  // 빠져 있던 라벨 (plan.md QA-32 / P4-2, T-215): db-sink가 신선도를 기록하는 데이터셋 6개 모두
+  market_flows: '증시 자금 흐름 (일별 통계)',
 }
 
+// Prometheus 수집 대상 이름(monitoring/prometheus.yml job_name) 7개 모두
 export const SERVICE_LABELS: Record<string, string> = {
   worker: '시세 수집기 (Yahoo)',
   backend: 'API · 실시간 전송',
   'db-sink': 'DB 적재',
   'krx-collector': 'KRX 수집기',
   'disclosure-collector': 'DART 수집기',
+  'market-stats-collector': '증시 자금 흐름 수집기',
   'kafka-exporter': 'Kafka 지표',
 }
 
