@@ -57,6 +57,14 @@ fastify.ready(async err => {
 });
 
 const start = async () => {
+  // 종료 처리는 마이그레이션·listen 전에 등록한다 (plan.md QA-07, T-228). 예전에는 listen 뒤에 등록해서 그 전에 온 종료 신호가 무시됐다.
+  // 시작 전에 불려도 각 단계는 안전하다(닫을 서버·연결이 없으면 바로 끝남): HTTP 서버와 WebSocket을 먼저 닫고, Kafka 컨슈머 → Redis → DB 순서 (T-28)
+  registerShutdown('backend', [
+    { name: 'http + socket.io', run: () => fastify.close() },
+    { name: 'kafka', run: () => stopMarketGateway() },
+    { name: 'redis', run: () => redis.quit() },
+    { name: 'db pool', run: () => dbPool.end() },
+  ]);
   try {
     await initDB();
     const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 3001;
@@ -71,14 +79,6 @@ const start = async () => {
     startDisclosureSelfCheck();
     startPipelineSelfCheck();
     startRestSelfCheck(fastify);
-
-    // 종료 처리 (docs/Task_ORDER.md T-28): 새 요청과 WebSocket을 먼저 닫고, Kafka 컨슈머 → Redis → DB 순서로 정리한다.
-    registerShutdown('backend', [
-      { name: 'http + socket.io', run: () => fastify.close() },
-      { name: 'kafka', run: () => stopMarketGateway() },
-      { name: 'redis', run: () => redis.quit() },
-      { name: 'db pool', run: () => dbPool.end() },
-    ]);
   } catch (err) {
     fastify.log.error(err);
     process.exit(1);

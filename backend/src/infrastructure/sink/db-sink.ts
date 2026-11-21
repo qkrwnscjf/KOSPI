@@ -789,6 +789,14 @@ async function logJobErrors() {
 
 async function run() {
   console.log('DB sink starting...');
+  // 종료 처리는 스키마 대기(최대 5분) 전에 등록한다 (plan.md QA-07, T-228). 예전에는 컨슈머 시작 뒤에 등록해서 그 전에 온 종료 신호가 무시됐다.
+  // 컨슈머를 먼저 끊는다. kafkajs는 처리 중인 묶음이 끝날 때까지 기다린 뒤 그룹에서 나간다 (T-28).
+  // 커밋하지 못한 묶음은 다음 기동에서 다시 처리되고, 중복은 유니크 제약이 건너뛴다(at-least-once). 시작 전이면 각 단계는 바로 끝난다
+  registerShutdown('db-sink', [
+    { name: 'kafka consumer', run: () => consumer.disconnect() },
+    { name: 'dlq producer', run: () => dlqProducer.disconnect() },
+    { name: 'db pool', run: () => dbPool.end() },
+  ]);
   // backend가 만든 스키마가 준비될 때까지만 기다린다(backend healthy·Gateway 그룹 참여는 기다리지 않음, QA-35 / P1-5, T-191)
   const schemaVersion = await waitForSchema();
   console.log(`DB schema ready (migration ${schemaVersion}).`);
@@ -877,14 +885,6 @@ async function run() {
       .finally(scheduleCloseRefresh);
   }, CLOSE_REFRESH_CHECK_MS);
   scheduleCloseRefresh();
-
-  // 종료 처리 (docs/Task_ORDER.md T-28): 컨슈머를 먼저 끊는다. kafkajs는 처리 중인 묶음이 끝날 때까지 기다린 뒤 그룹에서 나간다.
-  // 커밋하지 못한 묶음은 다음 기동에서 다시 처리되고, 중복은 유니크 제약이 건너뛴다(at-least-once).
-  registerShutdown('db-sink', [
-    { name: 'kafka consumer', run: () => consumer.disconnect() },
-    { name: 'dlq producer', run: () => dlqProducer.disconnect() },
-    { name: 'db pool', run: () => dbPool.end() },
-  ]);
 }
 
 // 시작에 실패하면 종료 코드 1로 끝내서 docker-compose가 다시 띄우게 한다 (T-08과 같은 방식).

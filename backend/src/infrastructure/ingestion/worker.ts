@@ -473,6 +473,15 @@ async function runIngestionWorker() {
   // 장중 Yahoo 연속 실패 (plan.md QA-23 / P3-2, T-212): 루프는 돌지만 새 값을 못 받는 상태를 unhealthy로 보여 준다
   registerHealthCheck('yahoo_fetch', () => yahooFetchHealthy(consecutiveFailures, Object.values(marketStatuses).includes('open')));
 
+  // 종료 처리는 Kafka 연결 전에 등록한다 (plan.md QA-07, T-228, BENCHMARK B-97).
+  // 예전에는 연결·토픽 확인이 끝난 뒤에 등록해서, Kafka를 기다리는 동안 온 종료 신호가 무시됐다(PID 1은 처리기가 없으면 SIGTERM을 무시).
+  // 시작 전에 불려도 각 단계는 할 일이 없으면 바로 끝난다(수집 루프 없음, 실행 기록 0건, 연결 안 된 프로듀서)
+  registerShutdown('worker', [
+    { name: 'poll loop', run: () => stopPolling() },
+    { name: 'last ingestion run', run: () => flushQuoteRun() },
+    { name: 'kafka producer', run: () => producer.disconnect() },
+  ]);
+
   await producer.connect();
   console.log('Connected to Kafka producer.');
   const partitions = await ensureTopics();
@@ -504,12 +513,6 @@ async function runIngestionWorker() {
   startMetricsServer(metricsConfig.port);
   startMetricsLog('worker', metricsConfig.logIntervalMs);
   console.log(`Metrics server listening on :${metricsConfig.port} (internal only)`);
-
-  registerShutdown('worker', [
-    { name: 'poll loop', run: () => stopPolling() },
-    { name: 'last ingestion run', run: () => flushQuoteRun() },
-    { name: 'kafka producer', run: () => producer.disconnect() },
-  ]);
 
   if (!WORKER_TEST_SEND_UNCHANGED) await seedLastSent();
   pollLoop();
