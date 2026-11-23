@@ -13,8 +13,10 @@ import { redis } from './infrastructure/redis.js';
 import { metricsConfig, startMetricsLog, startMetricsServer } from './infrastructure/metrics.js';
 import { registerShutdown } from './infrastructure/shutdown.js';
 import { registerHealthCheck } from './infrastructure/health.js';
+import { fastifyServerOptions } from './infrastructure/http-server-options.js';
 
-const fastify = Fastify({ logger: true });
+// 요청 로그에 접속자 IP를 남기지 않고(SEC-008), 요청 수신 시간 제한을 둔다(QA-03 나머지). 설정은 http-server-options.ts 한 곳
+const fastify = Fastify(fastifyServerOptions());
 
 // Register CORS
 fastify.register(fastifyCors, {

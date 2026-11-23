@@ -1,6 +1,7 @@
 # Stage 1: Build React/Vite app
 # CI와 같은 Node 버전으로 빌드한다 (docs/Task_ORDER.md T-09)
-FROM node:22-alpine as builder
+# 기반 이미지는 다이제스트로 고정한다 (plan.md 5장 S-4, docs/security.md SEC-006, T-36): 2026-11-23 빌드에서 쓰던 이미지 그대로
+FROM node:22-alpine@sha256:1314fb30ec37592d5845e5a160d522c0e680972aa534549940b8d73bde88481a as builder
 
 WORKDIR /app
 
@@ -17,7 +18,8 @@ RUN npm run lint
 RUN npm test
 
 # Stage 2: Serve with Nginx
-FROM nginx:alpine
+# 다이제스트 고정(S-4). 비root 실행은 컨테이너 포트를 80 → 8080으로 바꿔야 해 사용자 결정 대기(plan.md 5.3 결정 1)
+FROM nginx:alpine@sha256:fb4658584bd9a916ffb6f6e365f97c25cfdb2923801f551ea08356e695f14ff7
 
 # Copy built assets from builder stage
 COPY --from=builder /app/dist /usr/share/nginx/html

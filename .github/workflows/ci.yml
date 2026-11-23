@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [ "main", "master" ]
 
+# CI 토큰은 코드 읽기만 (docs/security.md SEC-007, plan.md 5장 S-3, T-37). 저장소 기본 설정이 바뀌어도 쓰기 권한을 받지 않는다
+permissions:
+  contents: read
+
 jobs:
   build-and-test:
     runs-on: ubuntu-latest

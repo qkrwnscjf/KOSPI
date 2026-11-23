@@ -254,6 +254,8 @@ export const startMetricsServer = (port: number) => {
   // 컨테이너 안에서는 Prometheus 컨테이너가 접근해야 하므로 0.0.0.0에 바인딩한다.
   // 호스트 공개 여부는 docker-compose의 ports가 결정하며, 이 포트는 공개하지 않는다.
   server.listen(port, '0.0.0.0');
+  // 컨테이너 실행 사용자 (plan.md 5장 S-4, SEC-006, T-36): root(0)가 아닌지 로그로 확인한다. 번호만 남긴다
+  console.log(`Process user: uid ${process.getuid?.() ?? 'unknown'}`);
   return server;
 };
 
