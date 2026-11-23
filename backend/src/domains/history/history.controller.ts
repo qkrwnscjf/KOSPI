@@ -6,6 +6,7 @@ import { Latency } from '../../infrastructure/metrics.js';
 import { DERIVED_SPREADS, isDerivedSymbol, isSubscribableSymbol, isYahooSymbolKey, YAHOO_KEYS } from '../../shared/symbols.js';
 import { isMarketState } from '../../shared/market-state.js';
 import { usesOfficialDailyClose } from '../../infrastructure/sink/daily-history.js';
+import { DB_TIMEFRAMES, historyQuery, type HistoryPoint, type Timeframe } from './history-queries.js';
 import { BREADTH_MARKETS, type BreadthMarket } from '../../shared/breadth.js';
 import type { DerivedSymbol, YahooSymbolKey } from '../../shared/symbols.js';
 import { isKrxDailySymbol, KRX_HISTORY_KEYS, KRX_SECTOR_KEYS, type KrxDailySymbol } from '../../shared/krx-indices.js';
@@ -26,17 +27,7 @@ const recentDuration = new Latency('kospi_history_recent_duration_seconds', 'Rec
 const RECENT_TICKS_LIMIT = 50;
 const RECENT_CACHE_TTL_S = 5;
 
-type Timeframe = '1일' | '1주' | '1개월' | '3개월' | '1년';
-type HistoryPoint = { time: number; value: number };
-
-// DB 집계 조회 (docs/Task_ORDER.md T-20). 집계 이름은 이 고정된 표에서만 고른다 (사용자 입력으로 SQL을 만들지 않음).
-const DB_TIMEFRAMES: Record<Timeframe, { view: string; range: string; fill?: BarResolution }> = {
-  '1일': { view: 'market_5m', range: '1 day', fill: '5m' },    // T-21: 이전에는 2일치를 보여 줬다
-  '1주': { view: 'market_1h', range: '7 days', fill: '1h' },
-  '1개월': { view: 'market_1d', range: '30 days' },
-  '3개월': { view: 'market_1d', range: '90 days' },
-  '1년': { view: 'market_1d', range: '365 days' },
-};
+// 기간 표와 합치기 SQL은 history-queries.ts에 있다 (통합 시험이 같은 SQL을 쓰도록 분리, T-227)
 const TIMEFRAMES = Object.keys(DB_TIMEFRAMES) as Timeframe[];
 const isTimeframe = (value: string): value is Timeframe => Object.prototype.hasOwnProperty.call(DB_TIMEFRAMES, value);
 
@@ -47,69 +38,10 @@ const HISTORY_SELF_CHECK = process.env.HISTORY_SELF_CHECK === 'true';
 const HISTORY_CACHE_TTL_S = Number.parseInt(process.env.HISTORY_CACHE_TTL_S ?? '', 10) || 30;
 
 // DB 집계 조회 (T-20). B-06에서 Yahoo 직접 호출보다 약 6배 빠르고, "1일" 기간 오류와 0값이 없어서 채택했다.
+// 합치기 규칙(일봉·집계·채운 봉 중 무엇을 쓰는지)은 history-queries.ts historyQuery에 있다 (통합 시험 test-integration/, T-227)
 async function getHistory(ticker: YahooSymbolKey, timeframe: Timeframe): Promise<HistoryPoint[]> {
-  const { view, range, fill } = DB_TIMEFRAMES[timeframe];
-  // 1개월 ~ 1년(1일 봉): 집계에 없는 날짜를 일봉(index_daily)으로 채운다.
-  // - 나중에 추가한 지표는 집계가 시작되기 전 날짜(T-104 ③), 모든 지표는 스택이 꺼져 있던 날처럼 집계가 빠진 날(T-127).
-  // 일봉 출처는 Yahoo(source 'yahoo') 또는 Yahoo가 주지 않는 지표의 KRX(source 'krx', 코스피 200)다. (symbol, time)이 유일해서 날짜당 1행.
-  // - 그 날짜에 집계 버킷이 있으면 집계가 우선이라 같은 날짜가 두 번 나오지 않는다.
-  // - 일봉 시각은 집계 버킷과 같은 기준(UTC 자정)으로 맞춘다. 1일·1주(5분·1시간 봉)는 해상도가 달라 붙이지 않는다.
-  // 장 시간이 정해진 시장의 지표(T-136, D-81)는 반대로 일봉(공식 종가)을 먼저 쓰고, 일봉이 없는 날(오늘·아직 받지 않은 날)만 집계를 쓴다.
-  // 스택이 장의 일부만 떠 있던 날 집계 종가가 틀리는 문제(B-49) 때문. 집계 자체는 바꾸지 않는다.
-  if (view === 'market_1d' && usesOfficialDailyClose(ticker)) {
-    const { rows } = await dbPool.query<HistoryPoint>(
-      `WITH daily AS (
-         SELECT time_bucket(INTERVAL '1 day', d.time) AS t, d.close
-         FROM index_daily d WHERE d.symbol = $1 AND d.time >= now() - $2::interval
-       )
-       SELECT (extract(epoch FROM t) * 1000)::float8 AS time, close::float8 AS value
-       FROM (
-         SELECT t, close FROM daily
-         UNION ALL
-         SELECT a.bucket AS t, a.close FROM market_1d a
-         WHERE a.symbol = $1 AND a.bucket >= now() - $2::interval
-           AND NOT EXISTS (SELECT 1 FROM daily WHERE daily.t = a.bucket)
-       ) merged
-       ORDER BY t`,
-      [ticker, range]
-    );
-    return rows;
-  }
-  if (view === 'market_1d') {
-    const { rows } = await dbPool.query<HistoryPoint>(
-      `WITH agg AS (
-         SELECT bucket, close FROM market_1d WHERE symbol = $1 AND bucket >= now() - $2::interval
-       )
-       SELECT (extract(epoch FROM t) * 1000)::float8 AS time, close::float8 AS value
-       FROM (
-         SELECT time_bucket(INTERVAL '1 day', d.time) AS t, d.close
-         FROM index_daily d
-         WHERE d.symbol = $1 AND d.time >= now() - $2::interval
-           AND NOT EXISTS (SELECT 1 FROM agg WHERE agg.bucket = time_bucket(INTERVAL '1 day', d.time))
-         UNION ALL
-         SELECT bucket AS t, close FROM agg
-       ) merged
-       ORDER BY t`,
-      [ticker, range]
-    );
-    return rows;
-  }
-  // 1일·1주(5분·1시간 봉, T-151): 스택이 꺼져 있던 구간처럼 집계에 없는 시각만 Yahoo 봉(market_bars_fill)으로 채운다. 집계가 항상 우선이다.
-  const { rows } = await dbPool.query<HistoryPoint>(
-    `WITH agg AS (
-       SELECT bucket, close FROM ${view} WHERE symbol = $1 AND bucket >= now() - $2::interval
-     )
-     SELECT (extract(epoch FROM t) * 1000)::float8 AS time, close::float8 AS value
-     FROM (
-       SELECT bucket AS t, close FROM agg
-       UNION ALL
-       SELECT f.time AS t, f.close FROM market_bars_fill f
-       WHERE f.symbol = $1 AND f.resolution = $3 AND f.time >= now() - $2::interval
-         AND NOT EXISTS (SELECT 1 FROM agg WHERE agg.bucket = f.time)
-     ) merged
-     ORDER BY t`,
-    [ticker, range, fill]
-  );
+  const { text, values } = historyQuery(ticker, timeframe);
+  const { rows } = await dbPool.query<HistoryPoint>(text, values);
   return rows;
 }
 

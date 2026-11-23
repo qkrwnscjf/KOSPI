@@ -205,6 +205,32 @@ services:
       backend:
         condition: service_started
 
+  # DB 통합 시험 (plan.md P6-1 · QA-41, docs/Task_ORDER.md T-227, BENCHMARK B-101). 평소에는 뜨지 않는다(profiles).
+  # 실행: `docker-compose up -d --build integration-test` → 결과 `docker logs kospi-integration-test`(# pass / # fail), 끝나면 스스로 종료(재시작 없음).
+  # 같은 TimescaleDB 안에 시험 전용 DB(kospi_it)를 만들고 끝나면 지운다. 실제 DB(kospi)에는 그 DB를 만들고 지우는 명령만 보낸다.
+  # 공개 포트·외부 접속 없음, Kafka·Redis 불필요. 이미지는 backend와 같은 Dockerfile(시험 파일 test-integration/ 포함)
+  integration-test:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: kospi-integration-test
+    <<: *service-defaults
+    restart: "no"
+    profiles: ["test"]
+    mem_limit: 384m
+    command: ["node", "--import", "tsx", "--test", "test-integration/*.test.ts"]
+    environment:
+      - DB_HOST=timescaledb
+      - DB_PORT=5432
+      - DB_USER=postgres
+      - DB_PASSWORD=password
+      - DB_NAME=kospi_it
+      - IT_ADMIN_DB=kospi
+      - METRICS_LOG_INTERVAL_MS=0
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+
   # KRX 일별 수집기 (docs/Task_ORDER.md T-67, T-104, T-106): 일별 지수 21종 → Kafka index-daily, 코스피 200 과거 일봉, 시장 폭·거래대금 → Kafka market-breadth
   # KRX 키를 가진 컨테이너는 이것 하나뿐이다. 공개 포트 없음. 접속 대상은 코드에 고정된 data-dbg.krx.co.kr 하나(2026-10-20 승인).
   krx-collector:
