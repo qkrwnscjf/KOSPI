@@ -16,20 +16,21 @@ import { Counter, Gauge, Latency, metricsConfig, startMetricsLog, startMetricsSe
 import { registerShutdown } from '../shutdown.js';
 import { validateTickRecord } from '../../shared/tick-validation.js';
 import { isPlausibleTickTime } from '../../shared/event-time.js';
-
-const readIntEnv = (name: string, fallback: number) => Number.parseInt(process.env[name] ?? '', 10) || fallback;
+import { readIntSetting } from '../int-setting.js';
+import { backoffDelay, isFreshTick } from './poll-policy.js';
 
 // 기본 10초. B-02 측정을 위해 환경변수로 바꿀 수 있게 했다 (docs/Task_ORDER.md T-30)
-const POLLING_INTERVAL_MS = readIntEnv('POLLING_INTERVAL_MS', 10000);
+// 정수 설정은 한 함수로 읽는다(0·음수·숫자 아님 → 기본값, QA-39 / T-225)
+const POLLING_INTERVAL_MS = readIntSetting('POLLING_INTERVAL_MS', 10000);
 // 소스별 수집 시간 제한. 넘기면 실패로 보고 그 주기를 넘긴다 (docs/Task_ORDER.md T-04)
-const FETCH_TIMEOUT_MS = readIntEnv('FETCH_TIMEOUT_MS', 3000);
+const FETCH_TIMEOUT_MS = readIntSetting('FETCH_TIMEOUT_MS', 3000);
 // 연속 실패 시 대기 시간 상한 (docs/Task_ORDER.md T-04)
-const MAX_BACKOFF_MS = readIntEnv('MAX_BACKOFF_MS', 60000);
+const MAX_BACKOFF_MS = readIntSetting('MAX_BACKOFF_MS', 60000);
 // 모든 시장이 닫혀 있을 때의 polling 주기 (docs/Task_ORDER.md T-07, D-16)
-const IDLE_POLLING_INTERVAL_MS = readIntEnv('IDLE_POLLING_INTERVAL_MS', 60000);
+const IDLE_POLLING_INTERVAL_MS = readIntSetting('IDLE_POLLING_INTERVAL_MS', 60000);
 // 시간표상 장 시간인데 소스가 휴장(공휴일 등)일 때의 주기 (T-56, D-40).
 // 휴장일의 호출을 줄이면서, 다음 날 개장은 이 주기 안에 알아채도록 유휴 주기보다 짧게 둔다.
-const HOLIDAY_POLLING_INTERVAL_MS = readIntEnv('HOLIDAY_POLLING_INTERVAL_MS', 15000);
+const HOLIDAY_POLLING_INTERVAL_MS = readIntSetting('HOLIDAY_POLLING_INTERVAL_MS', 15000);
 // 검증용: 장 시간을 판단할 때만 시계를 옮긴다(기본 0). 실제 수집 시각과 데이터에는 영향이 없다 (T-07)
 const MARKET_CLOCK_OFFSET_MS = Number.parseInt(process.env.MARKET_CLOCK_OFFSET_MS ?? '', 10) || 0;
 // 검증용: true이면 시작할 때 잘못된 메시지 2건을 한 번 보낸다(기본 끔). 컨슈머 방어(T-13)를 확인하기 위함
@@ -235,10 +236,13 @@ async function runCycle(): Promise<FetchResult> {
 
   // 변경 감지 (T-06, D-13): 마지막으로 전송한 소스 시각보다 새로운 tick만 보낸다.
   // 시각이 바뀌었다면 가격이 같아도 새 tick으로 본다. 장 상태가 바뀐 경우도 보낸다 (T-56).
+  // 판단 규칙은 poll-policy.ts isFreshTick 한 곳 (시험: test/poll-policy.test.ts, T-226)
   const freshData = allData.filter(data => {
-    const lastSent = lastSentTimestamp.get(data.ticker);
-    const stateChanged = data.marketState !== undefined && data.marketState !== lastSentMarketState.get(data.ticker);
-    const isNew = WORKER_TEST_SEND_UNCHANGED || lastSent === undefined || data.timestamp > lastSent || stateChanged;
+    const isNew = isFreshTick(
+      { timestamp: data.timestamp, marketState: data.marketState },
+      { timestamp: lastSentTimestamp.get(data.ticker), marketState: lastSentMarketState.get(data.ticker) },
+      WORKER_TEST_SEND_UNCHANGED,
+    );
     if (!isNew) {
       tickTotal.inc({ symbol: data.ticker, result: 'skipped_unchanged' });
     }
@@ -398,10 +402,8 @@ async function pollOnce() {
   const summaryLine = cycleSummary.add({ ...cycleCounts, failed: yahooResult !== 'success' });
   if (summaryLine) console.log(summaryLine);
   const interval = baseInterval();
-  // 백오프 상한은 현재 주기보다 짧아지지 않게 한다 (유휴 주기 60초가 백오프 때문에 줄어들지 않도록)
-  const targetDelay = consecutiveFailures === 0
-    ? interval
-    : Math.min(interval * 2 ** consecutiveFailures, Math.max(MAX_BACKOFF_MS, interval));
+  // 백오프 상한은 현재 주기보다 짧아지지 않게 한다 (유휴 주기 60초가 백오프 때문에 줄어들지 않도록). 계산은 poll-policy.ts (T-226)
+  const targetDelay = backoffDelay(interval, consecutiveFailures, MAX_BACKOFF_MS);
 
   if (consecutiveFailures > 0) {
     backoffTotal.inc();

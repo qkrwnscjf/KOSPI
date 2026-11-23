@@ -9,6 +9,10 @@ import { RCEPT_NO_PATTERN, type Disclosure, type DisclosureGroup, type Disclosur
 
 export type DisclosureBase = Omit<Disclosure, 'amount' | 'live' | 'collectedAt' | 'producedAt'>;
 
+// 목록 조회 주기 기본값: 평일 07 ~ 19시 KST는 activeMs, 그 밖은 idleMs (DISCLOSURE_POLLING_INTERVAL_MS / DISCLOSURE_IDLE_INTERVAL_MS).
+// 알림 기준과 대조하는 시험이 함께 쓴다 (test/alert-schedule.test.ts, T-226)
+export const DART_DEFAULT_INTERVALS = { activeMs: 60_000, idleMs: 10 * 60_000 } as const;
+
 // 주기 조회의 쪽 넘김 (plan.md QA-09 / P2-1, T-178)
 // 예전: 한 주기에 5쪽(500건)까지만 읽고 읽은 접수번호를 모두 "봤음"으로 기록했다. 500건 넘게 밀리면 다음 주기는 1쪽에서
 //       이미 본 공시를 만나 멈춰서 6쪽 이후는 재시작 전까지 읽히지 않았다(공시 마감일·한도 초과 뒤).

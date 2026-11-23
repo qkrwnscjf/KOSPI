@@ -5,7 +5,8 @@ import { registerShutdown } from '../shutdown.js';
 import { isoDate, reportRun } from '../ingestion-report.js';
 import { DISCLOSURE_SCOPE, isTargetStock, RCEPT_NO_PATTERN, type Disclosure } from '../../shared/disclosures.js';
 import { DART_KEY_ERRORS, DART_STATUS, DartApiError, DartClient, readDartConfig } from './dart-client.js';
-import { backfillRanges, DETAIL_ENDPOINTS, mapListItem, readLivePages, sumAmountFields, toDartDate, type DisclosureBase } from './dart-disclosures.js';
+import { backfillRanges, DART_DEFAULT_INTERVALS, DETAIL_ENDPOINTS, mapListItem, readLivePages, sumAmountFields, toDartDate, type DisclosureBase } from './dart-disclosures.js';
+import { readIntSetting } from '../int-setting.js';
 import { safeLogList } from '../http-json.js';
 import { fetchDisclosureCoverage } from '../backend-coverage.js';
 
@@ -16,14 +17,11 @@ import { fetchDisclosureCoverage } from '../backend-coverage.js';
 // - DART 키를 가진 컨테이너는 이 수집기 하나뿐이다. 키가 없으면 접속하지 않고 대기한다.
 // - 요청 URL에 키가 들어가므로 URL을 어디에도 남기지 않는다 (dart-client.ts, D-59 ⑥).
 
-const readIntEnv = (name: string, fallback: number) => {
-  const value = Number.parseInt(process.env[name] ?? '', 10);
-  return Number.isNaN(value) ? fallback : value;
-};
-const ACTIVE_INTERVAL_MS = readIntEnv('DISCLOSURE_POLLING_INTERVAL_MS', 60_000);
-const IDLE_INTERVAL_MS = readIntEnv('DISCLOSURE_IDLE_INTERVAL_MS', 10 * 60_000);
+// 정수 설정은 한 함수로 읽는다(QA-39 / T-225). 과거 채우기 0일(채우지 않음)은 뜻이 있어 0을 허용하고, 주기는 1 이상만
+const ACTIVE_INTERVAL_MS = readIntSetting('DISCLOSURE_POLLING_INTERVAL_MS', DART_DEFAULT_INTERVALS.activeMs);
+const IDLE_INTERVAL_MS = readIntSetting('DISCLOSURE_IDLE_INTERVAL_MS', DART_DEFAULT_INTERVALS.idleMs);
 // 1년(화면의 "1년" 기간과 DB 보관 1년에 맞춤, T-79). 이미 저장된 기간은 건너뛴다 (SEC-014)
-const BACKFILL_DAYS = Math.min(readIntEnv('DISCLOSURE_BACKFILL_DAYS', 365), 365);
+const BACKFILL_DAYS = Math.min(readIntSetting('DISCLOSURE_BACKFILL_DAYS', 365, { min: 0 }), 365);
 const PAGE_COUNT = 100;
 const MAX_LIVE_PAGES = 5;                  // 한 주기에 최대 500건. 그 이상 밀리면 다음 주기에 이어서 받는다
 const MAX_BACKFILL_PAGES_PER_WINDOW = 400; // 과거 채우기 상한 (호출 수 보호, 3개월 유가증권 공시는 수백 쪽 이하로 추정)

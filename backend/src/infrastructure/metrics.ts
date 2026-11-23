@@ -1,4 +1,5 @@
 import { createServer } from 'node:http';
+import { readIntSetting } from './int-setting.js';
 
 // Prometheus 텍스트 형식(v0.0.4)으로 메트릭을 노출하는 최소 구현.
 // 새 의존성(prom-client)을 추가하지 않기 위해 직접 구현했다 (docs/Task_ORDER.md D-09).
@@ -17,16 +18,12 @@ interface SampleSummary {
   max_ms?: number;
 }
 
-const readIntEnv = (name: string, fallback: number) => {
-  const value = Number.parseInt(process.env[name] ?? '', 10);
-  return Number.isNaN(value) ? fallback : value;
-};
-
+// 정수 설정은 한 함수로 읽는다(QA-39 / T-225). 로그 주기만 0(끔)을 허용한다
 export const metricsConfig = {
   // 컨테이너 내부 전용 포트. docker-compose에서 호스트로 공개하지 않는다.
-  port: readIntEnv('METRICS_PORT', 9464),
+  port: readIntSetting('METRICS_PORT', 9464),
   // 지연 요약 로그 주기. 0이면 로그와 샘플 수집을 모두 끈다.
-  logIntervalMs: readIntEnv('METRICS_LOG_INTERVAL_MS', 60000),
+  logIntervalMs: readIntSetting('METRICS_LOG_INTERVAL_MS', 60000, { min: 0 }),
 };
 
 const LATENCY_BUCKETS_SECONDS = [

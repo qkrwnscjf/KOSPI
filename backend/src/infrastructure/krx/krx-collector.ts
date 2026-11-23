@@ -12,7 +12,8 @@ import { combineCoverage, coverageSymbols, ENDPOINT_PATHS, FIELDS, internalGaps,
 import { BREADTH_ENDPOINTS, rankStocks, STOCK_FIELDS, summarizeBreadth, type BreadthEndpoint } from './krx-breadth.js';
 import { safeLogList } from '../http-json.js';
 import { setWallClockTimeout, type WallClockTimer } from '../wall-clock-timer.js';
-import { datesToCheck, mergeRetryDates, nextRetryAttempt, recordCheck, selectRetryDates, type DateCheckState } from './krx-schedule.js';
+import { datesToCheck, KRX_DEFAULT_POLLING_INTERVAL_MS, mergeRetryDates, nextRetryAttempt, recordCheck, selectRetryDates, type DateCheckState } from './krx-schedule.js';
+import { readIntSetting } from '../int-setting.js';
 
 // KRX 일별 지수 수집기 (docs/Task_ORDER.md T-67, D-60)
 // VKOSPI와 KRX 섹터 5종의 일별 종가를 KRX Open API에서 받아 Kafka `index-daily`로 보낸다.
@@ -22,12 +23,9 @@ import { datesToCheck, mergeRetryDates, nextRetryAttempt, recordCheck, selectRet
 //   DB는 (symbol, time) 기준으로 덮어쓰므로 다시 보내도 중복이 생기지 않는다.
 // - 값이 바뀐(또는 새로 생긴) 날짜만 보낸다.
 
-const readIntEnv = (name: string, fallback: number) => {
-  const value = Number.parseInt(process.env[name] ?? '', 10);
-  return Number.isNaN(value) ? fallback : value;
-};
-const BACKFILL_DAYS = readIntEnv('KRX_BACKFILL_DAYS', 370);
-const POLLING_INTERVAL_MS = readIntEnv('KRX_POLLING_INTERVAL_MS', 30 * 60_000);
+// 정수 설정은 한 함수로 읽는다(QA-39 / T-225). 과거 채우기 0일(채우지 않음)은 뜻이 있어 0을 허용하고, 주기는 1 이상만
+const BACKFILL_DAYS = readIntSetting('KRX_BACKFILL_DAYS', 370, { min: 0 });
+const POLLING_INTERVAL_MS = readIntSetting('KRX_POLLING_INTERVAL_MS', KRX_DEFAULT_POLLING_INTERVAL_MS);
 const RECENT_DAYS = 7;
 const REQUEST_GAP_MS = 200; // 호출 사이 간격 (KRX 호출 제한 보호)
 const MAX_BACKOFF_MS = 6 * 60 * 60_000;

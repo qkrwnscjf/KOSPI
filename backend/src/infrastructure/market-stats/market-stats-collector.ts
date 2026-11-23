@@ -6,7 +6,8 @@ import { registerShutdown } from '../shutdown.js';
 import { isoDate, reportRun } from '../ingestion-report.js';
 import type { IngestionStatus } from '../../shared/ingestion-runs.js';
 import { dailyCloseTime, dailyValues, readDataGoKrResponse, type MarketFlow, type MarketFlowDataset } from '../../shared/market-flows.js';
-import { nextCollectDelay } from './collect-schedule.js';
+import { MARKET_STATS_DEFAULT_INTERVAL_MS, MARKET_STATS_MAX_DELAY_MS, nextCollectDelay } from './collect-schedule.js';
+import { readIntSetting } from '../int-setting.js';
 import { setWallClockTimeout, type WallClockTimer } from '../wall-clock-timer.js';
 
 // 증시 자금 흐름 일별 통계 수집기 (docs/Task_ORDER.md 11단계 B′ T-95, D-45, D-65, D-76, D-77)
@@ -23,9 +24,9 @@ const OPERATIONS: { dataset: MarketFlowDataset; operation: string }[] = [
   { dataset: 'capital', operation: 'getSecuritiesMarketTotalCapitalInfo' }, // 증시자금추이 (2026-10-28 실제 응답으로 확인)
   { dataset: 'credit', operation: 'getGrantingOfCreditBalanceInfo' },        // 신용공여잔고추이
 ];
-const readIntEnv = (name: string, fallback: number) => Number.parseInt(process.env[name] ?? '', 10) || fallback;
-const POLLING_INTERVAL_MS = readIntEnv('MARKET_STATS_POLLING_INTERVAL_MS', 6 * 3600_000);
-const MAX_DELAY_MS = 24 * 3600_000;
+// 정수 설정은 한 함수로 읽는다(QA-39 / T-225)
+const POLLING_INTERVAL_MS = readIntSetting('MARKET_STATS_POLLING_INTERVAL_MS', MARKET_STATS_DEFAULT_INTERVAL_MS);
+const MAX_DELAY_MS = MARKET_STATS_MAX_DELAY_MS;
 const WINDOW_DAYS = 35;
 const NUM_OF_ROWS = 100;
 const REQUEST_TIMEOUT_MS = 10_000;

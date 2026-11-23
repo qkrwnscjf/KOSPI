@@ -756,6 +756,28 @@ async function logTelemetryLevel() {
   } catch (error) {
     console.warn(`DB telemetry level check failed: ${error instanceof Error ? error.message : String(error)}`);
   }
+  await logWorkerSettings();
+}
+
+// DB 백그라운드 작업 설정 (plan.md QA-26 / P3-4, T-213, BENCHMARK B-98): 기동 때 밀린 작업이 한꺼번에 돌며
+// `out of background workers`로 보관 작업이 실행되지 못한 일이 있어(11/17 · 11/23), 작업 슬롯과 예약 작업 수를 나란히 남긴다.
+// 런처 1개 + 접속 가능한 DB마다 스케줄러가 슬롯을 쓰므로 DB 수도 함께 남긴다. 설정 이름과 숫자만
+async function logWorkerSettings() {
+  try {
+    const { rows } = await dbPool.query<{ max_worker_processes: string; max_background_workers: string; max_parallel_workers: string; scheduled_jobs: string; databases: string }>(
+      `SELECT current_setting('max_worker_processes') AS max_worker_processes,
+              current_setting('timescaledb.max_background_workers') AS max_background_workers,
+              current_setting('max_parallel_workers') AS max_parallel_workers,
+              (SELECT count(*) FROM timescaledb_information.jobs WHERE scheduled)::text AS scheduled_jobs,
+              (SELECT count(*) FROM pg_database WHERE datallowconn)::text AS databases`
+    );
+    const row = rows[0];
+    if (row) {
+      console.log(`DB worker settings: max_worker_processes=${safeLogText(row.max_worker_processes, 6)}, timescaledb.max_background_workers=${safeLogText(row.max_background_workers, 6)}, max_parallel_workers=${safeLogText(row.max_parallel_workers, 6)}, scheduled_jobs=${safeLogText(row.scheduled_jobs, 6)}, databases=${safeLogText(row.databases, 6)}`);
+    }
+  } catch (error) {
+    console.warn(`DB worker settings check failed: ${dbErrorCode(error)}`);
+  }
 }
 
 // TimescaleDB 작업 오류 기록 (T-147): 누적 실패 수만으로는 원인을 알 수 없어(B-52) 처음 보는 오류를 로그로 남긴다.

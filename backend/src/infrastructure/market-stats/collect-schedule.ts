@@ -5,6 +5,9 @@
 //   그다음부터는 주기를 2배씩 늘린다(12시간 → 24시간).
 
 export const RETRY_AFTER_ERROR_MS = 30 * 60_000;
+// 정상 주기 기본값(MARKET_STATS_POLLING_INTERVAL_MS)과 실패 때 최대 대기. 알림 기준과 대조하는 시험이 함께 쓴다 (test/alert-schedule.test.ts, T-226)
+export const MARKET_STATS_DEFAULT_INTERVAL_MS = 6 * 3600_000;
+export const MARKET_STATS_MAX_DELAY_MS = 24 * 3600_000;
 
 export function nextCollectDelay(results: ('ok' | 'pause' | 'error')[], previousFailures: number, intervalMs: number, maxDelayMs: number) {
   if (results.includes('pause')) return { delayMs: maxDelayMs, failures: previousFailures };

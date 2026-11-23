@@ -8,6 +8,8 @@
 // - 아직 비어 있는 날짜는 1시간에 한 번만 다시 확인한다. 뒤 날짜가 이미 받아졌다면 그 날은 휴장일이라 더 확인하지 않는다.
 // - 상태는 프로세스 메모리에만 있다. 다시 시작하면 첫 주기에 공개된 날짜를 한 번씩 받는다(이전 주기 1회분과 같음).
 
+// 최근 날짜 확인 주기 기본값(KRX_POLLING_INTERVAL_MS). 알림 기준과 대조하는 시험이 함께 쓴다 (test/alert-schedule.test.ts, T-226)
+export const KRX_DEFAULT_POLLING_INTERVAL_MS = 30 * 60_000;
 export const CHECK_FROM_HOUR_KST = 18;
 export const EMPTY_RECHECK_MS = 60 * 60_000;
 export const RECHECK_AFTER_MS = 20 * 3600_000;

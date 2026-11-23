@@ -80,7 +80,11 @@ services:
     container_name: kospi-timescaledb
     mem_limit: 3g
     # 사용 통계 전송을 끈다 (docs/security.md SEC-017). 기존 볼륨에도 적용되도록 실행 옵션으로 준다
-    command: ["postgres", "-c", "timescaledb.telemetry_level=off"]
+    # 백그라운드 작업 수 (plan.md QA-26 / P3-4, T-213, BENCHMARK B-98): 하루 넘게 꺼졌다 켜면 밀린 작업이 한꺼번에 돌아
+    # `out of background workers`로 보관 작업이 실행되지 못했다(기본 16 = 런처 1 + DB 스케줄러 3 + 작업 12칸, 예약 작업 18개).
+    # 작업 칸 = 예약 작업 18 + 런처·스케줄러 4 + 늘어날 작업 여유 10 = 32, 전체 프로세스 = 32 + 병렬 작업 8 + 3(이미지 기본 계산과 같은 여유) = 43.
+    # 작업 수와 설정은 db-sink 기동 로그 `DB worker settings`로 비교한다. 칸은 작업이 돌 때만 프로세스가 생긴다
+    command: ["postgres", "-c", "timescaledb.telemetry_level=off", "-c", "timescaledb.max_background_workers=32", "-c", "max_worker_processes=43"]
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: password

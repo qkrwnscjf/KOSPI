@@ -1,5 +1,6 @@
 import type { Consumer, Producer } from 'kafkajs';
 import { Gauge, setHealthEvaluator } from './metrics.js';
+import { readIntSetting } from './int-setting.js';
 
 // 서비스별 실제 상태 점검 (docs/Task_ORDER.md T-152, BENCHMARK B-75)
 // 프로세스가 살아 있는지만이 아니라, 그 서비스가 일을 하는 데 필요한 연결(Kafka·DB)과 루프가 동작하는지 본다.
@@ -13,15 +14,11 @@ export interface HealthReport {
   checks: Record<string, boolean>;
 }
 
-const readIntEnv = (name: string, fallback: number) => {
-  const value = Number.parseInt(process.env[name] ?? '', 10);
-  return Number.isNaN(value) || value <= 0 ? fallback : value;
-};
-
 // 점검 하나가 이 시간 안에 끝나지 않으면 실패로 본다(DB가 응답하지 않는 경우 등). healthcheck 제한 시간(5초)보다 짧게 둔다
-const CHECK_TIMEOUT_MS = readIntEnv('HEALTH_CHECK_TIMEOUT_MS', 2000);
+// 정수 설정은 한 함수로 읽는다(QA-39 / T-225)
+const CHECK_TIMEOUT_MS = readIntSetting('HEALTH_CHECK_TIMEOUT_MS', 2000);
 // kafkajs 컨슈머의 기본 세션 제한(30초)을 넘겨 하트비트·fetch가 없으면 브로커도 그 멤버를 그룹에서 뺀다. 그 2배를 기준으로 둔다
-export const CONSUMER_SILENCE_LIMIT_MS = readIntEnv('HEALTH_CONSUMER_SILENCE_MS', 2 * 30_000);
+export const CONSUMER_SILENCE_LIMIT_MS = readIntSetting('HEALTH_CONSUMER_SILENCE_MS', 2 * 30_000);
 
 const checks = new Map<string, HealthCheck>();
 const healthStatus = new Gauge('kospi_health_status', 'Result of each health check at the last /health evaluation (1 ok, 0 failing)');
