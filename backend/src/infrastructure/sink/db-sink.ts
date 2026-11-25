@@ -24,6 +24,7 @@ import { runBackfillOnce, runDailyHistoryBackfill, runIntradayFill, runOfficialC
 import { clampWindow, mergeWindows, planLateRefresh, POLICY_START_OFFSET_MS, SAFE_RAW_WINDOW_MS, type RefreshWindow } from './late-refresh.js';
 import { runDlqReplay } from './dlq-replay.js';
 import { chunkForParams } from './sql-chunks.js';
+import { createTicksBatchHandler } from './ticks-batch.js';
 import { registerShutdown } from '../shutdown.js';
 
 // DB 적재 컨슈머 (docs/Task_ORDER.md T-12, D-18)
@@ -59,36 +60,7 @@ const CLOSE_REFRESH_CHECK_MS = 30 * 60 * 1000;
 const EXTRA_TABLES = ['index_daily_krx', 'index_daily_yahoo', 'disclosures', 'market_breadth', 'stock_rankings', 'market_flows', 'market_bars_fill', 'ingestion_runs', 'dq_results'];
 const dbRows = new Gauge('kospi_db_rows', 'Row count of the smaller tables added after the raw ticks (index_daily, disclosures, market_breadth, ...)');
 
-// 여러 행을 INSERT 한 번으로 저장한다 (P-16). 단일 문장이라 전부 들어가거나 전부 실패한다.
-// 실제로 들어간 행 수와, 들어간 행의 시각들(늦은 데이터 보정용, T-128)을 돌려준다.
-// 나머지는 유니크 제약에 걸려 건너뛴 중복이다 (T-15). 중복은 이미 집계에 반영된 값이라 보정 대상이 아니다.
-// 매개변수 한도를 넘지 않게 나눠 넣는다 (QA-05 / P1-6, T-185)
-async function insertBatch(ticks: TickData[]) {
-  let inserted = 0;
-  const times: number[] = [];
-  for (const chunk of chunkForParams(ticks, 7)) {
-    const result = await insertTickRows(chunk);
-    inserted += result.inserted;
-    for (const ms of result.times) times.push(ms);
-  }
-  return { inserted, times };
-}
-
-async function insertTickRows(ticks: TickData[]) {
-  const values: unknown[] = [];
-  const rows = ticks.map((tick, index) => {
-    const base = index * 7;
-    values.push(tick.timestamp, tick.symbol, tick.category, tick.price, tick.changeRate, tick.changePrice, tick.volume ?? null);
-    return `(to_timestamp($${base + 1} / 1000.0), $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7})`;
-  });
-  const result = await dbPool.query<{ ms: number }>(
-    `INSERT INTO market_ticks (time, symbol, category, price, change_rate, change_price, volume) VALUES ${rows.join(', ')}
-     ON CONFLICT (symbol, time) DO NOTHING
-     RETURNING (extract(epoch FROM time) * 1000)::float8 AS ms`,
-    values
-  );
-  return { inserted: result.rowCount ?? 0, times: result.rows.map(row => row.ms) };
-}
+// 시세 저장 SQL·처리 순서는 ticks-batch.ts에 있다(통합 시험이 같은 함수를 쓰도록 분리, T-230). 중복은 유니크 키로 건너뛴다(T-15)
 
 // 늦은 데이터 보정 (T-128): 정책 범위(최근 2시간) 밖에 새로 저장된 원본이 있으면 그 구간의 5분 봉만 다시 계산한다.
 // 묶음마다 바로 부르지 않고 30초 동안 구간을 합쳐서 한 번 부른다(밀린 메시지를 따라잡는 동안 수백 번 부르지 않게).
@@ -533,58 +505,30 @@ async function handleIngestionRunsBatch({ batch, resolveOffset, heartbeat }: Eac
   await heartbeat();
 }
 
-// 시세 묶음 처리 (T-12, T-15). 잘못된 메시지는 DLQ, 저장에 성공한 뒤에만 오프셋 확정
-async function handleTicksBatch({ batch, resolveOffset, heartbeat }: EachBatchPayload) {
-  const valid: TickData[] = [];
-
-  for (const message of batch.messages) {
-    const parsed = parseTick(message.value);
-    // change_price 컬럼은 NOT NULL이라, 없으면 묶음 전체가 계속 실패한다. 그래서 DLQ로 보낸다.
-    const reason = !parsed.ok ? parsed.reason : parsed.tick.changePrice === undefined ? 'change_price_missing' : undefined;
-    if (reason || !parsed.ok) {
-      invalidTotal.inc({ reason: reason ?? 'unknown' });
-      console.warn(`DB sink skipped invalid message at ${batch.topic}[${batch.partition}]@${message.offset}: ${reason}`);
-      await sendToDlq(dlqProducer, { consumer: CONSUMER_NAME, topic: batch.topic, partition: batch.partition, message, reason: reason ?? 'unknown' });
-      continue;
-    }
-    valid.push(parsed.tick);
-  }
-
-  if (valid.length > 0) {
-    const startedAt = Date.now();
-    let inserted: number;
-    try {
-      const result = await insertBatch(valid);
-      inserted = result.inserted;
-      scheduleLateRefresh(result.times);
-    } catch (error) {
-      insertDuration.observe({ result: 'error' }, Date.now() - startedAt);
-      // 예외를 던져서 오프셋을 커밋하지 않는다. 값 오류면 runIsolated가 한 건씩 나눠 저장하고, 결정적 오류가 3번 반복되면 한 건씩 나눠 본다(T-210).
-      // 연결 같은 일시적 오류는 kafkajs가 같은 묶음을 다시 시도한다.
-      // 오류 문장에 값이 들어갈 수 있어 원문 대신 오류 코드만 남긴다 (T-210)
-      console.error(`DB sink insert failed (${valid.length} rows, ${dbErrorCode(error)})`);
-      throw error;
-    }
-    const committedAt = Date.now();
+// 시세 묶음 처리 (T-12, T-15). 처리 순서는 ticks-batch.ts(통합 시험과 같은 함수, T-230). 지표·로그·DLQ·늦은 보정은 여기서 넘긴다
+const handleTicksBatch = createTicksBatchHandler({
+  query: (text, values) => dbPool.query<{ ms: number }>(text, values),
+  onInvalid: async (message, reason, { topic, partition }) => {
+    invalidTotal.inc({ reason });
+    console.warn(`DB sink skipped invalid message at ${topic}[${partition}]@${message.offset}: ${reason}`);
+    await sendToDlq(dlqProducer, { consumer: CONSUMER_NAME, topic, partition, message, reason });
+  },
+  onInsertError: (rows, error, startedAt) => {
+    insertDuration.observe({ result: 'error' }, Date.now() - startedAt);
+    // 오류 문장에 값이 들어갈 수 있어 원문 대신 오류 코드만 남긴다 (T-210)
+    console.error(`DB sink insert failed (${rows} rows, ${dbErrorCode(error)})`);
+  },
+  onStored: ({ valid, inserted, times, startedAt, committedAt }) => {
+    scheduleLateRefresh(times);
     insertDuration.observe({ result: 'commit' }, committedAt - startedAt);
     batchesTotal.inc();
     rowsInsertedTotal.inc({}, inserted);
-    if (inserted < valid.length) {
-      duplicatesSkippedTotal.inc({}, valid.length - inserted);
-    }
+    if (inserted < valid.length) duplicatesSkippedTotal.inc({}, valid.length - inserted);
     for (const tick of valid) {
-      if (tick.collectedAt !== undefined) {
-        storeLatency.observe({}, committedAt - tick.collectedAt);
-      }
+      if (tick.collectedAt !== undefined) storeLatency.observe({}, committedAt - tick.collectedAt);
     }
-  }
-
-  const lastMessage = batch.messages[batch.messages.length - 1];
-  if (lastMessage) {
-    resolveOffset(lastMessage.offset);
-  }
-  await heartbeat();
-}
+  },
+});
 
 // 토픽별 묶음 처리 함수
 const BATCH_HANDLERS: Record<string, (payload: EachBatchPayload) => Promise<void>> = {

@@ -5,15 +5,9 @@
 // 시나리오: ① 빈 DB 마이그레이션 ② History 합치기 SQL(T-136) ③ 늦은 데이터 보정과 저장 불변 조건(옛 T-128)
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
-import pg from 'pg';
+import type pg from 'pg';
 import { clampWindow, planLateRefresh } from '../src/infrastructure/sink/late-refresh.js';
-
-const IT_DB = process.env.DB_NAME ?? '';
-const ADMIN_DB = process.env.IT_ADMIN_DB ?? '';
-// 실수로 실제 DB를 지우지 않도록 이름을 검사한다(식별자는 매개변수로 넘길 수 없어 형식을 제한한 뒤에만 문장에 넣음)
-if (!/^[a-z][a-z0-9_]{0,40}_it$/.test(IT_DB) || ADMIN_DB === '' || ADMIN_DB === IT_DB) {
-  throw new Error('integration tests need DB_NAME=<name>_it and a different IT_ADMIN_DB');
-}
+import { createTestDb, dropTestDb, type TestDb } from './it-db.js';
 
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
@@ -21,21 +15,8 @@ const DAY = 24 * HOUR;
 const floor5 = (ms: number) => Math.floor(ms / (5 * MINUTE)) * 5 * MINUTE;
 const iso = (ms: number) => new Date(ms).toISOString();
 
-async function admin(sql: string) {
-  const client = new pg.Client({
-    host: process.env.DB_HOST, port: Number(process.env.DB_PORT ?? 5432),
-    user: process.env.DB_USER, password: process.env.DB_PASSWORD, database: ADMIN_DB,
-  });
-  await client.connect();
-  try {
-    await client.query(sql);
-  } finally {
-    await client.end();
-  }
-}
-
-// 시험 DB를 만든 뒤에 불러온다(풀은 DB_NAME = 시험 DB로 만들어짐)
-let db: typeof import('../src/infrastructure/db.js');
+// 시험 DB를 만든 뒤에 불러온다(풀은 DB_NAME = 시험 DB로 만들어짐, it-db.ts)
+let db: TestDb;
 let pool: pg.Pool;
 
 // 시각은 코드가 만든 ISO 문자열만 넣는다(외부 입력 없음)
@@ -50,18 +31,12 @@ async function insertTick(symbol: string, timeMs: number, price: number) {
 }
 
 before(async () => {
-  await admin(`DROP DATABASE IF EXISTS ${IT_DB} WITH (FORCE)`);
-  await admin(`CREATE DATABASE ${IT_DB}`);
-  db = await import('../src/infrastructure/db.js');
+  db = await createTestDb();
   pool = db.dbPool;
-  await db.initDB();
-  // 보관·갱신 정책이 시험 중에 스스로 돌지 않게 멈춘다(시험이 직접 다시 계산·청크 삭제를 한다)
-  await pool.query(`SELECT alter_job(job_id, scheduled => false) FROM timescaledb_information.jobs WHERE job_id >= 1000`);
 });
 
 after(async () => {
-  await pool?.end().catch(() => undefined);
-  await admin(`DROP DATABASE IF EXISTS ${IT_DB} WITH (FORCE)`);
+  await dropTestDb(db);
 });
 
 test('① 빈 DB에 마이그레이션 전부 적용, 다시 실행하면 새로 적용 0', async () => {

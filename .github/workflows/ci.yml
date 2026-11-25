@@ -56,3 +56,8 @@ jobs:
 
     - name: Docker Compose Build Test
       run: docker compose build
+
+    # 통합 시험 (plan.md P6-1 · QA-41, T-227 · T-230 · T-231): TimescaleDB·Kafka와 함께 시험 DB(kospi_it)·시험 토픽(it-…)에서 돈다.
+    # 평소에는 뜨지 않는 서비스(profiles: test)라 이름을 지정해 실행하고, 시험 컨테이너의 종료 코드가 이 단계의 결과가 된다
+    - name: Integration Tests
+      run: docker compose run --rm integration-test
